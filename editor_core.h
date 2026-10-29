@@ -10,7 +10,8 @@ typedef enum EditorMode {
     EDITOR_MODE_INSERT,
     EDITOR_MODE_VISUAL,
     EDITOR_MODE_VISUAL_LINE,
-    EDITOR_MODE_VISUAL_BLOCK
+    EDITOR_MODE_VISUAL_BLOCK,
+    EDITOR_MODE_REPLACE
 } EditorMode;
 
 typedef enum EditorKey {

@@ -3,7 +3,8 @@
 Build `parapad.sln` in Visual Studio with the v142 C++ toolset and Windows SDK.
 The application starts with an empty text buffer in command mode. Press `i` to
 enter insert mode and Esc to return to command mode. The main window's status bar
-shows `COMMAND`, `INSERT`, `VISUAL`, `VISUAL LINE`, or `VISUAL BLOCK` directly from the core's state.
+shows `COMMAND`, `INSERT`, `REPLACE`, `VISUAL`, `VISUAL LINE`, or `VISUAL BLOCK`
+directly from the core's state.
 The fixed black left gutter displays cyan one-based line numbers in a five-character field,
 right-aligned and padded with spaces. Lines above 99999 display `#####`.
 The editor retains its GDI bitmap and shifts existing rows during small vertical
@@ -46,6 +47,8 @@ for a future hex view, not an implemented hex editor.
 | `V` (Shift+V) | Toggle whole-line selection |
 | Ctrl+V | Toggle rectangular visual-block selection; motions extend the rectangle |
 | `I` (Shift+I) in visual-block mode | Insert at the left edge on the top selected line; Esc repeats the insertion on the other selected lines |
+| `r` then a character | Replace the character under the caret, or each selected character in visual mode |
+| `R` (Shift+R) in command mode | Enter continuous replace mode; Esc returns to command mode |
 | `y` in visual mode | Copy the selection to the core's register and return to command mode |
 | `yy` | Copy the current line |
 | `p` | Paste after the caret, or below the current line for a linewise register |
@@ -57,7 +60,7 @@ for a future hex view, not an implemented hex editor.
 | `y` plus a motion | Copy the motion's range, e.g. `yw`, `y$`, `yj`, `yG` |
 | `gg`, `G` | Go to the first/last line |
 | `12G`, `12gg` | Go to line 12 (one-based; clamped to existing lines) |
-| Esc | Cancel selection, a pending operator/count, or insert mode |
+| Esc | Cancel selection, a pending operator/count, or insert/replace mode |
 
 Prefix motions, delete/yank operators, and paste with a decimal count: `3j`,
 `4w`, `3x`, `2dd`, `2yy`, `3p`, `3P`. Counts before and after operators multiply:
@@ -65,7 +68,22 @@ Prefix motions, delete/yank operators, and paste with a decimal count: `3j`,
 nonzero digit extends a count, e.g. `10j`. Counts are overflow-checked, and motion
 at document boundaries stops without looping through the remaining count.
 `d` and `y` wait for a motion or a second matching key; unsupported continuations
-cancel the pending operator. Counts do not repeat insert-mode sessions.
+cancel the pending operator. Counts do not repeat insert/replace-mode sessions.
+
+`r` waits for the replacement character; Esc cancels it. A count such as `3rx`
+replaces three characters with `x`, staying on the current line. If fewer than
+three characters remain, nothing changes. The caret lands on the last replaced
+character. Visual `r` supports character, line, and block selections, preserving
+existing line separators. Replacement does not overwrite the yank register.
+
+In `R` mode, typed characters overwrite complete UTF-8 characters and append at
+the end of a line without consuming its newline. Enter inserts a line break;
+Tab overwrites up to four characters with four spaces. Backspace restores the
+previous overwritten character (or removes text appended beyond the line end).
+One Backspace restores an entire Tab operation. Arrow keys, Home, End, Delete,
+mouse positioning, and direct edit/navigation messages clear restoration history;
+Backspace with no history does nothing. Esc leaves the caret on the last typed
+character when possible. New/load clears replace mode and its history.
 
 Selections include both endpoint characters, preserve UTF-8 boundaries, and may
 span lines in either direction. `v` and `V` switch between selection styles while
@@ -103,7 +121,7 @@ allocation failure. Failed edits leave the document unchanged.
 | Message | Data |
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
-| `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/visual/visual-line/visual-block mode |
+| `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block mode |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |
@@ -129,7 +147,9 @@ allocation failure. Failed edits leave the document unchanged.
 
 `EDITOR_HANDLE_KEY` runs the core's per-instance state machine. ASCII `i` changes
 command mode to insert mode without inserting itself; scalar 27 (Esc) returns to
-command mode without inserting a character. Backspace, Tab, and Enter are passed
+command mode without inserting a character. ASCII `R` enters
+`EDITOR_MODE_REPLACE`, while `r` waits for a one-shot replacement character.
+Backspace, Tab, and Enter are passed
 as their ASCII control values. Navigation and Delete use the `EditorKey` enum.
 Ctrl+V is scalar 22. Block selection and deferred insertion are owned by the core;
 `EDITOR_GET_LINE_CARET` supplies per-line caret positions for rendering. During

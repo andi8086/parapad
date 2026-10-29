@@ -502,8 +502,102 @@ static void test_visual_block(void)
     editor_core_destroy(core);
 }
 
+static void test_replace(void)
+{
+    EditorCore *core = editor_core_create("abcd\nefgh");
+    assert(core);
+    send_keys(core, "l2rZ");
+    expect_line(core, 0, "aZZd");
+    expect_caret(core, 0, 2);
+    send_keys(core, "0R12");
+    expect_line(core, 0, "12Zd");
+    send_key(core, '\b');
+    expect_line(core, 0, "1ZZd");
+    send_keys(core, "Q");
+    send_key(core, 27);
+    expect_line(core, 0, "1QZd");
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    expect_caret(core, 0, 1);
+    editor_core_destroy(core);
+
+    core = editor_core_create("a\xC3\xA4\xF0\x9F\x98\x80z\nsecond");
+    assert(core);
+    send_keys(core, "l2r");
+    send_key(core, 0x20AC);
+    expect_line(core, 0, "a\xE2\x82\xAC\xE2\x82\xACz");
+    expect_caret(core, 0, 4);
+    send_keys(core, "0R");
+    expect_mode(core, EDITOR_MODE_REPLACE);
+    send_key(core, 0x1F600);
+    send_key(core, 'q');
+    expect_line(core, 0, "\xF0\x9F\x98\x80q\xE2\x82\xACz");
+    send_key(core, '\b');
+    send_key(core, '\b');
+    send_key(core, '\b');
+    expect_line(core, 0, "a\xE2\x82\xAC\xE2\x82\xACz");
+    expect_caret(core, 0, 0);
+    send_key(core, 27);
+    send_keys(core, "$rX");
+    expect_line(core, 0, "a\xE2\x82\xAC\xE2\x82\xACz");
+    send_keys(core, "0r");
+    send_key(core, 27);
+    send_keys(core, "99rX");
+    expect_line(core, 0, "a\xE2\x82\xAC\xE2\x82\xACz");
+    send_keys(core, "$RXY");
+    expect_line(core, 0, "a\xE2\x82\xAC\xE2\x82\xACzXY");
+    expect_line(core, 1, "second");
+    send_key(core, '\b');
+    send_key(core, '\b');
+    expect_line(core, 0, "a\xE2\x82\xAC\xE2\x82\xACz");
+    send_key(core, '\r');
+    expect_line(core, 1, "");
+    send_key(core, '\b');
+    expect_line(core, 1, "second");
+    send_key(core, 27);
+    editor_core_destroy(core);
+
+    core = editor_core_create("abcd\nx\nABCD");
+    assert(core);
+    send_keys(core, "l\026" "2jlrZ");
+    expect_line(core, 0, "aZZd");
+    expect_line(core, 1, "x");
+    expect_line(core, 2, "AZZD");
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    expect_caret(core, 0, 1);
+    send_keys(core, "0v2lrQ");
+    expect_line(core, 0, "QQQd");
+    expect_caret(core, 0, 0);
+    send_keys(core, "Vjr.");
+    expect_line(core, 0, "....");
+    expect_line(core, 1, ".");
+    expect_line(core, 2, "AZZD");
+    send_keys(core, "0RZ");
+    send_key(core, EDITOR_KEY_RIGHT);
+    send_key(core, '\b');
+    expect_line(core, 0, "Z...");
+    send_key(core, 'Y');
+    send_key(core, '\b');
+    expect_line(core, 0, "Z...");
+    send_key(core, 27);
+    send_keys(core, "0R\t");
+    expect_line(core, 0, "    ");
+    send_key(core, '\b');
+    expect_line(core, 0, "Z...");
+    EditorBuffer empty = { NULL, 0 };
+    assert(editor_core_send(core, EDITOR_SET_BUFFER, &empty));
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    send_keys(core, "rX");
+    expect_line(core, 0, "");
+    send_keys(core, "Rabc");
+    expect_line(core, 0, "abc");
+    send_key(core, 27);
+    expect_caret(core, 0, 2);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_replace();
     test_visual_block();
     test_raw_files();
     test_visual_commands();

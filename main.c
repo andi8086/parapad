@@ -630,6 +630,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         const char *mode_text;
         switch ((EditorMode)wp) {
         case EDITOR_MODE_INSERT: mode_text = "INSERT"; break;
+        case EDITOR_MODE_REPLACE: mode_text = "REPLACE"; break;
         case EDITOR_MODE_VISUAL: mode_text = "VISUAL"; break;
         case EDITOR_MODE_VISUAL_LINE: mode_text = "VISUAL LINE"; break;
         case EDITOR_MODE_VISUAL_BLOCK: mode_text = "VISUAL BLOCK"; break;

@@ -9,6 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct ReplaceEdit {
+    size_t position;
+    size_t original_length;
+    size_t inserted_length;
+    char original[16];
+} ReplaceEdit;
+
 struct EditorCore {
     char *text;
     size_t length;
@@ -31,7 +38,40 @@ struct EditorCore {
     size_t block_insert_column;
     size_t block_insert_start;
     int block_insert;
+    ReplaceEdit *replace_edits;
+    size_t replace_count;
+    size_t replace_capacity;
 };
+
+static size_t encode_character(unsigned long value, char text[5])
+{
+    if (!value || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF))
+        return 0;
+    if (value < 0x80) {
+        text[0] = (char)value;
+        text[1] = 0;
+        return 1;
+    }
+    if (value < 0x800) {
+        text[0] = (char)(0xC0 | (value >> 6));
+        text[1] = (char)(0x80 | (value & 0x3F));
+        text[2] = 0;
+        return 2;
+    }
+    if (value < 0x10000) {
+        text[0] = (char)(0xE0 | (value >> 12));
+        text[1] = (char)(0x80 | ((value >> 6) & 0x3F));
+        text[2] = (char)(0x80 | (value & 0x3F));
+        text[3] = 0;
+        return 3;
+    }
+    text[0] = (char)(0xF0 | (value >> 18));
+    text[1] = (char)(0x80 | ((value >> 12) & 0x3F));
+    text[2] = (char)(0x80 | ((value >> 6) & 0x3F));
+    text[3] = (char)(0x80 | (value & 0x3F));
+    text[4] = 0;
+    return 4;
+}
 
 static size_t decode_character(const char *text, size_t length, unsigned long *value)
 {
@@ -235,6 +275,7 @@ EditorCore *editor_core_create(const char *initial_text)
 void editor_core_destroy(EditorCore *core)
 {
     if (core) {
+        free(core->replace_edits);
         free(core->register_text);
         free(core->text);
         free(core);
@@ -382,6 +423,7 @@ static void reset_command(EditorCore *core)
 
 static void reset_document(EditorCore *core)
 {
+    core->replace_count = 0;
     core->block_insert = 0;
     core->cursor = 0;
     core->anchor = 0;
@@ -699,11 +741,145 @@ static int paste_register(EditorCore *core, size_t count, int before)
     return 1;
 }
 
+static int write_span(EditorCore *core, size_t start, size_t end, const char *text, size_t length)
+{
+    size_t remaining = core->length - (end - start);
+    if (length > SIZE_MAX - 1 - remaining || !reserve_text(core, remaining + length))
+        return 0;
+    if (length != end - start || (length && memcmp(core->text + start, text, length) != 0))
+        core->modified = 1;
+    memmove(core->text + start + length, core->text + end, core->length - end + 1);
+    if (length)
+        memcpy(core->text + start, text, length);
+    core->length = remaining + length;
+    return 1;
+}
+
+static int replace_input(EditorCore *core, unsigned long key)
+{
+    char text[5];
+    size_t length = key == '\t' ? 4 : encode_character(key == '\r' ? '\n' : key, text);
+    if (!length)
+        return 0;
+    if (key == '\t')
+        memcpy(text, "    ", 5);
+    size_t end = core->cursor;
+    size_t limit = line_end(core, end);
+    size_t count = key == '\t' ? 4 : 1;
+    if (key != '\r' && key != '\n')
+        while (count-- && end < limit)
+            end = next_character(core, end);
+    if (core->replace_count == core->replace_capacity) {
+        if (core->replace_capacity > SIZE_MAX / 2 / sizeof(ReplaceEdit))
+            return 0;
+        size_t capacity = core->replace_capacity ? core->replace_capacity * 2 : 16;
+        ReplaceEdit *edits = realloc(core->replace_edits, capacity * sizeof(*edits));
+        if (!edits)
+            return 0;
+        core->replace_edits = edits;
+        core->replace_capacity = capacity;
+    }
+    ReplaceEdit edit;
+    edit.position = core->cursor;
+    edit.original_length = end - core->cursor;
+    edit.inserted_length = length;
+    memcpy(edit.original, core->text + core->cursor, edit.original_length);
+    if (!write_span(core, core->cursor, end, text, length))
+        return 0;
+    core->replace_edits[core->replace_count++] = edit;
+    core->cursor += length;
+    return 1;
+}
+
+static int replace_characters(EditorCore *core, unsigned long key, size_t count)
+{
+    char encoded[5];
+    size_t width = encode_character(key == '\r' ? '\n' : key, encoded);
+    if (!width || (key < ' ' && key != '\t' && key != '\r' && key != '\n') || key == 127)
+        return 1;
+    size_t start = core->cursor, end = start;
+    size_t first = 0, last = 0, left = 0, right = 0;
+    int block = core->mode == EDITOR_MODE_VISUAL_BLOCK;
+    int visual = is_visual(core);
+    if (block) {
+        block_bounds(core, &first, &last, &left, &right);
+        find_line(core, first, &start, &end);
+        size_t ignored;
+        find_line(core, last, &ignored, &end);
+    } else if (visual) {
+        TextRange range = selected_range(core);
+        start = range.start;
+        end = range.end;
+    } else {
+        size_t limit = line_end(core, start);
+        while (count--) {
+            if (end == limit)
+                return 1;
+            end = next_character(core, end);
+        }
+    }
+    size_t characters = 0, line = first, column = 0;
+    for (size_t position = start; position < end; position = next_character(core, position)) {
+        if (core->text[position] == '\n') {
+            ++line;
+            column = 0;
+        } else {
+            if (!block || (line <= last && column >= left && column <= right))
+                ++characters;
+            ++column;
+        }
+    }
+    if (characters > (SIZE_MAX - 1 - core->length) / width)
+        return 0;
+    size_t capacity = end - start + characters * width;
+    char *text = malloc(capacity ? capacity : 1);
+    if (!text)
+        return 0;
+    size_t length = 0, cursor = start;
+    int positioned = 0;
+    line = first;
+    column = 0;
+    for (size_t position = start; position < end;) {
+        size_t next = next_character(core, position);
+        int newline = core->text[position] == '\n';
+        int replace = !newline && (!block || (line <= last && column >= left && column <= right));
+        if (replace) {
+            if (!positioned) {
+                cursor = start + length;
+                positioned = 1;
+            }
+            memcpy(text + length, encoded, width);
+            length += width;
+        } else {
+            memcpy(text + length, core->text + position, next - position);
+            length += next - position;
+        }
+        if (newline) {
+            ++line;
+            column = 0;
+        } else {
+            ++column;
+        }
+        position = next;
+    }
+    int success = write_span(core, start, end, text, length);
+    if (success) {
+        core->cursor = visual ? cursor : previous_character(core, start + length);
+        core->mode = EDITOR_MODE_COMMAND;
+    }
+    free(text);
+    return success;
+}
+
 static int handle_key(EditorCore *core, unsigned long key)
 {
     if (key == 27) {
         if (!finish_block_insert(core))
             return 0;
+        if (core->mode == EDITOR_MODE_REPLACE && core->replace_count &&
+            core->cursor > line_start(core, core->cursor))
+            core->cursor = previous_character(core, core->cursor);
+        core->replace_count = 0;
         core->mode = EDITOR_MODE_COMMAND;
         reset_command(core);
         return 1;
@@ -711,6 +887,32 @@ static int handle_key(EditorCore *core, unsigned long key)
     if (!key || key > EDITOR_KEY_END ||
         (key > 0x10FFFF && key < EDITOR_KEY_DELETE) || (key >= 0xD800 && key <= 0xDFFF))
         return 0;
+    if (core->mode == EDITOR_MODE_REPLACE) {
+        if (key == '\b') {
+            if (!core->replace_count)
+                return 1;
+            ReplaceEdit *edit = &core->replace_edits[core->replace_count - 1];
+            if (!write_span(core, edit->position, edit->position + edit->inserted_length,
+                edit->original, edit->original_length))
+                return 0;
+            core->cursor = edit->position;
+            --core->replace_count;
+            return 1;
+        }
+        if (key >= EDITOR_KEY_DELETE) {
+            core->replace_count = 0;
+            return key == EDITOR_KEY_DELETE ? editor_core_send(core, EDITOR_DELETE_CHAR, NULL) :
+                move_command(core, key, 1, 0);
+        }
+        if ((key < ' ' && key != '\t' && key != '\r' && key != '\n') || key == 127)
+            return 1;
+        return replace_input(core, key);
+    }
+    if (core->pending == 'r') {
+        size_t count = core->operator_count;
+        reset_command(core);
+        return replace_characters(core, key, count);
+    }
     if (core->mode == EDITOR_MODE_INSERT) {
         if (core->block_insert) {
             if (key == '\b' && core->cursor == core->block_insert_start)
@@ -778,6 +980,16 @@ static int handle_key(EditorCore *core, unsigned long key)
         return use_range(core, range, pending == 'd');
     }
     core->count = 0;
+    if (key == 'r') {
+        core->pending = key;
+        core->operator_count = count;
+        return 1;
+    }
+    if (key == 'R' && !is_visual(core)) {
+        core->replace_count = 0;
+        core->mode = EDITOR_MODE_REPLACE;
+        return 1;
+    }
     if (key == 'v' || key == 'V' || key == 22) {
         EditorMode mode = key == 22 ? EDITOR_MODE_VISUAL_BLOCK :
             (key == 'v' ? EDITOR_MODE_VISUAL : EDITOR_MODE_VISUAL_LINE);
@@ -844,6 +1056,15 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
 {
     if (!core)
         return 0;
+    switch (message) {
+    case EDITOR_ADD_CHAR: case EDITOR_ADD_CODEPOINT: case EDITOR_INSERT_TEXT:
+    case EDITOR_BACKSPACE: case EDITOR_DELETE_CHAR: case EDITOR_DELETE_LINE:
+    case EDITOR_SET_CARET: case EDITOR_MOVE_LEFT: case EDITOR_MOVE_RIGHT:
+    case EDITOR_MOVE_UP: case EDITOR_MOVE_DOWN: case EDITOR_MOVE_HOME: case EDITOR_MOVE_END:
+        core->replace_count = 0;
+        break;
+    default: break;
+    }
     switch (message) {
     case EDITOR_SET_BUFFER:
         return set_buffer(core, data);
@@ -951,23 +1172,8 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
             return 0;
         unsigned long value = *(const unsigned long *)data;
         char text[5] = { 0 };
-        if (!value || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF))
+        if (!encode_character(value, text))
             return 0;
-        if (value < 0x80) {
-            text[0] = (char)value;
-        } else if (value < 0x800) {
-            text[0] = (char)(0xC0 | (value >> 6));
-            text[1] = (char)(0x80 | (value & 0x3F));
-        } else if (value < 0x10000) {
-            text[0] = (char)(0xE0 | (value >> 12));
-            text[1] = (char)(0x80 | ((value >> 6) & 0x3F));
-            text[2] = (char)(0x80 | (value & 0x3F));
-        } else {
-            text[0] = (char)(0xF0 | (value >> 18));
-            text[1] = (char)(0x80 | ((value >> 12) & 0x3F));
-            text[2] = (char)(0x80 | ((value >> 6) & 0x3F));
-            text[3] = (char)(0x80 | (value & 0x3F));
-        }
         return insert_text(core, text);
     }
     case EDITOR_INSERT_TEXT:
