@@ -5,6 +5,21 @@
 
 typedef struct EditorCore EditorCore;
 
+typedef enum EditorMode {
+    EDITOR_MODE_COMMAND,
+    EDITOR_MODE_INSERT
+} EditorMode;
+
+typedef enum EditorKey {
+    EDITOR_KEY_DELETE = 0x110000,
+    EDITOR_KEY_LEFT,
+    EDITOR_KEY_RIGHT,
+    EDITOR_KEY_UP,
+    EDITOR_KEY_DOWN,
+    EDITOR_KEY_HOME,
+    EDITOR_KEY_END
+} EditorKey;
+
 typedef enum EditorMessage {
     EDITOR_ADD_CHAR,
     EDITOR_ADD_CODEPOINT,
@@ -22,7 +37,9 @@ typedef enum EditorMessage {
     EDITOR_MOVE_UP,
     EDITOR_MOVE_DOWN,
     EDITOR_MOVE_HOME,
-    EDITOR_MOVE_END
+    EDITOR_MOVE_END,
+    EDITOR_HANDLE_KEY,
+    EDITOR_GET_MODE
 } EditorMessage;
 
 typedef struct EditorLine {

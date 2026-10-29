@@ -19,8 +19,85 @@ static void expect_caret(EditorCore *core, size_t line, size_t column)
     assert(caret.line == line && caret.column == column);
 }
 
+static void send_key(EditorCore *core, unsigned long key)
+{
+    assert(editor_core_send(core, EDITOR_HANDLE_KEY, &key));
+}
+
+static void expect_mode(EditorCore *core, EditorMode expected)
+{
+    EditorMode mode;
+    assert(editor_core_send(core, EDITOR_GET_MODE, &mode));
+    assert(mode == expected);
+}
+
+static void test_modes(void)
+{
+    EditorCore *core = editor_core_create("");
+    assert(core);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    send_key(core, 'a');
+    send_key(core, '\r');
+    send_key(core, '\t');
+    send_key(core, '\b');
+    expect_line(core, 0, "");
+    send_key(core, 'i');
+    expect_mode(core, EDITOR_MODE_INSERT);
+    expect_line(core, 0, "");
+    send_key(core, 'h');
+    send_key(core, 'i');
+    send_key(core, 0x1F600);
+    expect_line(core, 0, "hi\xF0\x9F\x98\x80");
+    send_key(core, '\b');
+    expect_line(core, 0, "hi");
+    send_key(core, '\r');
+    send_key(core, '\t');
+    send_key(core, 'x');
+    expect_line(core, 1, "    x");
+    send_key(core, 27);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    send_key(core, 27);
+    send_key(core, 'z');
+    send_key(core, '\b');
+    expect_line(core, 1, "    x");
+    send_key(core, '0');
+    expect_caret(core, 1, 0);
+    send_key(core, 'k');
+    send_key(core, 'l');
+    expect_caret(core, 0, 1);
+    send_key(core, 'h');
+    send_key(core, 'x');
+    expect_line(core, 0, "i");
+    send_key(core, 'j');
+    send_key(core, '$');
+    expect_caret(core, 1, 5);
+    send_key(core, EDITOR_KEY_LEFT);
+    send_key(core, EDITOR_KEY_DELETE);
+    expect_line(core, 1, "    ");
+    send_key(core, 'i');
+    send_key(core, 0x20AC);
+    send_key(core, EDITOR_KEY_LEFT);
+    send_key(core, EDITOR_KEY_DELETE);
+    expect_line(core, 1, "    ");
+    expect_mode(core, EDITOR_MODE_INSERT);
+    send_key(core, 27);
+    unsigned long invalid = 0xD800;
+    assert(!editor_core_send(core, EDITOR_HANDLE_KEY, &invalid));
+    assert(!editor_core_send(core, EDITOR_HANDLE_KEY, NULL));
+    assert(!editor_core_send(core, EDITOR_GET_MODE, NULL));
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    EditorCore *other = editor_core_create(NULL);
+    assert(other);
+    send_key(other, 'i');
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    expect_mode(other, EDITOR_MODE_INSERT);
+    editor_core_destroy(other);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_modes();
     EditorCore *core = editor_core_create("ab\r\ncd\ref\n");
     assert(core);
     size_t count = 0;

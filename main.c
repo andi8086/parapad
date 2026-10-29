@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <commctrl.h>
 #include <limits.h>
 #include <stdlib.h>
 
@@ -7,6 +8,8 @@
 
 #define ID_EDITOR 100
 #define ID_FILE_EXIT 101
+#define ID_STATUS 102
+#define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 
 typedef struct EditorControl {
     EditorCore *core;
@@ -43,7 +46,7 @@ static int character_to_ansi(unsigned long value, char *text, int capacity)
     return length;
 }
 
-static int insert_ansi_character(EditorControl *editor, WPARAM value, unsigned int repeats)
+static int dispatch_ansi_key(EditorControl *editor, WPARAM value, unsigned int repeats)
 {
     char text[2];
     int length = 1;
@@ -75,7 +78,7 @@ static int insert_ansi_character(EditorControl *editor, WPARAM value, unsigned i
         codepoint = 0x10000 + (((unsigned long)units[0] - 0xD800) << 10) + units[1] - 0xDC00;
     }
     for (unsigned int repeat = 0; repeat < repeats; ++repeat)
-        if (!editor_core_send(editor->core, EDITOR_ADD_CODEPOINT, &codepoint))
+        if (!editor_core_send(editor->core, EDITOR_HANDLE_KEY, &codepoint))
             return 0;
     return 1;
 }
@@ -110,6 +113,9 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
 
 static void update_editor_caret(HWND window, EditorControl *editor)
 {
+    EditorMode mode;
+    editor_core_send(editor->core, EDITOR_GET_MODE, &mode);
+    SendMessageA(GetParent(window), WM_EDITOR_MODE_CHANGED, (WPARAM)mode, 0);
     EditorCaret caret;
     editor_core_send(editor->core, EDITOR_GET_CARET, &caret);
     HDC dc = GetDC(window);
@@ -209,43 +215,35 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_KEYDOWN: {
-        EditorMessage message;
+        unsigned long key;
         switch (wp) {
-        case VK_DELETE: message = EDITOR_DELETE_CHAR; break;
-        case VK_LEFT: message = EDITOR_MOVE_LEFT; break;
-        case VK_RIGHT: message = EDITOR_MOVE_RIGHT; break;
-        case VK_UP: message = EDITOR_MOVE_UP; break;
-        case VK_DOWN: message = EDITOR_MOVE_DOWN; break;
-        case VK_HOME: message = EDITOR_MOVE_HOME; break;
-        case VK_END: message = EDITOR_MOVE_END; break;
+        case VK_ESCAPE: key = 27; break;
+        case VK_DELETE: key = EDITOR_KEY_DELETE; break;
+        case VK_LEFT: key = EDITOR_KEY_LEFT; break;
+        case VK_RIGHT: key = EDITOR_KEY_RIGHT; break;
+        case VK_UP: key = EDITOR_KEY_UP; break;
+        case VK_DOWN: key = EDITOR_KEY_DOWN; break;
+        case VK_HOME: key = EDITOR_KEY_HOME; break;
+        case VK_END: key = EDITOR_KEY_END; break;
         default: return DefWindowProcA(hWnd, msg, wp, lp);
         }
         editor->pending_lead = 0;
         for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat)
-            editor_core_send(editor->core, message, NULL);
+            editor_core_send(editor->core, EDITOR_HANDLE_KEY, &key);
         update_editor_caret(hWnd, editor);
         return 0;
     }
     case WM_CHAR: {
         if (wp >= ' ' && wp != 127) {
-            if (!insert_ansi_character(editor, wp, LOWORD(lp)))
+            if (!dispatch_ansi_key(editor, wp, LOWORD(lp)))
                 MessageBeep(MB_ICONWARNING);
             update_editor_caret(hWnd, editor);
             return 0;
         }
+        editor->pending_lead = 0;
+        unsigned long key = (unsigned long)wp;
         for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat) {
-            int success = 1;
-            if (wp == '\b') {
-                editor->pending_lead = 0;
-                success = editor_core_send(editor->core, EDITOR_BACKSPACE, NULL);
-            } else if (wp == '\t') {
-                editor->pending_lead = 0;
-                success = editor_core_send(editor->core, EDITOR_INSERT_TEXT, "    ");
-            } else if (wp == '\r') {
-                editor->pending_lead = 0;
-                success = editor_core_send(editor->core, EDITOR_ADD_CHAR, "\n");
-            }
-            if (!success) {
+            if (!editor_core_send(editor->core, EDITOR_HANDLE_KEY, &key)) {
                 MessageBeep(MB_ICONWARNING);
                 break;
             }
@@ -357,6 +355,14 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             return -1;
         }
 
+        HWND status = CreateWindowExA(0, STATUSCLASSNAMEA, NULL,
+            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+            0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_STATUS,
+            ((LPCREATESTRUCTA)lp)->hInstance, NULL);
+        if (!status)
+            return -1;
+        SendMessageA(status, SB_SETTEXTA, 0, (LPARAM)"COMMAND");
+
         HWND editor = CreateWindowExA(WS_EX_CLIENTEDGE, "PARAPAD_EDITOR", NULL,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_EDITOR,
@@ -368,11 +374,20 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE: {
         RECT rect;
         GetClientRect(hWnd, &rect);
+        HWND status = GetDlgItem(hWnd, ID_STATUS);
+        SendMessageA(status, WM_SIZE, 0, 0);
+        RECT status_rect = { 0 };
+        GetWindowRect(status, &status_rect);
+        int available_height = rect.bottom - (status_rect.bottom - status_rect.top);
         int width = rect.right > 24 ? rect.right - 24 : 0;
-        int height = rect.bottom > 24 ? rect.bottom - 24 : 0;
+        int height = available_height > 24 ? available_height - 24 : 0;
         MoveWindow(GetDlgItem(hWnd, ID_EDITOR), 12, 12, width, height, TRUE);
         return 0;
     }
+    case WM_EDITOR_MODE_CHANGED:
+        SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
+            (LPARAM)(wp == EDITOR_MODE_INSERT ? "INSERT" : "COMMAND"));
+        return 0;
     case WM_SETFOCUS:
         SetFocus(GetDlgItem(hWnd, ID_EDITOR));
         return 0;
@@ -392,6 +407,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, INT nCmdShow)
 {
+    InitCommonControls();
     WNDCLASSA my_editor_cls;
 
     memset(&my_editor_cls, 0, sizeof(my_editor_cls));

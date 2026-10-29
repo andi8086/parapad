@@ -1,9 +1,16 @@
 # Parapad
 
 Build `parapad.sln` in Visual Studio with the v142 C++ toolset and Windows SDK.
-The application starts with an empty text buffer. The editor supports typing,
-Enter, Backspace, Delete, arrow keys, Home, End, and mouse caret positioning.
-Tab inserts four spaces. The viewport follows the caret.
+The application starts with an empty text buffer in command mode. Press `i` to
+enter insert mode and Esc to return to command mode. The main window's status bar
+shows `COMMAND` or `INSERT` directly from the core's state.
+
+In insert mode, typing inserts text, Enter splits the line, Backspace deletes the
+previous character, and Tab inserts four spaces. In command mode, `h/j/k/l` move
+left/down/up/right, `x` deletes the current character, `0` moves to the start of
+the line, and `$` moves to its end. Other character keys are ignored. Arrow keys,
+Home, End, Delete, and mouse caret positioning work in either mode. The viewport
+follows the caret. This is a small Vim-style command subset, not a full Vim engine.
 
 ## Editor Core
 
@@ -18,6 +25,8 @@ allocation failure. Failed edits leave the document unchanged.
 
 | Message | Data |
 | --- | --- |
+| `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
+| `EDITOR_GET_MODE` | `EditorMode *` receiving `EDITOR_MODE_COMMAND` or `EDITOR_MODE_INSERT` |
 | `EDITOR_ADD_CHAR` | NUL-terminated UTF-8 `char *` containing exactly one Unicode scalar |
 | `EDITOR_ADD_CODEPOINT` | `unsigned long *` containing a nonzero Unicode scalar, encoded by the core |
 | `EDITOR_INSERT_TEXT` | NUL-terminated UTF-8 `char *` to insert at the caret |
@@ -32,6 +41,15 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_MOVE_LEFT`, `EDITOR_MOVE_RIGHT` | NULL; move across characters and line boundaries |
 | `EDITOR_MOVE_UP`, `EDITOR_MOVE_DOWN` | NULL; move one line, clamping the column |
 | `EDITOR_MOVE_HOME`, `EDITOR_MOVE_END` | NULL; move to the current line boundary |
+
+`EDITOR_HANDLE_KEY` runs the core's per-instance state machine. ASCII `i` changes
+command mode to insert mode without inserting itself; scalar 27 (Esc) returns to
+command mode without inserting a character. Backspace, Tab, and Enter are passed
+as their ASCII control values. Navigation and Delete use the `EditorKey` enum.
+Mode transitions are synchronous and can be queried with `EDITOR_GET_MODE`.
+The GUI sends key messages without interpreting commands or deciding transitions.
+Direct buffer-edit and navigation messages remain mode-independent for loading
+text, programmatic edits, and other non-keyboard clients.
 
 All stored text and string payloads are UTF-8 `char` strings, independent of the
 system locale. Line and column indices are zero-based. Columns and lengths count

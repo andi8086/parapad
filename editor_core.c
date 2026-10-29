@@ -9,6 +9,7 @@ struct EditorCore {
     size_t length;
     size_t capacity;
     size_t cursor;
+    EditorMode mode;
 };
 
 static size_t decode_character(const char *text, size_t length, unsigned long *value)
@@ -194,11 +195,64 @@ void editor_core_destroy(EditorCore *core)
     }
 }
 
+static int handle_key(EditorCore *core, unsigned long key)
+{
+    if (key == 27) {
+        core->mode = EDITOR_MODE_COMMAND;
+        return 1;
+    }
+    switch (key) {
+    case EDITOR_KEY_DELETE: return editor_core_send(core, EDITOR_DELETE_CHAR, NULL);
+    case EDITOR_KEY_LEFT: return editor_core_send(core, EDITOR_MOVE_LEFT, NULL);
+    case EDITOR_KEY_RIGHT: return editor_core_send(core, EDITOR_MOVE_RIGHT, NULL);
+    case EDITOR_KEY_UP: return editor_core_send(core, EDITOR_MOVE_UP, NULL);
+    case EDITOR_KEY_DOWN: return editor_core_send(core, EDITOR_MOVE_DOWN, NULL);
+    case EDITOR_KEY_HOME: return editor_core_send(core, EDITOR_MOVE_HOME, NULL);
+    case EDITOR_KEY_END: return editor_core_send(core, EDITOR_MOVE_END, NULL);
+    }
+    if (!key || key > 0x10FFFF || (key >= 0xD800 && key <= 0xDFFF))
+        return 0;
+    switch (core->mode) {
+    case EDITOR_MODE_COMMAND:
+        switch (key) {
+        case 'i': core->mode = EDITOR_MODE_INSERT; return 1;
+        case 'h': return editor_core_send(core, EDITOR_MOVE_LEFT, NULL);
+        case 'j': return editor_core_send(core, EDITOR_MOVE_DOWN, NULL);
+        case 'k': return editor_core_send(core, EDITOR_MOVE_UP, NULL);
+        case 'l': return editor_core_send(core, EDITOR_MOVE_RIGHT, NULL);
+        case 'x': return editor_core_send(core, EDITOR_DELETE_CHAR, NULL);
+        case '0': return editor_core_send(core, EDITOR_MOVE_HOME, NULL);
+        case '$': return editor_core_send(core, EDITOR_MOVE_END, NULL);
+        default: return 1;
+        }
+    case EDITOR_MODE_INSERT:
+        switch (key) {
+        case '\b': return editor_core_send(core, EDITOR_BACKSPACE, NULL);
+        case '\t': return editor_core_send(core, EDITOR_INSERT_TEXT, "    ");
+        case '\r':
+        case '\n': return editor_core_send(core, EDITOR_ADD_CHAR, "\n");
+        default:
+            if (key < ' ' || key == 127)
+                return 1;
+            return editor_core_send(core, EDITOR_ADD_CODEPOINT, &key);
+        }
+    default:
+        return 0;
+    }
+}
+
 int editor_core_send(EditorCore *core, EditorMessage message, void *data)
 {
     if (!core)
         return 0;
     switch (message) {
+    case EDITOR_HANDLE_KEY:
+        return data ? handle_key(core, *(const unsigned long *)data) : 0;
+    case EDITOR_GET_MODE:
+        if (!data)
+            return 0;
+        *(EditorMode *)data = core->mode;
+        return 1;
     case EDITOR_ADD_CHAR: {
         if (!data)
             return 0;
