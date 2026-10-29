@@ -42,6 +42,30 @@ do not decode, transcode, normalize newlines, remove a BOM, or stop at NUL or
 Ctrl+Z. Unedited files round-trip byte for byte, including arbitrary non-UTF-8 data.
 Paths use ANSI dialogs and the system code page, consistent with the Win95 GUI.
 
+### Directory Buffers
+
+`:tabe .` opens a directory listing in a new buffer. `:tabe <directory>` also
+accepts directory paths, including quoted paths containing spaces. Move with
+Up/Down or `j`/`k`, then press Enter or double-click a row. Directories have a
+trailing `/`; `../`, Backspace, or `-` navigates to the parent. Parent comes
+first, followed by sorted directories and then sorted files. The active row is
+highlighted and the status bar shows `DIRECTORY`.
+
+Each directory buffer has its own current path and navigation state. Navigation
+never calls `SetCurrentDirectory` or `chdir`, so it cannot change another buffer
+or the process working directory. Relative `:tabe` paths in a directory buffer
+resolve against that buffer's path. Selecting a file loads it into the same
+buffer, replaces the listing, updates the title/sidebar and lexer, and leaves
+the tab count unchanged. Failed enumeration or file loading preserves the
+listing. Listings are read-only and cannot be saved or edited.
+
+Windows enumeration uses Win95-supported `FindFirstFileA`/`FindNextFileA` and
+the full `cFileName`, never the 8.3 `cAlternateFileName`. Long filenames and
+spaces are retained in native ANSI paths; only displayed names are converted
+to UTF-8. Paths must fit the Win95 `MAX_PATH` limit (260 bytes including the
+terminator); oversized paths fail instead of being silently truncated.
+This does not require Unicode filesystem APIs or modern long-path extensions.
+
 The current text view uses LF as its line separator. Valid UTF-8 is displayed as
 characters; malformed bytes show replacement glyphs and control bytes other than
 Tab show dots,
@@ -360,6 +384,11 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_REGISTER_LEXER` | `const Lexer *`; register an additional lexer descriptor on this core; registering the same pointer again is a no-op |
 | `EDITOR_SELECT_LEXER` | NUL-terminated filename; select the first registered lexer matching its basename or extension, or plain text when none matches |
 | `EDITOR_GET_LEXER` | `const Lexer **` receiving the selected descriptor, or NULL for plain text |
+| `EDITOR_REGISTER_DIRECTORY_FUNCTIONS` | `const EditorDirectoryFunctions *`; register host directory listing and local path-resolution callbacks |
+| `EDITOR_OPEN_DIRECTORY` | NUL-terminated host-native path; replace an unmodified buffer with a read-only listing, resolving relative to its current directory when browsing |
+| `EDITOR_ACTIVATE_DIRECTORY_ENTRY` | NULL; enter the directory or load the file at the caret, replacing the listing in place |
+| `EDITOR_GET_DIRECTORY` | `EditorDirectory *`; receive the current browser path and whether the buffer is a directory listing |
+| `EDITOR_TAKE_DIRECTORY_CHANGE` | `EditorDirectory *`; receive a pending browser path change, or NULL path when none; consumes the notification |
 | `EDITOR_UNDO`, `EDITOR_REDO` | NULL; restore one history step, returning to command mode |
 | `EDITOR_GET_SELECTION` | `EditorSelection *`; supply `line`, receive byte `start`/exclusive `end`, `active`, and `includes_newline` |
 | `EDITOR_GET_REGISTER` | `EditorRegister *` receiving borrowed UTF-8 `text`, byte `length`, and `linewise` |
@@ -397,6 +426,22 @@ deferred insertion, secondary rows remain unchanged until Esc, and `advance`
 positions their preview carets after the pending inserted characters. The primary
 caret remains available through `EDITOR_GET_CARET`. New/load clears block state.
 Mode transitions are synchronous and can be queried with `EDITOR_GET_MODE`.
+
+Directory callbacks are copied into each core and survive document replacement.
+Their context must outlive the core or be replaced before it expires. `list`
+receives a resolved directory path and an `EditorDirectoryEmit` callback; emit
+one entry per row with a UTF-8 display name, host-native full path, and directory
+flag. Include a parent entry named `..` when appropriate. Emitted strings are
+copied synchronously; stop and report failure if emit returns zero. `change`
+receives the current browser path (NULL when not browsing) and requested path;
+it must validate/resolve a directory without changing global working-directory
+state and return a `malloc`-allocated path through `resolved_path`. The core
+owns/frees that path, including any allocation returned on failure. Both
+callbacks return 1 for success or 0 for failure and must not reenter the core.
+Directory query/notification paths are borrowed until the next successful
+document replacement/navigation or core destruction. A file-selection
+notification has `active == 0`; hosts should update their filename without
+adding another buffer. Failed operations do not discard the old listing.
 The GUI sends key messages without interpreting commands or deciding transitions.
 Direct buffer-edit and navigation messages remain mode-independent for loading
 text, programmatic edits, and other non-keyboard clients.

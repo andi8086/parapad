@@ -73,8 +73,33 @@ typedef enum EditorMessage {
     EDITOR_TAKE_CHANGE,
     EDITOR_REGISTER_LEXER,
     EDITOR_SELECT_LEXER,
-    EDITOR_GET_LEXER
+    EDITOR_GET_LEXER,
+    EDITOR_REGISTER_DIRECTORY_FUNCTIONS,
+    EDITOR_OPEN_DIRECTORY,
+    EDITOR_ACTIVATE_DIRECTORY_ENTRY,
+    EDITOR_GET_DIRECTORY,
+    EDITOR_TAKE_DIRECTORY_CHANGE
 } EditorMessage;
+
+typedef struct EditorDirectoryEntry {
+    const char *name;
+    const char *path;
+    int is_directory;
+} EditorDirectoryEntry;
+
+typedef int (*EditorDirectoryEmit)(void *context, const EditorDirectoryEntry *entry);
+
+typedef struct EditorDirectoryFunctions {
+    void *context;
+    int (*list)(void *context, const char *path, EditorDirectoryEmit emit, void *emit_context);
+    int (*change)(void *context, const char *current_path, const char *requested_path,
+        char **resolved_path);
+} EditorDirectoryFunctions;
+
+typedef struct EditorDirectory {
+    const char *path;
+    int active;
+} EditorDirectory;
 
 typedef struct EditorChange {
     size_t revision;

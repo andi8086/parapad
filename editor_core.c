@@ -29,6 +29,12 @@ typedef struct HistoryEntry {
 } HistoryEntry;
 
 struct EditorCore {
+    EditorDirectoryFunctions directory_functions;
+    EditorDirectoryEntry *directory_entries;
+    size_t directory_count;
+    char *directory_path;
+    int directory_active;
+    int directory_changed;
     const Lexer **lexers;
     size_t lexer_count;
     const Lexer *lexer;
@@ -83,6 +89,30 @@ struct EditorCore {
     int history_open;
     int history_changed;
 };
+
+static void clear_directory(EditorCore *core)
+{
+    for (size_t index = 0; index < core->directory_count; ++index) {
+        free((void *)core->directory_entries[index].name);
+        free((void *)core->directory_entries[index].path);
+    }
+    free(core->directory_entries);
+    free(core->directory_path);
+    core->directory_entries = NULL;
+    core->directory_count = 0;
+    core->directory_path = NULL;
+    core->directory_active = 0;
+    core->directory_changed = 0;
+}
+
+static char *copy_string(const char *text)
+{
+    size_t length = strlen(text);
+    char *copy = malloc(length + 1);
+    if (copy)
+        memcpy(copy, text, length + 1);
+    return copy;
+}
 
 static int register_lexer(EditorCore *core, const Lexer *lexer)
 {
@@ -461,6 +491,7 @@ EditorCore *editor_core_create(const char *initial_text)
 void editor_core_destroy(EditorCore *core)
 {
     if (core) {
+    clear_directory(core);
     free(core->lexers);
         clear_replace_history(core);
         free(core->search_text);
@@ -705,6 +736,7 @@ static int set_buffer(EditorCore *core, const EditorBuffer *buffer)
     core->text = text;
     core->length = buffer->length;
     core->capacity = buffer->length + 1;
+    clear_directory(core);
     reset_document(core);
     return 1;
 }
@@ -743,8 +775,149 @@ static int load_file(EditorCore *core, const char *path)
     core->text = loaded.text;
     core->length = loaded.length;
     core->capacity = loaded.capacity;
+    clear_directory(core);
     reset_document(core);
     return 1;
+}
+
+typedef struct DirectoryListing {
+    EditorDirectoryEntry *entries;
+    size_t count;
+    size_t capacity;
+    int failed;
+} DirectoryListing;
+
+static int collect_directory_entry(void *context, const EditorDirectoryEntry *entry)
+{
+    DirectoryListing *listing = context;
+    if (listing->failed)
+        return 0;
+    if (!entry || !entry->name || !*entry->name || !entry->path || !*entry->path ||
+        strchr(entry->name, '\n') || strchr(entry->name, '\r')) {
+        listing->failed = 1;
+        return 0;
+    }
+    if (listing->count == listing->capacity) {
+        if (listing->capacity > SIZE_MAX / sizeof(*listing->entries) / 2) {
+            listing->failed = 1;
+            return 0;
+        }
+        size_t capacity = listing->capacity ? listing->capacity * 2 : 32;
+        EditorDirectoryEntry *entries = realloc(listing->entries, capacity * sizeof(*entries));
+        if (!entries) {
+            listing->failed = 1;
+            return 0;
+        }
+        listing->entries = entries;
+        listing->capacity = capacity;
+    }
+    EditorDirectoryEntry copied = { 0 };
+    copied.name = copy_string(entry->name);
+    copied.path = copy_string(entry->path);
+    copied.is_directory = entry->is_directory != 0;
+    if (!copied.name || !copied.path) {
+        free((void *)copied.name);
+        free((void *)copied.path);
+        listing->failed = 1;
+        return 0;
+    }
+    listing->entries[listing->count++] = copied;
+    return 1;
+}
+
+static int compare_directory_entries(const void *left, const void *right)
+{
+    const EditorDirectoryEntry *left_entry = left;
+    const EditorDirectoryEntry *right_entry = right;
+    int left_parent = !strcmp(left_entry->name, "..");
+    int right_parent = !strcmp(right_entry->name, "..");
+    if (left_parent != right_parent)
+        return right_parent - left_parent;
+    if (left_entry->is_directory != right_entry->is_directory)
+        return right_entry->is_directory - left_entry->is_directory;
+    return strcmp(left_entry->name, right_entry->name);
+}
+
+static int open_directory(EditorCore *core, const char *path)
+{
+    if (!path || core->modified || !core->directory_functions.list || !core->directory_functions.change)
+        return 0;
+    char *resolved = NULL;
+    if (!core->directory_functions.change(core->directory_functions.context,
+        core->directory_active ? core->directory_path : NULL, path, &resolved) ||
+        !resolved || !*resolved) {
+        free(resolved);
+        return 0;
+    }
+    DirectoryListing listing = { 0 };
+    EditorCore document = { 0 };
+    int success = core->directory_functions.list(core->directory_functions.context,
+        resolved, collect_directory_entry, &listing) && !listing.failed;
+    if (success && listing.count > 1)
+        qsort(listing.entries, listing.count, sizeof(*listing.entries), compare_directory_entries);
+    for (size_t index = 0; success && index < listing.count; ++index) {
+        const EditorDirectoryEntry *entry = &listing.entries[index];
+        size_t length = strlen(entry->name);
+        size_t suffix = entry->is_directory ? 1 : 0;
+        size_t separator = index + 1 < listing.count ? 1 : 0;
+        if (length > SIZE_MAX - suffix - separator - 1 ||
+            document.length > SIZE_MAX - length - suffix - separator - 1 ||
+            !reserve_text(&document, document.length + length + suffix + separator)) {
+            success = 0;
+            break;
+        }
+        memcpy(document.text + document.length, entry->name, length);
+        document.length += length;
+        if (suffix)
+            document.text[document.length++] = '/';
+        if (separator)
+            document.text[document.length++] = '\n';
+    }
+    EditorBuffer buffer = { (const unsigned char *)document.text, document.length };
+    if (success)
+        success = set_buffer(core, &buffer);
+    free(document.text);
+    if (!success) {
+        for (size_t index = 0; index < listing.count; ++index) {
+            free((void *)listing.entries[index].name);
+            free((void *)listing.entries[index].path);
+        }
+        free(listing.entries);
+        free(resolved);
+        return 0;
+    }
+    core->directory_entries = listing.entries;
+    core->directory_count = listing.count;
+    core->directory_path = resolved;
+    core->directory_active = 1;
+    core->directory_changed = 1;
+    core->lexer = NULL;
+    return 1;
+}
+
+static int activate_directory_entry(EditorCore *core)
+{
+    if (!core->directory_active)
+        return 0;
+    size_t line = 0;
+    for (size_t position = 0; position < core->cursor; ++position)
+        if (core->text[position] == '\n')
+            ++line;
+    if (line >= core->directory_count)
+        return 1;
+    const EditorDirectoryEntry *entry = &core->directory_entries[line];
+    if (entry->is_directory)
+        return open_directory(core, entry->path);
+    char *path = copy_string(entry->path);
+    if (!path)
+        return 0;
+    if (!load_file(core, path)) {
+        free(path);
+        return 0;
+    }
+    core->directory_path = path;
+    core->directory_changed = 1;
+    return select_lexer(core, path);
 }
 
 static int save_file(EditorCore *core, const char *path)
@@ -1745,6 +1918,43 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
 {
     if (!core)
         return 0;
+    if (core->directory_active) {
+        switch (message) {
+        case EDITOR_ADD_CHAR: case EDITOR_ADD_CODEPOINT: case EDITOR_INSERT_TEXT:
+        case EDITOR_BACKSPACE: case EDITOR_DELETE_CHAR: case EDITOR_DELETE_LINE:
+        case EDITOR_UNDO: case EDITOR_REDO: case EDITOR_SAVE_FILE:
+            return 0;
+        case EDITOR_EXECUTE_COMMAND: {
+            const char *command = data;
+            if (!command)
+                return 0;
+            if (core->command_prefix == '/')
+                break;
+            while (*command == ' ' || *command == '\t' || *command == ':')
+                ++command;
+            if (strncmp(command, "set", 3) ||
+                (command[3] && command[3] != ' ' && command[3] != '\t'))
+                return 0;
+            break;
+        }
+        case EDITOR_HANDLE_KEY: {
+            if (!data)
+                return 0;
+            unsigned long key = *(const unsigned long *)data;
+            if (key == '\r' || key == '\n')
+                return activate_directory_entry(core);
+            if (key == '-' || key == 8)
+                return open_directory(core, "..");
+            if (key < EDITOR_KEY_LEFT || key > EDITOR_KEY_END) {
+                if (key != 27 && key != ':' && key != '/' &&
+                    !(key > 0 && key < 128 && strchr("0123456789hjklwbeWBE^$gGtTnN*", (int)key)))
+                    return 0;
+            }
+            break;
+        }
+        default: break;
+        }
+    }
     switch (message) {
     case EDITOR_ADD_CHAR: case EDITOR_ADD_CODEPOINT: case EDITOR_INSERT_TEXT:
     case EDITOR_BACKSPACE: case EDITOR_DELETE_CHAR: case EDITOR_DELETE_LINE:
@@ -1756,6 +1966,27 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     default: break;
     }
     switch (message) {
+    case EDITOR_REGISTER_DIRECTORY_FUNCTIONS: {
+        const EditorDirectoryFunctions *functions = data;
+        if (!functions || !functions->list || !functions->change)
+            return 0;
+        core->directory_functions = *functions;
+        return 1;
+    }
+    case EDITOR_OPEN_DIRECTORY:
+        return open_directory(core, data);
+    case EDITOR_ACTIVATE_DIRECTORY_ENTRY:
+        return activate_directory_entry(core);
+    case EDITOR_GET_DIRECTORY:
+    case EDITOR_TAKE_DIRECTORY_CHANGE:
+        if (!data)
+            return 0;
+        ((EditorDirectory *)data)->active = core->directory_active;
+        ((EditorDirectory *)data)->path = message == EDITOR_GET_DIRECTORY || core->directory_changed
+            ? core->directory_path : NULL;
+        if (message == EDITOR_TAKE_DIRECTORY_CHANGE)
+            core->directory_changed = 0;
+        return 1;
     case EDITOR_REGISTER_LEXER:
         return register_lexer(core, data);
     case EDITOR_SELECT_LEXER:
@@ -1871,7 +2102,13 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
             return 0;
         selection->start = selection->end = 0;
         selection->active = selection->includes_newline = 0;
-        if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
+        if (core->directory_active) {
+            selection->active = core->directory_count && start == line_start(core, core->cursor);
+            if (selection->active) {
+                selection->end = end - start;
+                selection->includes_newline = 1;
+            }
+        } else if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
             size_t first, last, left, right;
             block_bounds(core, &first, &last, &left, &right);
             selection->active = selection->line >= first && selection->line <= last;

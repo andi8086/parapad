@@ -601,7 +601,8 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (editor)
             update_editor_caret(hWnd, editor);
         return 0;
-    case WM_LBUTTONDOWN: {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
         editor->pending_lead = 0;
         SetFocus(hWnd);
         int mouse_x = (short)LOWORD(lp);
@@ -625,6 +626,12 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             ReleaseDC(hWnd, dc);
         }
         editor_core_send(editor->core, EDITOR_SET_CARET, &caret);
+        if (msg == WM_LBUTTONDBLCLK) {
+            EditorDirectory directory;
+            editor_core_send(editor->core, EDITOR_GET_DIRECTORY, &directory);
+            if (directory.active && !editor_core_send(editor->core, EDITOR_ACTIVATE_DIRECTORY_ENTRY, NULL))
+                MessageBeep(MB_ICONWARNING);
+        }
         update_editor_caret(hWnd, editor);
         return 0;
     }
@@ -749,21 +756,157 @@ static const char *buffer_filename(const TextBuffer *buffer)
     for (const char *position = buffer->path; *position; ++position)
         if (*position == '\\' || *position == '/')
             name = position + 1;
-    return *name ? name : "Untitled";
+    return *name ? name : *buffer->path ? buffer->path : "Untitled";
 }
 
 static void configure_document_syntax(TextBuffer *buffer)
 {
-    editor_core_send(buffer->core, EDITOR_SELECT_LEXER, buffer->path);
+    EditorDirectory directory;
+    editor_core_send(buffer->core, EDITOR_GET_DIRECTORY, &directory);
+    editor_core_send(buffer->core, EDITOR_SELECT_LEXER, directory.active ? "" : buffer->path);
+}
+
+static int directory_full_path(const char *current, const char *name, char path[MAX_PATH])
+{
+    if (!name || !*name)
+        return 0;
+    char joined[MAX_PATH];
+    const char *input = name;
+    if (current && name[0] != '\\' && name[0] != '/' && name[1] != ':') {
+        size_t directory_length = strlen(current);
+        size_t name_length = strlen(name);
+        size_t separator = directory_length && current[directory_length - 1] != '\\' &&
+            current[directory_length - 1] != '/';
+        if (directory_length + separator + name_length >= MAX_PATH)
+            return 0;
+        memcpy(joined, current, directory_length);
+        if (separator)
+            joined[directory_length++] = '\\';
+        memcpy(joined + directory_length, name, name_length + 1);
+        input = joined;
+    }
+    DWORD copied = GetFullPathNameA(input, MAX_PATH, path, NULL);
+    return copied && copied < MAX_PATH;
+}
+
+static int change_directory(void *context, const char *current, const char *requested,
+    char **resolved)
+{
+    (void)context;
+    char path[MAX_PATH];
+    *resolved = NULL;
+    if (!directory_full_path(current, requested, path))
+        return 0;
+    DWORD attributes = GetFileAttributesA(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return 0;
+    size_t length = strlen(path);
+    while (length > 3 && (path[length - 1] == '\\' || path[length - 1] == '/'))
+        path[--length] = 0;
+    char *copy = malloc(length + 1);
+    if (!copy)
+        return 0;
+    memcpy(copy, path, length + 1);
+    *resolved = copy;
+    return 1;
+}
+
+static char *directory_display_name(const char *name)
+{
+    WCHAR wide[MAX_PATH];
+    int count = MultiByteToWideChar(CP_ACP, 0, name, -1, wide, MAX_PATH);
+    if (!count)
+        return NULL;
+    char *text = malloc((size_t)count * 4);
+    if (!text)
+        return NULL;
+    size_t length = 0;
+    for (int index = 0; index + 1 < count; ++index) {
+        unsigned long value = wide[index];
+        if (value >= 0xD800 && value <= 0xDBFF && index + 2 < count &&
+            wide[index + 1] >= 0xDC00 && wide[index + 1] <= 0xDFFF) {
+            value = 0x10000 + ((value - 0xD800) << 10) + (wide[++index] - 0xDC00);
+        } else if (value >= 0xD800 && value <= 0xDFFF) {
+            value = 0xFFFD;
+        }
+        if (value < 0x80) {
+            text[length++] = (char)value;
+        } else if (value < 0x800) {
+            text[length++] = (char)(0xC0 | (value >> 6));
+            text[length++] = (char)(0x80 | (value & 0x3F));
+        } else if (value < 0x10000) {
+            text[length++] = (char)(0xE0 | (value >> 12));
+            text[length++] = (char)(0x80 | ((value >> 6) & 0x3F));
+            text[length++] = (char)(0x80 | (value & 0x3F));
+        } else {
+            text[length++] = (char)(0xF0 | (value >> 18));
+            text[length++] = (char)(0x80 | ((value >> 12) & 0x3F));
+            text[length++] = (char)(0x80 | ((value >> 6) & 0x3F));
+            text[length++] = (char)(0x80 | (value & 0x3F));
+        }
+    }
+    text[length] = 0;
+    return text;
+}
+
+static int list_directory(void *context, const char *path, EditorDirectoryEmit emit,
+    void *emit_context)
+{
+    (void)context;
+    char pattern[MAX_PATH];
+    if (!directory_full_path(path, "*", pattern))
+        return 0;
+    char *parent = NULL;
+    if (change_directory(NULL, path, "..", &parent) && lstrcmpiA(path, parent)) {
+        EditorDirectoryEntry entry = { "..", parent, 1 };
+        if (!emit(emit_context, &entry)) {
+            free(parent);
+            return 0;
+        }
+    }
+    free(parent);
+    WIN32_FIND_DATAA found;
+    HANDLE search = FindFirstFileA(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
+    int success = 1;
+    do {
+        if (!lstrcmpA(found.cFileName, ".") || !lstrcmpA(found.cFileName, ".."))
+            continue;
+        char entry_path[MAX_PATH];
+        char *name = directory_display_name(found.cFileName);
+        if (!name || !directory_full_path(path, found.cFileName, entry_path)) {
+            free(name);
+            success = 0;
+            break;
+        }
+        EditorDirectoryEntry entry = { name, entry_path,
+            (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 };
+        success = emit(emit_context, &entry);
+        free(name);
+        if (!success)
+            break;
+    } while (FindNextFileA(search, &found));
+    if (success && GetLastError() != ERROR_NO_MORE_FILES)
+        success = 0;
+    FindClose(search);
+    return success;
 }
 
 static TextBuffer *create_document(const char *path)
 {
+    if (path && strlen(path) >= MAX_PATH)
+        return NULL;
     TextBuffer *buffer = calloc(1, sizeof(*buffer));
     if (!buffer)
         return NULL;
     buffer->core = editor_core_create("");
-    if (!buffer->core || (path && !editor_core_send(buffer->core, EDITOR_LOAD_FILE, (void *)path))) {
+    EditorDirectoryFunctions functions = { NULL, list_directory, change_directory };
+    DWORD attributes = path ? GetFileAttributesA(path) : INVALID_FILE_ATTRIBUTES;
+    EditorMessage load = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)
+        ? EDITOR_OPEN_DIRECTORY : EDITOR_LOAD_FILE;
+    if (!buffer->core || !editor_core_send(buffer->core, EDITOR_REGISTER_DIRECTORY_FUNCTIONS, &functions) ||
+        (path && !editor_core_send(buffer->core, load, (void *)path))) {
         editor_core_destroy(buffer->core);
         free(buffer);
         return NULL;
@@ -775,6 +918,34 @@ static TextBuffer *create_document(const char *path)
 }
 
 static void layout_main_children(HWND window);
+
+static void synchronize_directory_path(HWND window, MainWindowState *state)
+{
+    EditorDirectory directory;
+    if (!editor_core_send(state->core, EDITOR_TAKE_DIRECTORY_CHANGE, &directory) || !directory.path)
+        return;
+    TextBuffer *buffer = state->buffers[state->active_buffer];
+    lstrcpynA(buffer->path, directory.path, MAX_PATH);
+    buffer->first_line = 0;
+    buffer->left_pixel = 0;
+    configure_document_syntax(buffer);
+    HWND list = GetDlgItem(window, ID_BUFFER_LIST);
+    LRESULT item = SendMessageA(list, LB_INSERTSTRING, (WPARAM)state->active_buffer,
+        (LPARAM)buffer_filename(buffer));
+    if (item != LB_ERR && item != LB_ERRSPACE)
+        SendMessageA(list, LB_DELETESTRING, (WPARAM)(state->active_buffer + 1), 0);
+    SendMessageA(list, LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
+    InvalidateRect(list, NULL, FALSE);
+    update_document_title(window, state);
+    HWND editor = GetDlgItem(window, ID_EDITOR);
+    EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
+    if (control) {
+        control->first_line = 0;
+        control->left_pixel = 0;
+        control->pending_lead = 0;
+        control->bitmap_valid = 0;
+    }
+}
 
 static void activate_document(HWND window, MainWindowState *state, size_t index)
 {
@@ -894,6 +1065,12 @@ static int write_document(HWND window, MainWindowState *state, const char *path)
 
 static int save_document(HWND window, MainWindowState *state, int save_as)
 {
+    EditorDirectory directory;
+    editor_core_send(state->core, EDITOR_GET_DIRECTORY, &directory);
+    if (directory.active) {
+        MessageBoxA(window, "Directory buffers cannot be saved.", "parapad", MB_OK | MB_ICONWARNING);
+        return 0;
+    }
     char path[MAX_PATH];
     lstrcpynA(path, state->buffers[state->active_buffer]->path, MAX_PATH);
     if ((save_as || !path[0]) && !choose_file(window, path, 1))
@@ -1069,8 +1246,9 @@ static int execute_window_command(HWND window, MainWindowState *state, const cha
         char argument[MAX_PATH];
         memcpy(argument, position, length);
         argument[length] = 0;
-        DWORD copied = GetFullPathNameA(argument, MAX_PATH, path, NULL);
-        if (!copied || copied >= MAX_PATH)
+        EditorDirectory directory;
+        editor_core_send(state->core, EDITOR_GET_DIRECTORY, &directory);
+        if (!directory_full_path(directory.active ? directory.path : NULL, argument, path))
             return window_command_error(state, "invalid file name");
     }
     if (!strcmp(name, "tabe")) {
@@ -1096,6 +1274,10 @@ static int execute_window_command(HWND window, MainWindowState *state, const cha
         return 1;
     }
     if (!strcmp(name, "w")) {
+        EditorDirectory directory;
+        editor_core_send(state->core, EDITOR_GET_DIRECTORY, &directory);
+        if (directory.active)
+            return window_command_error(state, "directory buffers cannot be saved");
         const char *current = state->buffers[state->active_buffer]->path;
         if (!has_argument) {
             if (!*current)
@@ -1310,6 +1492,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     }
     case WM_EDITOR_MODE_CHANGED: {
+        synchronize_directory_path(hWnd, state);
         if ((EditorMode)wp != EDITOR_MODE_COMMAND_LINE)
             state->command_error = NULL;
         RECT item_rect;
@@ -1329,7 +1512,12 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             mode_text = prefix == '/' ? "SEARCH" : "COMMAND LINE";
             break;
         }
-        default: mode_text = "COMMAND"; break;
+        default: {
+            EditorDirectory directory;
+            editor_core_send(state->core, EDITOR_GET_DIRECTORY, &directory);
+            mode_text = directory.active ? "DIRECTORY" : "COMMAND";
+            break;
+        }
         }
         if ((EditorStatus)lp == EDITOR_STATUS_NO_CHANGE)
             mode_text = "no change";
@@ -1438,7 +1626,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     WNDCLASSA my_editor_cls;
 
     memset(&my_editor_cls, 0, sizeof(my_editor_cls));
-    my_editor_cls.style = CS_HREDRAW | CS_VREDRAW;
+    my_editor_cls.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     my_editor_cls.lpfnWndProc = my_editor_wnd_proc;
     my_editor_cls.hbrBackground = NULL;
     my_editor_cls.hCursor = LoadCursor(NULL, IDC_IBEAM);
