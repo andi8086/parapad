@@ -23,6 +23,7 @@ typedef struct CachedLine {
     size_t index;
     size_t length;
     EditorSelection selection;
+    EditorLineCaret caret;
     int exists;
     int valid;
 } CachedLine;
@@ -207,8 +208,10 @@ static void clear_line_cache(EditorControl *editor)
     editor->bitmap_valid = 0;
 }
 
-static void paint_editor(HDC dc, EditorControl *editor, int width, int height, int buffered)
+static void paint_editor(HDC dc, EditorControl *editor, int width, int height, int buffered, int focused)
 {
+    EditorCaret primary;
+    editor_core_send(editor->core, EDITOR_GET_CARET, &primary);
     size_t rows = height > 16 ? (size_t)((height - 17) / editor->line_height + 1) : 0;
     if (editor->line_count != rows) {
         clear_line_cache(editor);
@@ -255,11 +258,16 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
         EditorSelection selection = { index, 0, 0, 0, 0 };
         if (exists)
             editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
+        EditorLineCaret caret = { index, 0, 0, 0 };
+        if (exists && focused && index != primary.line)
+            editor_core_send(editor->core, EDITOR_GET_LINE_CARET, &caret);
         CachedLine *cached = editor->lines ? &editor->lines[index % rows] : NULL;
         if (reuse && cached && cached->valid && cached->index == index && cached->exists == exists &&
             cached->length == line.length && cached->selection.start == selection.start &&
             cached->selection.end == selection.end && cached->selection.active == selection.active &&
             cached->selection.includes_newline == selection.includes_newline &&
+            cached->caret.active == caret.active && cached->caret.column == caret.column &&
+            cached->caret.advance == caret.advance &&
             (!line.length || memcmp(cached->text, line.text, line.length) == 0))
             continue;
 
@@ -280,6 +288,17 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
                 IntersectClipRect(dc, editor->text_left, top, width - 8, dirty.bottom);
                 SetTextColor(dc, RGB(255, 0, 0));
                 layout_editor_line(dc, editor, index, line.length, top, 1, 0, NULL);
+                if (caret.active) {
+                    int offset = layout_editor_line(dc, editor, index, caret.column, 0, 0, 0, NULL);
+                    SIZE space = { 0, 0 };
+                    GetTextExtentPoint32A(dc, " ", 1, &space);
+                    int left = editor->text_left - editor->left_pixel + offset;
+                    if (space.cx > 0 && caret.advance <= (size_t)((INT_MAX - offset) / space.cx)) {
+                        left += (int)caret.advance * space.cx;
+                        RECT cursor = { left, top, left + 2, top + editor->line_height };
+                        FillRect(dc, &cursor, (HBRUSH)GetStockObject(WHITE_BRUSH));
+                    }
+                }
                 RestoreDC(dc, saved_dc);
             } else if (cached) {
                 cached->valid = 0;
@@ -297,6 +316,7 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
                 cached->index = index;
                 cached->exists = exists;
                 cached->selection = selection;
+                cached->caret = caret;
                 cached->valid = buffered;
             }
         }
@@ -353,6 +373,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_KILLFOCUS:
         editor->pending_lead = 0;
         DestroyCaret();
+        InvalidateRect(hWnd, NULL, FALSE);
         return 0;
     case WM_SIZE:
         if (editor)
@@ -459,7 +480,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
             HDC draw_dc = editor->back_bitmap && editor->back_width == width &&
                 editor->back_height == height ? editor->memdc : dc;
-            paint_editor(draw_dc, editor, width, height, draw_dc == editor->memdc);
+            paint_editor(draw_dc, editor, width, height, draw_dc == editor->memdc, GetFocus() == hWnd);
 
             if (draw_dc == editor->memdc)
                 BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
@@ -611,6 +632,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case EDITOR_MODE_INSERT: mode_text = "INSERT"; break;
         case EDITOR_MODE_VISUAL: mode_text = "VISUAL"; break;
         case EDITOR_MODE_VISUAL_LINE: mode_text = "VISUAL LINE"; break;
+        case EDITOR_MODE_VISUAL_BLOCK: mode_text = "VISUAL BLOCK"; break;
         default: mode_text = "COMMAND"; break;
         }
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,

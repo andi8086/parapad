@@ -24,6 +24,13 @@ struct EditorCore {
     size_t register_length;
     int register_linewise;
     int modified;
+    size_t block_anchor_column;
+    size_t block_column;
+    size_t block_first;
+    size_t block_last;
+    size_t block_insert_column;
+    size_t block_insert_start;
+    int block_insert;
 };
 
 static size_t decode_character(const char *text, size_t length, unsigned long *value)
@@ -120,7 +127,10 @@ static int insert_text(EditorCore *core, const char *text)
     core->cursor += count;
     if (count)
         core->modified = 1;
-    if (core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE)
+    if (core->block_insert && memchr(normalized, '\n', count))
+        core->block_insert = 0;
+    if (core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE ||
+        core->mode == EDITOR_MODE_VISUAL_BLOCK)
         core->mode = EDITOR_MODE_COMMAND;
     free(normalized);
     return 1;
@@ -178,6 +188,8 @@ static size_t next_character(const EditorCore *core, size_t position)
 
 static void erase_text(EditorCore *core, size_t start, size_t end)
 {
+    if (core->block_insert && (start < core->block_insert_start || end > core->cursor))
+        core->block_insert = 0;
     if (start != end)
         core->modified = 1;
     memmove(core->text + start, core->text + end,
@@ -187,7 +199,8 @@ static void erase_text(EditorCore *core, size_t start, size_t end)
         core->cursor -= end - start;
     else if (core->cursor > start)
         core->cursor = start;
-    if (core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE)
+    if (core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE ||
+        core->mode == EDITOR_MODE_VISUAL_BLOCK)
         core->mode = EDITOR_MODE_COMMAND;
 }
 
@@ -236,7 +249,127 @@ typedef struct TextRange {
 
 static int is_visual(const EditorCore *core)
 {
-    return core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE;
+    return core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE ||
+        core->mode == EDITOR_MODE_VISUAL_BLOCK;
+}
+
+static size_t character_column(const EditorCore *core, size_t position)
+{
+    size_t column = 0;
+    for (size_t offset = line_start(core, position); offset < position;
+        offset = next_character(core, offset))
+        ++column;
+    return column;
+}
+
+static size_t column_position(const EditorCore *core, size_t start, size_t end, size_t column)
+{
+    while (column-- && start < end)
+        start = next_character(core, start);
+    return start;
+}
+
+static size_t position_line(const EditorCore *core, size_t position)
+{
+    size_t line = 0;
+    for (size_t offset = 0; offset < position; ++offset)
+        if (core->text[offset] == '\n')
+            ++line;
+    return line;
+}
+
+static void block_bounds(const EditorCore *core, size_t *first, size_t *last,
+    size_t *left, size_t *right)
+{
+    size_t anchor = position_line(core, core->anchor);
+    size_t cursor = position_line(core, core->cursor);
+    *first = anchor < cursor ? anchor : cursor;
+    *last = anchor > cursor ? anchor : cursor;
+    *left = core->block_anchor_column < core->block_column ? core->block_anchor_column : core->block_column;
+    *right = core->block_anchor_column > core->block_column ? core->block_anchor_column : core->block_column;
+}
+
+static int finish_block_insert(EditorCore *core)
+{
+    if (!core->block_insert)
+        return 1;
+    size_t length = core->cursor - core->block_insert_start;
+    size_t copies = core->block_last - core->block_first;
+    if (length && copies > (SIZE_MAX - 1 - core->length) / length)
+        return 0;
+    char *text = length ? malloc(length) : NULL;
+    if (length && !text)
+        return 0;
+    if (length)
+        memcpy(text, core->text + core->block_insert_start, length);
+    if (!reserve_text(core, core->length + copies * length)) {
+        free(text);
+        return 0;
+    }
+    if (length) {
+        for (size_t line = core->block_last; line > core->block_first; --line) {
+            size_t start, end;
+            if (!find_line(core, line, &start, &end))
+                continue;
+            size_t position = column_position(core, start, end, core->block_insert_column);
+            if (character_column(core, position) < core->block_insert_column)
+                continue;
+            memmove(core->text + position + length, core->text + position,
+                core->length - position + 1);
+            memcpy(core->text + position, text, length);
+            core->length += length;
+            core->modified = 1;
+        }
+        core->cursor = previous_character(core, core->cursor);
+    }
+    free(text);
+    core->block_insert = 0;
+    return 1;
+}
+
+static int use_block(EditorCore *core, int remove)
+{
+    size_t first, last, left, right;
+    block_bounds(core, &first, &last, &left, &right);
+    size_t rows = last - first;
+    if (rows > SIZE_MAX - 1 - core->length)
+        return 0;
+    char *text = malloc(core->length + rows + 1);
+    if (!text)
+        return 0;
+    size_t length = 0;
+    for (size_t line = first;; ++line) {
+        size_t start, end;
+        find_line(core, line, &start, &end);
+        start = column_position(core, start, end, left);
+        end = column_position(core, start, end, right - left + 1);
+        memcpy(text + length, core->text + start, end - start);
+        length += end - start;
+        if (line == last)
+            break;
+        text[length++] = '\n';
+    }
+    text[length] = 0;
+    free(core->register_text);
+    core->register_text = text;
+    core->register_length = length;
+    core->register_linewise = 0;
+    if (remove) {
+        for (size_t line = last;; --line) {
+            size_t start, end;
+            find_line(core, line, &start, &end);
+            start = column_position(core, start, end, left);
+            end = column_position(core, start, end, right - left + 1);
+            erase_text(core, start, end);
+            if (line == first)
+                break;
+        }
+    }
+    size_t start, end;
+    find_line(core, first, &start, &end);
+    core->cursor = column_position(core, start, end, left);
+    core->mode = EDITOR_MODE_COMMAND;
+    return 1;
 }
 
 static void reset_command(EditorCore *core)
@@ -249,6 +382,7 @@ static void reset_command(EditorCore *core)
 
 static void reset_document(EditorCore *core)
 {
+    core->block_insert = 0;
     core->cursor = 0;
     core->anchor = 0;
     core->mode = EDITOR_MODE_COMMAND;
@@ -441,6 +575,34 @@ static void goto_line(EditorCore *core, size_t number)
 
 static int move_command(EditorCore *core, unsigned long key, size_t count, int explicit_count)
 {
+    if (core->mode == EDITOR_MODE_VISUAL_BLOCK &&
+        (key == 'h' || key == 'l' || key == EDITOR_KEY_LEFT || key == EDITOR_KEY_RIGHT)) {
+        size_t start = line_start(core, core->cursor);
+        size_t end = line_end(core, core->cursor);
+        while (count--) {
+            size_t previous = core->cursor;
+            if ((key == 'h' || key == EDITOR_KEY_LEFT) && core->cursor > start)
+                core->cursor = previous_character(core, core->cursor);
+            else if ((key == 'l' || key == EDITOR_KEY_RIGHT) && core->cursor < end)
+                core->cursor = next_character(core, core->cursor);
+            if (previous == core->cursor)
+                break;
+        }
+        return 1;
+    }
+    if (core->mode == EDITOR_MODE_VISUAL_BLOCK &&
+        (key == 'j' || key == 'k' || key == EDITOR_KEY_UP || key == EDITOR_KEY_DOWN)) {
+        size_t line = position_line(core, core->cursor);
+        while (count--) {
+            size_t target = key == 'j' || key == EDITOR_KEY_DOWN ? line + 1 : (line ? line - 1 : 0);
+            size_t start, end;
+            if (target == line || !find_line(core, target, &start, &end))
+                break;
+            core->cursor = column_position(core, start, end, core->block_column);
+            line = target;
+        }
+        return 1;
+    }
     EditorMessage message;
     switch (key) {
     case 'h': case EDITOR_KEY_LEFT: message = EDITOR_MOVE_LEFT; break;
@@ -455,6 +617,10 @@ static int move_command(EditorCore *core, unsigned long key, size_t count, int e
         return 1;
     case 'G':
         goto_line(core, explicit_count ? count : SIZE_MAX);
+        if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
+            size_t start = line_start(core, core->cursor);
+            core->cursor = column_position(core, start, line_end(core, start), core->block_column);
+        }
         return 1;
     case 'w': case 'b':
         while (count--) {
@@ -536,6 +702,8 @@ static int paste_register(EditorCore *core, size_t count, int before)
 static int handle_key(EditorCore *core, unsigned long key)
 {
     if (key == 27) {
+        if (!finish_block_insert(core))
+            return 0;
         core->mode = EDITOR_MODE_COMMAND;
         reset_command(core);
         return 1;
@@ -544,6 +712,12 @@ static int handle_key(EditorCore *core, unsigned long key)
         (key > 0x10FFFF && key < EDITOR_KEY_DELETE) || (key >= 0xD800 && key <= 0xDFFF))
         return 0;
     if (core->mode == EDITOR_MODE_INSERT) {
+        if (core->block_insert) {
+            if (key == '\b' && core->cursor == core->block_insert_start)
+                return 1;
+            if (key == EDITOR_KEY_DELETE || key >= EDITOR_KEY_LEFT || key == '\r' || key == '\n')
+                core->block_insert = 0;
+        }
         if (key == EDITOR_KEY_DELETE)
             return editor_core_send(core, EDITOR_DELETE_CHAR, NULL);
         if (key >= EDITOR_KEY_LEFT)
@@ -580,6 +754,10 @@ static int handle_key(EditorCore *core, unsigned long key)
         if (pending == 'g') {
             if (key == 'g')
                 goto_line(core, count);
+            if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
+                size_t start = line_start(core, core->cursor);
+                core->cursor = column_position(core, start, line_end(core, start), core->block_column);
+            }
             return 1;
         }
         if (key == pending)
@@ -600,16 +778,39 @@ static int handle_key(EditorCore *core, unsigned long key)
         return use_range(core, range, pending == 'd');
     }
     core->count = 0;
-    if (key == 'v' || key == 'V') {
-        EditorMode mode = key == 'v' ? EDITOR_MODE_VISUAL : EDITOR_MODE_VISUAL_LINE;
+    if (key == 'v' || key == 'V' || key == 22) {
+        EditorMode mode = key == 22 ? EDITOR_MODE_VISUAL_BLOCK :
+            (key == 'v' ? EDITOR_MODE_VISUAL : EDITOR_MODE_VISUAL_LINE);
         if (core->mode == mode)
             core->mode = EDITOR_MODE_COMMAND;
         else {
             if (!is_visual(core))
                 core->anchor = core->cursor;
             core->mode = mode;
+            if (mode == EDITOR_MODE_VISUAL_BLOCK) {
+                core->block_anchor_column = character_column(core, core->anchor);
+                core->block_column = character_column(core, core->cursor);
+            }
         }
         return 1;
+    }
+    if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
+        if (key == 'I') {
+            size_t right;
+            block_bounds(core, &core->block_first, &core->block_last, &core->block_insert_column, &right);
+            size_t start, end;
+            find_line(core, core->block_first, &start, &end);
+            core->cursor = column_position(core, start, end, core->block_insert_column);
+            core->block_insert_column = character_column(core, core->cursor);
+            core->block_insert_start = core->cursor;
+            core->block_insert = 1;
+            core->mode = EDITOR_MODE_INSERT;
+            return 1;
+        }
+        if (key == 'y' || key == 'd' || key == 'x' || key == EDITOR_KEY_DELETE)
+            return use_block(core, key != 'y');
+        if (key == 'p' || key == 'P')
+            return 1;
     }
     if (is_visual(core) && (key == 'y' || key == 'd' || key == 'x' || key == EDITOR_KEY_DELETE))
         return use_range(core, selected_range(core), key != 'y');
@@ -633,6 +834,9 @@ static int handle_key(EditorCore *core, unsigned long key)
         return use_range(core, range, 1);
     }
     move_command(core, key, count, explicit_count);
+    if (core->mode == EDITOR_MODE_VISUAL_BLOCK && key != 'j' && key != 'k' &&
+        key != EDITOR_KEY_UP && key != EDITOR_KEY_DOWN && key != 'G')
+        core->block_column = character_column(core, core->cursor);
     return 1;
 }
 
@@ -669,6 +873,34 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
         value->linewise = core->register_linewise;
         return 1;
     }
+    case EDITOR_GET_LINE_CARET: {
+        EditorLineCaret *caret = data;
+        size_t start, end;
+        if (!caret || !find_line(core, caret->line, &start, &end))
+            return 0;
+        caret->active = 0;
+        caret->column = caret->advance = 0;
+        size_t first, last, left, right;
+        if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
+            block_bounds(core, &first, &last, &left, &right);
+            if (caret->line >= first && caret->line <= last) {
+                caret->active = 1;
+                caret->column = column_position(core, start, end, core->block_column) - start;
+            }
+        } else if (core->block_insert && caret->line >= core->block_first && caret->line <= core->block_last) {
+            size_t position = column_position(core, start, end, core->block_insert_column);
+            if (character_column(core, position) == core->block_insert_column) {
+                caret->active = 1;
+                caret->column = position - start;
+                caret->advance = character_column(core, core->cursor) - core->block_insert_column;
+                if (caret->line == core->block_first) {
+                    caret->column = core->cursor - start;
+                    caret->advance = 0;
+                }
+            }
+        }
+        return 1;
+    }
     case EDITOR_GET_SELECTION: {
         EditorSelection *selection = data;
         size_t start, end;
@@ -676,7 +908,15 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
             return 0;
         selection->start = selection->end = 0;
         selection->active = selection->includes_newline = 0;
-        if (is_visual(core)) {
+        if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
+            size_t first, last, left, right;
+            block_bounds(core, &first, &last, &left, &right);
+            selection->active = selection->line >= first && selection->line <= last;
+            if (selection->active) {
+                selection->start = column_position(core, start, end, left) - start;
+                selection->end = column_position(core, start + selection->start, end, right - left + 1) - start;
+            }
+        } else if (is_visual(core)) {
             TextRange range = selected_range(core);
             selection->active = range.linewise ?
                 start <= line_start(core, core->anchor > core->cursor ? core->anchor : core->cursor) && end >= range.start :
@@ -798,23 +1038,31 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
         size_t start, end;
         if (!caret || !find_line(core, caret->line, &start, &end))
             return 0;
+        core->block_insert = 0;
         core->cursor = clamp_column(core, start, end, caret->column);
+        if (core->mode == EDITOR_MODE_VISUAL_BLOCK)
+            core->block_column = character_column(core, core->cursor);
         return 1;
     }
     case EDITOR_MOVE_LEFT:
+        core->block_insert = 0;
         core->cursor = previous_character(core, core->cursor);
         return 1;
     case EDITOR_MOVE_RIGHT:
+        core->block_insert = 0;
         core->cursor = next_character(core, core->cursor);
         return 1;
     case EDITOR_MOVE_HOME:
+        core->block_insert = 0;
         core->cursor = line_start(core, core->cursor);
         return 1;
     case EDITOR_MOVE_END:
+        core->block_insert = 0;
         core->cursor = line_end(core, core->cursor);
         return 1;
     case EDITOR_MOVE_UP:
     case EDITOR_MOVE_DOWN: {
+        core->block_insert = 0;
         size_t start = line_start(core, core->cursor);
         size_t column = core->cursor - start;
         size_t end;

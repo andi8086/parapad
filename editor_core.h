@@ -9,7 +9,8 @@ typedef enum EditorMode {
     EDITOR_MODE_COMMAND,
     EDITOR_MODE_INSERT,
     EDITOR_MODE_VISUAL,
-    EDITOR_MODE_VISUAL_LINE
+    EDITOR_MODE_VISUAL_LINE,
+    EDITOR_MODE_VISUAL_BLOCK
 } EditorMode;
 
 typedef enum EditorKey {
@@ -48,7 +49,8 @@ typedef enum EditorMessage {
     EDITOR_GET_BUFFER,
     EDITOR_LOAD_FILE,
     EDITOR_SAVE_FILE,
-    EDITOR_GET_MODIFIED
+    EDITOR_GET_MODIFIED,
+    EDITOR_GET_LINE_CARET
 } EditorMessage;
 
 typedef struct EditorLine {
@@ -68,6 +70,13 @@ typedef struct EditorCharacter {
     unsigned long value;
     size_t length;
 } EditorCharacter;
+
+typedef struct EditorLineCaret {
+    size_t line;
+    size_t column;
+    size_t advance;
+    int active;
+} EditorLineCaret;
 
 typedef struct EditorSelection {
     size_t line;

@@ -3,7 +3,7 @@
 Build `parapad.sln` in Visual Studio with the v142 C++ toolset and Windows SDK.
 The application starts with an empty text buffer in command mode. Press `i` to
 enter insert mode and Esc to return to command mode. The main window's status bar
-shows `COMMAND`, `INSERT`, `VISUAL`, or `VISUAL LINE` directly from the core's state.
+shows `COMMAND`, `INSERT`, `VISUAL`, `VISUAL LINE`, or `VISUAL BLOCK` directly from the core's state.
 The fixed black left gutter displays cyan one-based line numbers in a five-character field,
 right-aligned and padded with spaces. Lines above 99999 display `#####`.
 The editor retains its GDI bitmap and shifts existing rows during small vertical
@@ -44,11 +44,13 @@ for a future hex view, not an implemented hex editor.
 | `0`, `$`, Home, End | Move to the start/end of the line |
 | `v` | Toggle inclusive character selection |
 | `V` (Shift+V) | Toggle whole-line selection |
+| Ctrl+V | Toggle rectangular visual-block selection; motions extend the rectangle |
+| `I` (Shift+I) in visual-block mode | Insert at the left edge on the top selected line; Esc repeats the insertion on the other selected lines |
 | `y` in visual mode | Copy the selection to the core's register and return to command mode |
 | `yy` | Copy the current line |
 | `p` | Paste after the caret, or below the current line for a linewise register |
 | `P` (Shift+P) | Paste before the caret, or above the current line for a linewise register |
-| `p`, `P` in visual mode | Replace the selection with the register contents |
+| `p`, `P` in character/line visual mode | Replace the selection with the register contents |
 | `x`, Delete | Delete selected text, or characters on the current line, saving them to the register |
 | `d` plus a motion | Delete the motion's range, e.g. `dw`, `d$`, `d0`, `dj`, `dG` |
 | `dd` | Delete the current line, saving it to the register |
@@ -73,6 +75,20 @@ even for the document's final unterminated line. Visual paste preserves the
 register; subsequent paste can reuse it. Copy/paste uses a per-core internal UTF-8
 register, not the Windows system clipboard, so no code-page conversion loses text.
 
+Ctrl+V selects an inclusive rectangle in character columns rather than byte
+offsets, retaining the target column when moving vertically through short lines.
+The GUI highlights each row's selected bytes and draws stacked secondary carets.
+`x`, Delete, or `d` deletes the rectangle without removing line separators.
+`I` starts a block insert: type on the top selected line, then press Esc to repeat
+the final inserted text on the remaining selected lines. Backspace can remove
+characters typed during that session but cannot erase before its starting point.
+Lines shorter than the insertion column are skipped; no padding is added. The
+starting column is clamped to the top selected line. Moving the caret, clicking,
+pressing Delete, or inserting a newline ends repetition and continues ordinary
+editing on the first line. An empty insert followed by Esc changes nothing.
+Block yank/delete stores newline-separated row slices in the ordinary register;
+blockwise paste is not implemented, and `p`/`P` while selecting a block is a no-op.
+
 ## Editor Core
 
 `editor_core.h` exposes an opaque `EditorCore` with no Windows dependencies.
@@ -87,7 +103,8 @@ allocation failure. Failed edits leave the document unchanged.
 | Message | Data |
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
-| `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/visual/visual-line mode |
+| `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/visual/visual-line/visual-block mode |
+| `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |
 | `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; load the file verbatim in binary mode |
@@ -114,6 +131,11 @@ allocation failure. Failed edits leave the document unchanged.
 command mode to insert mode without inserting itself; scalar 27 (Esc) returns to
 command mode without inserting a character. Backspace, Tab, and Enter are passed
 as their ASCII control values. Navigation and Delete use the `EditorKey` enum.
+Ctrl+V is scalar 22. Block selection and deferred insertion are owned by the core;
+`EDITOR_GET_LINE_CARET` supplies per-line caret positions for rendering. During
+deferred insertion, secondary rows remain unchanged until Esc, and `advance`
+positions their preview carets after the pending inserted characters. The primary
+caret remains available through `EDITOR_GET_CARET`. New/load clears block state.
 Mode transitions are synchronous and can be queried with `EDITOR_GET_MODE`.
 The GUI sends key messages without interpreting commands or deciding transitions.
 Direct buffer-edit and navigation messages remain mode-independent for loading

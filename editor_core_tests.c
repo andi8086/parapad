@@ -413,8 +413,98 @@ static void test_raw_files(void)
     editor_core_destroy(core);
 }
 
+static void test_visual_block(void)
+{
+    EditorCore *core = editor_core_create("abcd\nefgh\nijkl");
+    assert(core);
+    send_keys(core, "l\026" "2jIHi");
+    expect_line(core, 0, "aHibcd");
+    expect_line(core, 1, "efgh");
+    send_key(core, 27);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    expect_line(core, 1, "eHifgh");
+    expect_line(core, 2, "iHijkl");
+    send_keys(core, "ggl\026" "2jlx");
+    expect_line(core, 0, "abcd");
+    expect_line(core, 1, "efgh");
+    expect_line(core, 2, "ijkl");
+    editor_core_destroy(core);
+
+    core = editor_core_create("abcd\nx\nABCD");
+    assert(core);
+    send_keys(core, "2l\026" "2j");
+    EditorSelection selection = { 2, 0, 0, 0, 0 };
+    assert(editor_core_send(core, EDITOR_GET_SELECTION, &selection));
+    assert(selection.active && selection.start == 2 && selection.end == 3 && !selection.includes_newline);
+    EditorLineCaret caret = { 2, 0, 0, 0 };
+    assert(editor_core_send(core, EDITOR_GET_LINE_CARET, &caret));
+    assert(caret.active && caret.column == 2);
+    send_keys(core, "IUV\b");
+    caret.line = 2;
+    assert(editor_core_send(core, EDITOR_GET_LINE_CARET, &caret));
+    assert(caret.active && caret.column == 2 && caret.advance == 1);
+    caret.line = 1;
+    assert(editor_core_send(core, EDITOR_GET_LINE_CARET, &caret));
+    assert(!caret.active);
+    send_key(core, 27);
+    expect_line(core, 0, "abUcd");
+    expect_line(core, 1, "x");
+    expect_line(core, 2, "ABUCD");
+    expect_caret(core, 0, 2);
+    send_keys(core, "G2l\026" "2khx");
+    expect_line(core, 0, "acd");
+    expect_line(core, 1, "x");
+    expect_line(core, 2, "ACD");
+    editor_core_destroy(core);
+
+    core = editor_core_create("a\xC3\xA4z\nbQz");
+    assert(core);
+    send_keys(core, "l\026jx");
+    expect_line(core, 0, "az");
+    expect_line(core, 1, "bz");
+    send_keys(core, "ggl\026jI");
+    send_key(core, '\b');
+    send_key(core, 0xE4);
+    send_key(core, '\b');
+    send_key(core, 27);
+    expect_line(core, 0, "az");
+    expect_line(core, 1, "bz");
+    send_keys(core, "ggl\026jI");
+    send_key(core, 0xE4);
+    send_key(core, 27);
+    expect_line(core, 0, "a\xC3\xA4z");
+    expect_line(core, 1, "b\xC3\xA4z");
+    send_keys(core, "gg\026jI");
+    send_key(core, 27);
+    expect_line(core, 1, "b\xC3\xA4z");
+    send_keys(core, "gg\026jIA");
+    send_key(core, EDITOR_KEY_RIGHT);
+    send_key(core, 27);
+    expect_line(core, 0, "Aa\xC3\xA4z");
+    expect_line(core, 1, "b\xC3\xA4z");
+    send_keys(core, "gg\026j");
+    send_key(core, 22);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    assert(!editor_core_send(core, EDITOR_GET_LINE_CARET, NULL));
+    editor_core_destroy(core);
+
+    core = editor_core_create("a\nb");
+    assert(core);
+    send_keys(core, "\026jIZ");
+    const char *path = "Debug/core-tests/editor_core_block_save.bin";
+    assert(editor_core_send(core, EDITOR_SAVE_FILE, (void *)path));
+    int modified = 1;
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    send_key(core, 27);
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && modified);
+    expect_line(core, 1, "Zb");
+    assert(remove(path) == 0);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_visual_block();
     test_raw_files();
     test_visual_commands();
     test_counted_commands();
