@@ -1258,6 +1258,76 @@ static int handle_key(EditorCore *core, unsigned long key)
     return 1;
 }
 
+static int retab(EditorCore *core)
+{
+    if (!core->settings.expandtabs)
+        return 1;
+    size_t length = core->length;
+    size_t column = 0;
+    int found = 0;
+    for (size_t position = 0; position < core->length; position = next_character(core, position)) {
+        if (core->text[position] == '\t') {
+            size_t spaces = core->settings.tabwidth - column;
+            if (spaces - 1 > SIZE_MAX - 1 - length)
+                return 0;
+            length += spaces - 1;
+            column = 0;
+            found = 1;
+        } else if (core->text[position] == '\n') {
+            column = 0;
+        } else {
+            column = column + 1 == core->settings.tabwidth ? 0 : column + 1;
+        }
+    }
+    if (!found)
+        return 1;
+    char *text = malloc(length + 1);
+    if (!text)
+        return 0;
+    size_t offset = 0;
+    size_t cursor = length;
+    column = 0;
+    for (size_t position = 0; position < core->length;) {
+        if (position == core->cursor)
+            cursor = offset;
+        size_t next = next_character(core, position);
+        if (core->text[position] == '\t') {
+            size_t spaces = core->settings.tabwidth - column;
+            memset(text + offset, ' ', spaces);
+            offset += spaces;
+            column = 0;
+        } else {
+            memcpy(text + offset, core->text + position, next - position);
+            offset += next - position;
+            column = core->text[position] == '\n' || column + 1 == core->settings.tabwidth ? 0 : column + 1;
+        }
+        position = next;
+    }
+    text[length] = 0;
+    core->history_open = 0;
+    int success = write_span(core, 0, core->length, text, length);
+    free(text);
+    if (!success)
+        return 0;
+    core->history_open = 0;
+    core->cursor = core->anchor = cursor;
+    core->block_insert = 0;
+    clear_replace_history(core);
+    core->mode = EDITOR_MODE_COMMAND;
+    reset_command(core);
+    return 1;
+}
+
+static int complete_command(EditorCore *core)
+{
+    core->status = EDITOR_STATUS_NONE;
+    if (core->mode == EDITOR_MODE_COMMAND_LINE) {
+        core->mode = EDITOR_MODE_COMMAND;
+        reset_command(core);
+    }
+    return 1;
+}
+
 static int execute_command(EditorCore *core, const char *text)
 {
     core->status = EDITOR_STATUS_INVALID_COMMAND;
@@ -1269,6 +1339,14 @@ static int execute_command(EditorCore *core, const char *text)
         ++text;
     while (*text == ' ' || *text == '\t')
         ++text;
+    if (strncmp(text, "retab", 5) == 0) {
+        text += 5;
+        while (*text == ' ' || *text == '\t')
+            ++text;
+        if (*text || !retab(core))
+            return 0;
+        return complete_command(core);
+    }
     if (strncmp(text, "set", 3) || (text[3] != ' ' && text[3] != '\t'))
         return 0;
     text += 3;
@@ -1313,12 +1391,7 @@ static int execute_command(EditorCore *core, const char *text)
         return 0;
     }
     core->settings = settings;
-    core->status = EDITOR_STATUS_NONE;
-    if (core->mode == EDITOR_MODE_COMMAND_LINE) {
-        core->mode = EDITOR_MODE_COMMAND;
-        reset_command(core);
-    }
-    return 1;
+    return complete_command(core);
 }
 
 static int dispatch_message(EditorCore *core, EditorMessage message, void *data)

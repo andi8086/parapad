@@ -123,9 +123,10 @@ status bar. For example:
 :set tabwidth=4
 :set expandtabs=0
 :set expandtabs=1
+:retab
 ```
 
-Enter applies the setting, closes the input, and returns focus to the editor.
+Enter executes the command, closes the input, and returns focus to the editor.
 Esc closes it without applying the pending command. The input is hidden and
 disabled when inactive, and does not open for colons typed in insert/replace
 mode or as the character following `r`. Commands are limited to 1023 input bytes.
@@ -135,6 +136,13 @@ Whitespace around `=` is allowed. Unknown commands/settings, negative values,
 invalid booleans, trailing text, integer overflow, and zero `tabwidth` are
 rejected without changing settings. The input stays open for correction and the
 status bar shows `invalid command`.
+
+`:retab` replaces every real tab in the document with spaces reaching the next
+virtual tab stop, using the current `tabwidth`, but only when `expandtabs=1`.
+With `expandtabs=0`, or when no real tabs remain, it does nothing. Existing spaces
+and all other bytes are preserved, including NULs, malformed UTF-8, and line
+endings. The caret is remapped past expanded tabs, and the complete conversion
+is one undo/redo step. The command takes no arguments.
 
 Each core owns an `EditorSettings` value, queried with `EDITOR_GET_SETTINGS` and
 updated with `EDITOR_SET_SETTINGS`.
@@ -198,7 +206,7 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_GET_STATUS` | `EditorStatus *` receiving `EDITOR_STATUS_NONE`, `EDITOR_STATUS_NO_CHANGE`, or `EDITOR_STATUS_INVALID_COMMAND` without clearing it |
 | `EDITOR_GET_SETTINGS` | `EditorSettings *` receiving `maxcol`, `tabwidth`, and `expandtabs` |
 | `EDITOR_SET_SETTINGS` | `const EditorSettings *` supplying all three settings |
-| `EDITOR_EXECUTE_COMMAND` | NUL-terminated command string, with an optional leading `:`; parse and apply `set name=value` in the core |
+| `EDITOR_EXECUTE_COMMAND` | NUL-terminated command string, with an optional leading `:`; execute `set name=value` or `retab` in the core |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |

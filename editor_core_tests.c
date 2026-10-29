@@ -921,8 +921,75 @@ static void test_set_commands(void)
     editor_core_destroy(core);
 }
 
+static void test_retab(void)
+{
+    EditorCore *core = editor_core_create("a\tb\n\t\tZ\n\xC3\xA4\t!");
+    assert(core);
+    EditorCaret caret = { 0, 2 };
+    assert(editor_core_send(core, EDITOR_SET_CARET, &caret));
+    send_key(core, ':');
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, ":retab"));
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    expect_line(core, 0, "a       b");
+    expect_line(core, 1, "                Z");
+    expect_line(core, 2, "\xC3\xA4       !");
+    expect_caret(core, 0, 8);
+    int modified;
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && modified);
+    send_key(core, 'u');
+    expect_line(core, 0, "a\tb");
+    expect_line(core, 1, "\t\tZ");
+    expect_line(core, 2, "\xC3\xA4\t!");
+    expect_caret(core, 0, 2);
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    send_key(core, 18);
+    expect_line(core, 0, "a       b");
+    expect_caret(core, 0, 8);
+    send_key(core, 'x');
+    expect_line(core, 0, "a       ");
+    send_key(core, 'u');
+    expect_line(core, 0, "a       b");
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "retab"));
+    send_key(core, 'u');
+    expect_line(core, 0, "a\tb");
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "set expandtabs=0"));
+    send_key(core, ':');
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "retab \t"));
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    expect_line(core, 0, "a\tb");
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    send_key(core, 18);
+    expect_line(core, 0, "a       b");
+    assert(!editor_core_send(core, EDITOR_EXECUTE_COMMAND, "retab extra"));
+    assert(!editor_core_send(core, EDITOR_EXECUTE_COMMAND, "retabbing"));
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "set expandtabs=1"));
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "set tabwidth=4"));
+    const unsigned char bytes[] = { '\t', 0, 0xFF, '\t', '\r', '\n', 'x', '\t' };
+    EditorBuffer raw = { bytes, sizeof(bytes) };
+    assert(editor_core_send(core, EDITOR_SET_BUFFER, &raw));
+    caret.line = 1;
+    caret.column = 2;
+    assert(editor_core_send(core, EDITOR_SET_CARET, &caret));
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "retab"));
+    const unsigned char expected[] = { ' ', ' ', ' ', ' ', 0, 0xFF, ' ', ' ', '\r', '\n', 'x', ' ', ' ', ' ' };
+    EditorBuffer actual;
+    assert(editor_core_send(core, EDITOR_GET_BUFFER, &actual));
+    assert(actual.length == sizeof(expected) && memcmp(actual.data, expected, sizeof(expected)) == 0);
+    expect_caret(core, 1, 4);
+    send_key(core, 'u');
+    assert(editor_core_send(core, EDITOR_GET_BUFFER, &actual));
+    assert(actual.length == sizeof(bytes) && memcmp(actual.data, bytes, sizeof(bytes)) == 0);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "set tabwidth=1"));
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "retab"));
+    const unsigned char single[] = { ' ', 0, 0xFF, ' ', '\r', '\n', 'x', ' ' };
+    assert(editor_core_send(core, EDITOR_GET_BUFFER, &actual));
+    assert(actual.length == sizeof(single) && memcmp(actual.data, single, sizeof(single)) == 0);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_retab();
     test_set_commands();
     test_settings();
     test_undo_redo();
