@@ -204,6 +204,11 @@ the system selection colors.
 | `.` in command mode | Repeat the last keyboard editing command at the caret; a count overrides its saved count |
 | `y` in visual mode | Copy the selection to the core's register and return to command mode |
 | `yy` | Copy the current line |
+| `gq` plus a motion | Reflow whole affected lines at `maxcol`, e.g. `gqj`, `gqk`, `gqG`, or `gqgg` |
+| `gqq` | Reflow the current line; `3gqq` formats three consecutive lines |
+| `gqip`, `gqap` | Reflow the current paragraph, without/with surrounding separator lines; counts include subsequent paragraphs |
+| `gq` in visual mode | Reflow the whole lines touched by the selection |
+| `<`, `>` | Decrease/increase indentation of selected lines, or the current line without a selection |
 | `p` | Paste after the caret, or below the current line for a linewise register |
 | `P` (Shift+P) | Paste before the caret, or above the current line for a linewise register |
 | `p`, `P` in character/line visual mode | Replace the selection with the register contents |
@@ -311,6 +316,40 @@ A failed search leaves the caret unchanged and displays `pattern not found`;
 the search input remains open for correction or Esc. `n`/`N` without a pattern shows
 `no previous search`. Searching does not modify bytes, the yank register, or undo
 history. Each open buffer retains its own search pattern when switching buffers.
+
+## Formatting And Indentation
+
+`gqj` formats the current line and the following line as text, joining their
+words and inserting line breaks at `maxcol`. `gqk` includes the preceding line;
+`gqG` formats through the last line and `gqgg` through the first. Existing motions
+also work as `gq` targets. `gqq` formats one line, and visual `gq` formats all
+selected rows, including rows touched by character or rectangular selections.
+Counts before `gq` and before a motion multiply, as with delete/yank operators.
+`gqip` selects a blank-line-delimited paragraph; `gqap` also includes its trailing
+separator lines. For example, `2gqip` formats two paragraphs independently.
+
+Formatting preserves paragraph breaks, the paragraph's initial indentation,
+and whether the buffer ends with a newline. Whitespace between words is
+normalized to one space. Words are never split, so an individual long word can
+exceed `maxcol`. Display widths include indentation, tab stops, and Unicode
+scalars. In C/C++ buffers, `//`, `///`, and `//!` comment leaders are retained on
+wrapped lines rather than becoming words within the paragraph. This is text
+reflow, not a C/C++ code formatter. `maxcol=0` disables `gq` formatting.
+
+A single `>` or `<` applies immediately; a second key is not required. Each
+step adds/removes `tabwidth` display columns of leading indentation, never
+going below column zero. Generated indentation respects `expandtabs`, including
+mixed tabs/spaces and partially removed tab stops. Blank lines are left alone.
+Without a selection, a count chooses consecutive lines: `3>` shifts three lines
+right by one step. With a selection, it chooses indentation steps: `3>` shifts
+every selected row right by three steps. Character, line, and block selections
+all operate on whole lines.
+
+Formatting and shifting leave the yank register unchanged, preserve LF/CRLF
+mode and bytes outside the target range, and return to command mode at the
+first affected line's first nonblank character. Each operation is one undo
+step and supports dot-repeat. Esc cancels an unfinished `gq` sequence. Directory
+listings remain read-only.
 
 ## C/C++ Indentation
 

@@ -1418,6 +1418,217 @@ static size_t c_indent_write(char *text, size_t column, const EditorSettings *se
     return tabs + spaces;
 }
 
+static TextRange whole_lines(const EditorCore *core, TextRange range)
+{
+    size_t last = range.end > range.start ? range.end - 1 : range.start;
+    range.start = line_start(core, range.start);
+    range.end = line_end(core, last);
+    if (range.end < core->length)
+        ++range.end;
+    range.linewise = 1;
+    return range;
+}
+
+static int blank_text_line(const EditorCore *core, size_t start)
+{
+    size_t end = line_end(core, start);
+    while (start < end && (core->text[start] == ' ' || core->text[start] == '\t'))
+        ++start;
+    return start == end;
+}
+
+static TextRange paragraph_lines(const EditorCore *core, size_t count, int around)
+{
+    size_t start = line_start(core, core->cursor);
+    int blank = blank_text_line(core, start);
+    while (start && blank_text_line(core, line_start(core, start - 1)) == blank)
+        start = line_start(core, start - 1);
+    size_t end = start;
+    if (blank) {
+        while (end < core->length && blank_text_line(core, end)) {
+            size_t next = line_end(core, end);
+            end = next < core->length ? next + 1 : next;
+        }
+        if (!around) {
+            TextRange range = { start, end, 1 };
+            return range;
+        }
+    }
+    while (count-- && end < core->length) {
+        while (end < core->length && !blank_text_line(core, end)) {
+            size_t next = line_end(core, end);
+            end = next < core->length ? next + 1 : next;
+        }
+        if (count || around) {
+            while (end < core->length && blank_text_line(core, end)) {
+                size_t next = line_end(core, end);
+                end = next < core->length ? next + 1 : next;
+            }
+        }
+    }
+    TextRange range = { start, end, 1 };
+    return range;
+}
+
+static int append_edit_text(EditorCore *output, const char *text, size_t length)
+{
+    if (length > SIZE_MAX - 1 - output->length || !reserve_text(output, output->length + length))
+        return 0;
+    if (length)
+        memcpy(output->text + output->length, text, length);
+    output->length += length;
+    output->text[output->length] = 0;
+    return 1;
+}
+
+static int apply_line_edit(EditorCore *core, TextRange range, EditorCore *output)
+{
+    int success = write_span(core, range.start, range.end, output->text, output->length);
+    free(output->text);
+    if (!success)
+        return 0;
+    core->cursor = range.start;
+    while (core->cursor < core->length &&
+        (core->text[core->cursor] == ' ' || core->text[core->cursor] == '\t'))
+        ++core->cursor;
+    core->anchor = core->cursor;
+    core->block_insert = 0;
+    core->mode = EDITOR_MODE_COMMAND;
+    return 1;
+}
+
+static int shift_lines(EditorCore *core, TextRange range, int right, size_t steps)
+{
+    range = whole_lines(core, range);
+    if (steps > SIZE_MAX / core->settings.tabwidth)
+        return 0;
+    size_t distance = steps * core->settings.tabwidth;
+    EditorCore output = { 0 };
+    for (size_t start = range.start; start < range.end;) {
+        size_t end = line_end(core, start);
+        size_t first = start;
+        while (first < end && (core->text[first] == ' ' || core->text[first] == '\t'))
+            ++first;
+        size_t next = end < range.end ? end + 1 : end;
+        if (first < end) {
+            size_t column = advance_columns(core, 0, start, first);
+            if (right && distance > SIZE_MAX - column)
+                goto failure;
+            column = right ? column + distance : distance > column ? 0 : column - distance;
+            size_t bytes = core->settings.expandtabs ? column :
+                column / core->settings.tabwidth + column % core->settings.tabwidth;
+            if (bytes > SIZE_MAX - 1 - output.length || !reserve_text(&output, output.length + bytes))
+                goto failure;
+            output.length += c_indent_write(output.text + output.length, column, &core->settings);
+            if (!append_edit_text(&output, core->text + first, next - first))
+                goto failure;
+        } else if (!append_edit_text(&output, core->text + start, next - start)) {
+            goto failure;
+        }
+        start = next;
+    }
+    return apply_line_edit(core, range, &output);
+failure:
+    free(output.text);
+    return 0;
+}
+
+static int format_lines(EditorCore *core, TextRange range)
+{
+    if (!core->settings.maxcol) {
+        core->status = EDITOR_STATUS_NO_CHANGE;
+        core->mode = EDITOR_MODE_COMMAND;
+        return 1;
+    }
+    range = whole_lines(core, range);
+    EditorCore output = { 0 };
+    int paragraph = 0, has_word = 0;
+    size_t prefix = 0, prefix_length = 0, column = 0;
+    size_t leader = 0, leader_length = 0;
+    for (size_t start = range.start; start < range.end;) {
+        size_t end = line_end(core, start);
+        size_t first = start;
+        while (first < end && (core->text[first] == ' ' || core->text[first] == '\t'))
+            ++first;
+        size_t body = first;
+        size_t current_leader = 0;
+        if (core->lexer == &lexer_c_cpp && end - first >= 2 &&
+            core->text[first] == '/' && core->text[first + 1] == '/') {
+            while (body < end && core->text[body] == '/')
+                ++body;
+            if (body < end && core->text[body] == '!')
+                ++body;
+            current_leader = body - first;
+            while (body < end && (core->text[body] == ' ' || core->text[body] == '\t'))
+                ++body;
+        }
+        size_t next = end < range.end ? end + 1 : end;
+        if (body == end) {
+            if (paragraph && !append_edit_text(&output, "\n", 1))
+                goto failure;
+            if (!append_edit_text(&output, core->text + start, next - start))
+                goto failure;
+            paragraph = 0;
+            start = next;
+            continue;
+        }
+        if (paragraph && (current_leader != leader_length ||
+            (leader_length && memcmp(core->text + first, core->text + leader, leader_length)))) {
+            if (!append_edit_text(&output, "\n", 1))
+                goto failure;
+            paragraph = 0;
+        }
+        if (!paragraph) {
+            prefix = start;
+            prefix_length = body - start;
+            leader = first;
+            leader_length = current_leader;
+            if (!append_edit_text(&output, core->text + prefix, prefix_length))
+                goto failure;
+            column = advance_columns(core, 0, start, body);
+            has_word = 0;
+            paragraph = 1;
+        }
+        for (size_t position = body; position < end;) {
+            if (core->text[position] == ' ' || core->text[position] == '\t') {
+                ++position;
+                continue;
+            }
+            size_t word_end = position;
+            while (word_end < end && core->text[word_end] != ' ' && core->text[word_end] != '\t')
+                word_end = next_character(core, word_end);
+            size_t width = advance_columns(core, 0, position, word_end);
+            if (has_word && (column >= core->settings.maxcol ||
+                width > core->settings.maxcol - column - 1)) {
+                if (!append_edit_text(&output, "\n", 1) ||
+                    !append_edit_text(&output, core->text + prefix, prefix_length))
+                    goto failure;
+                column = advance_columns(core, 0, prefix, prefix + prefix_length);
+                has_word = 0;
+            }
+            if (has_word) {
+                if (column == SIZE_MAX || !append_edit_text(&output, " ", 1))
+                    goto failure;
+                ++column;
+            }
+            if (width > SIZE_MAX - column ||
+                !append_edit_text(&output, core->text + position, word_end - position))
+                goto failure;
+            column += width;
+            has_word = 1;
+            position = word_end;
+        }
+        start = next;
+    }
+    if (paragraph && range.end > range.start && core->text[range.end - 1] == '\n' &&
+        !append_edit_text(&output, "\n", 1))
+        goto failure;
+    return apply_line_edit(core, range, &output);
+failure:
+    free(output.text);
+    return 0;
+}
+
 static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **text, size_t *length)
 {
     CIndentFrame *frames = NULL;
@@ -1887,6 +2098,14 @@ static int handle_key(EditorCore *core, unsigned long key)
         count *= core->operator_count ? core->operator_count : 1;
         reset_command(core);
         if (pending == 'g') {
+            if (key == 'q') {
+                if (is_visual(core))
+                    return format_lines(core, selected_range(core));
+                core->pending = 'q';
+                core->operator_count = count;
+                core->operator_has_count = motion_counted;
+                return 1;
+            }
             if ((key == 't' || key == 'T') && core->mode == EDITOR_MODE_COMMAND) {
                 core->buffer_switch.count = count;
                 core->buffer_switch.backwards = key == 'T';
@@ -1899,6 +2118,42 @@ static int handle_key(EditorCore *core, unsigned long key)
                 core->cursor = column_position(core, start, line_end(core, start), core->block_column);
             }
             return 1;
+        }
+        if (pending == '!' || pending == '@') {
+            if (key == 'p')
+                return format_lines(core, paragraph_lines(core, count, pending == '@'));
+            return 1;
+        }
+        if (pending == 'q' || pending == 'Q') {
+            if (pending == 'q' && key == 'q')
+                return format_lines(core, counted_lines(core, count));
+            if (pending == 'q' && (key == 'i' || key == 'a')) {
+                core->pending = key == 'i' ? '!' : '@';
+                core->operator_count = count;
+                core->operator_has_count = motion_counted;
+                return 1;
+            }
+            if (pending == 'q' && key == 'g') {
+                core->pending = 'Q';
+                core->operator_count = count;
+                core->operator_has_count = motion_counted;
+                return 1;
+            }
+            size_t original = core->cursor;
+            if (pending == 'Q') {
+                if (key != 'g')
+                    return 1;
+                goto_line(core, count);
+            } else if (!move_command(core, key, count, motion_counted)) {
+                return 1;
+            }
+            size_t first = original < core->cursor ? original : core->cursor;
+            size_t last = original > core->cursor ? original : core->cursor;
+            int inclusive = pending == 'Q' || key == 'e' || key == 'j' || key == 'k' ||
+                key == 'G' || key == EDITOR_KEY_UP || key == EDITOR_KEY_DOWN;
+            TextRange range = { first, inclusive ? next_character(core, last) : last, 1 };
+            core->cursor = original;
+            return format_lines(core, range);
         }
         if (key == pending)
             return use_range(core, counted_lines(core, count), pending == 'd');
@@ -1929,6 +2184,11 @@ static int handle_key(EditorCore *core, unsigned long key)
         return step_history(core, count, key == 18);
     if (key == '.' && core->mode == EDITOR_MODE_COMMAND)
         return repeat_change(core, count, explicit_count);
+    if (key == '<' || key == '>') {
+        int visual = is_visual(core);
+        TextRange range = visual ? selected_range(core) : counted_lines(core, count);
+        return shift_lines(core, range, key == '>', visual ? count : 1);
+    }
     if (key == 'r') {
         core->pending = key;
         core->operator_count = count;
