@@ -40,7 +40,7 @@ line count or scroll position. Byte offsets are zero-based. An empty buffer
 shows `LN 1/1, Col 1`, `100% (0 / 0)`, and
 `LF`; the end-of-file position in a nonempty buffer shows `100%`.
 
-File > Close (`Ctrl+W`) closes only the active buffer, asking whether to save
+File > Close (`Ctrl+F4`) closes only the active buffer, asking whether to save
 unsaved changes. Cancel or a failed save keeps it open. Closing the final buffer
 creates a fresh untitled buffer. Exit checks every modified buffer, including
 inactive ones; cancelling keeps the application open with that buffer selected.
@@ -51,6 +51,45 @@ do not decode, transcode, remove a BOM, or stop at NUL or Ctrl+Z. LF and CRLF fi
 retain their line-ending format; other bytes, including arbitrary non-UTF-8 data,
 are preserved. Mixed LF/CRLF input selects CRLF and is saved consistently as CRLF.
 Paths use ANSI dialogs and the system code page, consistent with the Win95 GUI.
+
+### Split Windows
+
+`:split` (`:sp`) shows two views above each other. `:vsplit` (`:vs`) shows them
+side by side. Without a filename, both panes show the current buffer, with
+independent caret positions and scrolling. With a filename, such as
+`:vs other.c` or `:sp "file with spaces.txt"`, the new left/top pane opens that
+file and the other pane keeps the original buffer. Already-open files reuse
+their buffer; nonexistent files become named empty buffers. Directory paths
+open directory listings. Relative paths follow the same rules as `:tabe`.
+
+Click a pane to activate it, then use the buffer list, File > Open/New, or
+`:n` to change only that pane's buffer. The title, status bar, command line,
+Save, search, substitution, and editing apply to the active pane. Views of the
+same buffer share bytes, undo/redo, settings, and syntax highlighting; editing
+either updates the other. Different buffers retain independent document state.
+
+In command mode, Ctrl+W starts Vim-style window commands:
+
+| Keys / Command | Action |
+| --- | --- |
+| Ctrl+W then `s` / `v` | Create a horizontal / vertical split |
+| Ctrl+W then `w` (or Ctrl+W again) | Switch to the other pane |
+| Ctrl+W then `h/j/k/l` or an arrow | Focus the pane in that direction |
+| Ctrl+W then `c`, or `:close` (`:clo`) | Close the active pane |
+| Ctrl+W then `o`, or `:only` (`:on`) | Keep only the active pane |
+| `:wincmd w` | Execute a window command; also accepts `s/v/h/j/k/l/c/o` |
+
+Closing a pane never deletes its buffer or discards unsaved edits; hidden
+buffers remain in the buffer list. While split, `:q` and `:q!` also close only
+the active pane. `:close` cannot close the last pane. `:qa` still checks all
+buffers before exiting, and `:qa!` discards them. File > Close (`Ctrl+F4`)
+instead closes the actual active buffer and rebinds any other view of it to a
+remaining buffer. Ctrl+W is reserved for window commands, not File > Close.
+
+This implementation supports two equally sized panes, not nested splits.
+Close a pane or use `:only` before opening a split in another orientation.
+Esc cancels an unfinished Ctrl+W command. No pane operation saves files or
+creates an undo step.
 
 ### Directory Buffers
 
@@ -237,7 +276,7 @@ the same paging keys. Page Up/Down in insert or replace mode keeps that mode.
 Font zoom starts at 18 points and is limited to 6 through 72 points. Ctrl+= also
 zooms in without requiring Shift on keyboards where plus shares the equals key.
 Zoom updates text, the line-number gutter, caret, command-input font, and page
-height. It affects the shared editor view across buffers, not document bytes,
+height. It affects the active pane's view across buffers, not document bytes,
 modified state, or undo history.
 
 Mouse-wheel scrolling respects Windows' lines-per-notch or one-page setting

@@ -37,10 +37,13 @@ typedef struct SyntaxCache {
 #define ID_COMMAND_LINE 107
 #define ID_BUFFER_LIST 108
 #define ID_FILE_CLOSE 109
+#define ID_SECOND_EDITOR 110
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
 #define WM_EDITOR_REFRESH (WM_APP + 3)
 #define WM_EDITOR_SWITCH_BUFFER (WM_APP + 4)
+#define WM_EDITOR_FOCUS (WM_APP + 5)
+#define WM_EDITOR_WINDOW_KEY (WM_APP + 6)
 
 typedef struct CachedLine {
     char *text;
@@ -94,7 +97,20 @@ typedef struct MainWindowState {
     WNDPROC command_proc;
     int command_active;
     const char *command_error;
+    HWND second_editor;
+    TextBuffer *pane_buffers[2];
+    EditorCaret pane_carets[2];
+    int active_pane;
+    int split_vertical;
+    int window_pending;
 } MainWindowState;
+
+static HWND active_editor(HWND window)
+{
+    MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(window, GWLP_USERDATA);
+    return state && state->active_pane && state->second_editor ? state->second_editor :
+        GetDlgItem(window, ID_EDITOR);
+}
 
 static void clear_syntax_cache(SyntaxCache *cache)
 {
@@ -353,6 +369,10 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
 
 static void update_editor_caret(HWND window, EditorControl *editor)
 {
+    if (window != active_editor(GetParent(window))) {
+        InvalidateRect(window, NULL, FALSE);
+        return;
+    }
     EditorBufferSwitch request;
     if (editor_core_send(editor->core, EDITOR_TAKE_BUFFER_SWITCH, &request) && request.count) {
         SendMessageA(GetParent(window), WM_EDITOR_SWITCH_BUFFER, 0, (LPARAM)&request);
@@ -651,6 +671,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         update_editor_caret(hWnd, editor);
         return 0;
     case WM_SETFOCUS:
+        SendMessageA(GetParent(hWnd), WM_EDITOR_FOCUS, (WPARAM)hWnd, 0);
         CreateCaret(hWnd, NULL, 2, editor->line_height);
         update_editor_caret(hWnd, editor);
         ShowCaret(hWnd);
@@ -776,6 +797,8 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case VK_NEXT: key = EDITOR_KEY_PAGE_DOWN; break;
         default: return DefWindowProcA(hWnd, msg, wp, lp);
         }
+        if (SendMessageA(GetParent(hWnd), WM_EDITOR_WINDOW_KEY, (WPARAM)key, 0))
+            return 0;
         editor->pending_lead = 0;
         for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat)
             send_editor_key(editor, key);
@@ -783,6 +806,8 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_CHAR: {
+        if (SendMessageA(GetParent(hWnd), WM_EDITOR_WINDOW_KEY, wp, 0))
+            return 0;
         if (GetKeyState(VK_CONTROL) < 0 &&
             (wp == '+' || wp == '=' || wp == '-' || wp == '_' || wp == 0 || wp == 29 || wp == 31))
             return 0;
@@ -1068,7 +1093,7 @@ static void synchronize_directory_path(HWND window, MainWindowState *state)
     SendMessageA(list, LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
     InvalidateRect(list, NULL, FALSE);
     update_document_title(window, state);
-    HWND editor = GetDlgItem(window, ID_EDITOR);
+    HWND editor = active_editor(window);
     EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
     if (control) {
         control->first_line = 0;
@@ -1101,7 +1126,7 @@ static void activate_document(HWND window, MainWindowState *state, size_t index)
 {
     if (index >= state->buffer_count)
         return;
-    HWND editor = GetDlgItem(window, ID_EDITOR);
+    HWND editor = active_editor(window);
     EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
     if (control && state->core) {
         TextBuffer *previous = state->buffers[state->active_buffer];
@@ -1118,7 +1143,10 @@ static void activate_document(HWND window, MainWindowState *state, size_t index)
         SetWindowTextA(command, "");
     }
     state->active_buffer = index;
+    state->window_pending = 0;
     TextBuffer *buffer = state->buffers[index];
+    state->pane_buffers[state->active_pane] = buffer;
+    editor_core_send(buffer->core, EDITOR_GET_CARET, &state->pane_carets[state->active_pane]);
     state->core = buffer->core;
     update_buffer_status(window, state->core);
     SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)index, 0);
@@ -1196,12 +1224,18 @@ static int write_document(HWND window, MainWindowState *state, const char *path)
     }
     lstrcpynA(buffer->path, path, MAX_PATH);
     configure_document_syntax(buffer);
-    HWND editor = GetDlgItem(window, ID_EDITOR);
+    HWND editor = active_editor(window);
     EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
     if (control) {
         control->syntax = &buffer->syntax;
         control->bitmap_valid = 0;
         InvalidateRect(editor, NULL, FALSE);
+    }
+    if (state->second_editor && state->pane_buffers[0] == state->pane_buffers[1]) {
+        HWND other = state->active_pane ? GetDlgItem(window, ID_EDITOR) : state->second_editor;
+        EditorControl *other_control = (EditorControl *)GetWindowLongPtrA(other, GWLP_USERDATA);
+        other_control->bitmap_valid = 0;
+        InvalidateRect(other, NULL, FALSE);
     }
     HWND list = GetDlgItem(window, ID_BUFFER_LIST);
     LRESULT item = SendMessageA(list, LB_INSERTSTRING, (WPARAM)state->active_buffer,
@@ -1258,6 +1292,23 @@ static int remove_document(HWND window, MainWindowState *state, int quit_last)
         activate_document(window, state, closing + 1 < state->buffer_count ? closing + 1 : closing - 1);
     }
     TextBuffer *buffer = state->buffers[closing];
+    for (int pane = 0; pane < 2; ++pane) {
+        if (state->pane_buffers[pane] != buffer)
+            continue;
+        TextBuffer *replacement = state->buffers[state->active_buffer];
+        state->pane_buffers[pane] = replacement;
+        HWND view = pane ? state->second_editor : GetDlgItem(window, ID_EDITOR);
+        EditorControl *control = view ? (EditorControl *)GetWindowLongPtrA(view, GWLP_USERDATA) : NULL;
+        if (control) {
+            control->core = replacement->core;
+            control->syntax = &replacement->syntax;
+            control->first_line = replacement->first_line;
+            control->left_pixel = replacement->left_pixel;
+            control->bitmap_valid = 0;
+            InvalidateRect(view, NULL, FALSE);
+        }
+        editor_core_send(replacement->core, EDITOR_GET_CARET, &state->pane_carets[pane]);
+    }
     SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_DELETESTRING, (WPARAM)closing, 0);
     memmove(state->buffers + closing, state->buffers + closing + 1,
         (state->buffer_count - closing - 1) * sizeof(*state->buffers));
@@ -1281,7 +1332,7 @@ static void close_document(HWND window, MainWindowState *state)
 static void layout_main_children(HWND window)
 {
     MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(window, GWLP_USERDATA);
-    HWND editor = GetDlgItem(window, ID_EDITOR);
+    HWND editor = active_editor(window);
     if (!state || !editor)
         return;
     RECT rect;
@@ -1311,8 +1362,215 @@ static void layout_main_children(HWND window)
     int width = rect.right > editor_left + 12 ? rect.right - editor_left - 12 : 0;
     int height = content_height > 24 ? content_height - 24 : 0;
     MoveWindow(GetDlgItem(window, ID_BUFFER_LIST), 0, 0, sidebar_width, available_height, TRUE);
-    MoveWindow(editor, editor_left, 12, width, height, TRUE);
+    HWND first_editor = GetDlgItem(window, ID_EDITOR);
+    if (state->second_editor) {
+        int gap = state->split_vertical ? (width < 4 ? width : 4) : (height < 4 ? height : 4);
+        int first = state->split_vertical ? (width - gap) / 2 : (height - gap) / 2;
+        if (state->split_vertical) {
+            MoveWindow(first_editor, editor_left, 12, first, height, TRUE);
+            MoveWindow(state->second_editor, editor_left + first + gap, 12,
+                width - first - gap, height, TRUE);
+        } else {
+            MoveWindow(first_editor, editor_left, 12, width, first, TRUE);
+            MoveWindow(state->second_editor, editor_left, 12 + first + gap,
+                width, height - first - gap, TRUE);
+        }
+    } else {
+        MoveWindow(first_editor, editor_left, 12, width, height, TRUE);
+    }
     MoveWindow(GetDlgItem(window, ID_COMMAND_LINE), editor_left, content_height, width, command_height, TRUE);
+}
+
+static void cancel_window_command(HWND window, MainWindowState *state)
+{
+    if (!state->command_active)
+        return;
+    unsigned long escape = 27;
+    editor_core_send(state->core, EDITOR_HANDLE_KEY, &escape);
+    state->command_active = 0;
+    HWND command = GetDlgItem(window, ID_COMMAND_LINE);
+    ShowWindow(command, SW_HIDE);
+    EnableWindow(command, FALSE);
+    SetWindowTextA(command, "");
+}
+
+static void select_pane(HWND window, MainWindowState *state, int pane)
+{
+    if (pane == state->active_pane || (pane && !state->second_editor))
+        return;
+    editor_core_send(state->core, EDITOR_GET_CARET, &state->pane_carets[state->active_pane]);
+    cancel_window_command(window, state);
+    state->active_pane = pane;
+    state->window_pending = 0;
+    TextBuffer *buffer = state->pane_buffers[pane];
+    state->core = buffer->core;
+    for (size_t index = 0; index < state->buffer_count; ++index) {
+        if (state->buffers[index] == buffer) {
+            state->active_buffer = index;
+            break;
+        }
+    }
+    editor_core_send(state->core, EDITOR_SET_CARET, &state->pane_carets[pane]);
+    HWND editor = active_editor(window);
+    EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
+    SendMessageA(GetDlgItem(window, ID_COMMAND_LINE), WM_SETFONT, (WPARAM)control->font, TRUE);
+    SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
+    InvalidateRect(GetDlgItem(window, ID_BUFFER_LIST), NULL, FALSE);
+    update_document_title(window, state);
+    layout_main_children(window);
+}
+
+static int split_document(HWND window, MainWindowState *state, int vertical, const char *path)
+{
+    if (state->second_editor)
+        return 0;
+    TextBuffer *target = NULL;
+    size_t target_index = 0;
+    int owned = 0;
+    if (path) {
+        for (size_t index = 0; index < state->buffer_count; ++index) {
+            if (!lstrcmpiA(state->buffers[index]->path, path)) {
+                target = state->buffers[index];
+                target_index = index;
+                break;
+            }
+        }
+        if (!target) {
+            DWORD attributes = GetFileAttributesA(path);
+            int new_file = attributes == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND;
+            target = create_document(new_file ? NULL : path);
+            if (!target)
+                return 0;
+            if (new_file) {
+                lstrcpynA(target->path, path, MAX_PATH);
+                configure_document_syntax(target);
+            }
+            owned = 1;
+        }
+    }
+    HWND first_editor = GetDlgItem(window, ID_EDITOR);
+    EditorControl *first = (EditorControl *)GetWindowLongPtrA(first_editor, GWLP_USERDATA);
+    HWND second = CreateWindowExA(WS_EX_CLIENTEDGE, "PARAPAD_EDITOR", NULL,
+        WS_CHILD | WS_TABSTOP, 0, 0, 0, 0, window, (HMENU)(INT_PTR)ID_SECOND_EDITOR,
+        (HINSTANCE)GetWindowLongPtrA(window, GWLP_HINSTANCE), state->core);
+    if (!second) {
+        if (owned) {
+            editor_core_destroy(target->core);
+            clear_syntax_cache(&target->syntax);
+            free(target);
+        }
+        return 0;
+    }
+    EditorControl *other = (EditorControl *)GetWindowLongPtrA(second, GWLP_USERDATA);
+    if (other->font_points != first->font_points)
+        set_editor_font(second, other, first->font_points);
+    other->syntax = first->syntax;
+    other->first_line = first->first_line;
+    other->left_pixel = first->left_pixel;
+    state->second_editor = second;
+    state->split_vertical = vertical;
+    state->pane_buffers[1] = state->pane_buffers[0];
+    editor_core_send(state->core, EDITOR_GET_CARET, &state->pane_carets[0]);
+    state->pane_carets[1] = state->pane_carets[0];
+    if (target) {
+        if (owned && !add_document(window, state, target)) {
+            state->second_editor = NULL;
+            state->pane_buffers[1] = NULL;
+            DestroyWindow(second);
+            editor_core_destroy(target->core);
+            clear_syntax_cache(&target->syntax);
+            free(target);
+            SendMessageA(GetDlgItem(window, ID_COMMAND_LINE), WM_SETFONT, (WPARAM)first->font, TRUE);
+            layout_main_children(window);
+            return 0;
+        }
+        if (!owned)
+            activate_document(window, state, target_index);
+    }
+    cancel_window_command(window, state);
+    ShowWindow(second, SW_SHOW);
+    layout_main_children(window);
+    SendMessageA(GetDlgItem(window, ID_COMMAND_LINE), WM_SETFONT, (WPARAM)first->font, TRUE);
+    SetFocus(first_editor);
+    SendMessageA(first_editor, WM_EDITOR_REFRESH, 0, 0);
+    return 1;
+}
+
+static int retain_pane(HWND window, MainWindowState *state, int pane)
+{
+    if (!state->second_editor)
+        return 0;
+    EditorCaret caret = state->pane_carets[pane];
+    if (pane == state->active_pane)
+        editor_core_send(state->core, EDITOR_GET_CARET, &caret);
+    cancel_window_command(window, state);
+    HWND first_editor = GetDlgItem(window, ID_EDITOR);
+    HWND second = state->second_editor;
+    EditorControl *first = (EditorControl *)GetWindowLongPtrA(first_editor, GWLP_USERDATA);
+    EditorControl *other = (EditorControl *)GetWindowLongPtrA(second, GWLP_USERDATA);
+    TextBuffer *buffer = state->pane_buffers[pane];
+    if (pane) {
+        first->first_line = other->first_line;
+        first->left_pixel = other->left_pixel;
+        if (first->font_points != other->font_points)
+            set_editor_font(first_editor, first, other->font_points);
+    }
+    first->core = buffer->core;
+    first->syntax = &buffer->syntax;
+    first->pending_lead = 0;
+    first->bitmap_valid = 0;
+    state->second_editor = NULL;
+    state->active_pane = 0;
+    state->pane_buffers[0] = buffer;
+    state->pane_buffers[1] = NULL;
+    state->pane_carets[0] = caret;
+    state->core = buffer->core;
+    for (size_t index = 0; index < state->buffer_count; ++index) {
+        if (state->buffers[index] == buffer) {
+            state->active_buffer = index;
+            break;
+        }
+    }
+    SendMessageA(GetDlgItem(window, ID_COMMAND_LINE), WM_SETFONT, (WPARAM)first->font, TRUE);
+    DestroyWindow(second);
+    editor_core_send(state->core, EDITOR_SET_CARET, &caret);
+    SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
+    InvalidateRect(GetDlgItem(window, ID_BUFFER_LIST), NULL, FALSE);
+    update_document_title(window, state);
+    layout_main_children(window);
+    SetFocus(first_editor);
+    SendMessageA(first_editor, WM_EDITOR_REFRESH, 0, 0);
+    return 1;
+}
+
+static int execute_window_key(HWND window, MainWindowState *state, unsigned long key)
+{
+    if (key == 's' || key == 19)
+        return split_document(window, state, 0, NULL);
+    if (key == 'v' || key == 22)
+        return split_document(window, state, 1, NULL);
+    if (key == 'c' || key == 3)
+        return retain_pane(window, state, 1 - state->active_pane);
+    if (key == 'o' || key == 15)
+        return !state->second_editor || retain_pane(window, state, state->active_pane);
+    int pane = state->active_pane;
+    if (key == 'w' || key == 'W' || key == 23)
+        pane = 1 - pane;
+    else if (key == 'h' || key == 8 || key == EDITOR_KEY_LEFT)
+        pane = state->split_vertical ? 0 : pane;
+    else if (key == 'l' || key == 12 || key == EDITOR_KEY_RIGHT)
+        pane = state->split_vertical ? 1 : pane;
+    else if (key == 'k' || key == 11 || key == EDITOR_KEY_UP)
+        pane = state->split_vertical ? pane : 0;
+    else if (key == 'j' || key == 10 || key == EDITOR_KEY_DOWN)
+        pane = state->split_vertical ? pane : 1;
+    else if (key != 27)
+        return 0;
+    if (state->second_editor) {
+        cancel_window_command(window, state);
+        SetFocus(pane ? state->second_editor : GetDlgItem(window, ID_EDITOR));
+    }
+    return 1;
 }
 
 static int execute_ansi_command(EditorCore *core, const char *text)
@@ -1380,7 +1638,14 @@ static int execute_window_command(HWND window, MainWindowState *state, const cha
         return execute_ansi_command(state->core, text);
     memcpy(name, start, length);
     name[length] = 0;
-    if (strcmp(name, "tabe") && strcmp(name, "n") && strcmp(name, "w") &&
+    int horizontal = length >= 2 && length <= 5 && !strncmp(name, "split", length);
+    int vertical = length >= 2 && length <= 6 && !strncmp(name, "vsplit", length);
+    size_t plain_length = length - (name[length - 1] == '!');
+    int close = plain_length >= 3 && plain_length <= 5 && !strncmp(name, "close", plain_length);
+    int only = plain_length >= 2 && plain_length <= 4 && !strncmp(name, "only", plain_length);
+    int window_command = !strcmp(name, "wincmd");
+    if (!horizontal && !vertical && !close && !only && !window_command &&
+        strcmp(name, "tabe") && strcmp(name, "n") && strcmp(name, "w") &&
         strcmp(name, "q") && strcmp(name, "q!") && strcmp(name, "qa") && strcmp(name, "qa!"))
         return execute_ansi_command(state->core, text);
     while (*position == ' ' || *position == '\t')
@@ -1389,9 +1654,19 @@ static int execute_window_command(HWND window, MainWindowState *state, const cha
     while (end > position && (end[-1] == ' ' || end[-1] == '\t'))
         --end;
     int has_argument = end != position;
+    if (window_command) {
+        if (end - position != 1)
+            return window_command_error(state, "wincmd requires one window command");
+        if (!execute_window_key(window, state, (unsigned char)*position))
+            return window_command_error(state, "window command failed (two panes maximum)");
+        cancel_window_command(window, state);
+        layout_main_children(window);
+        SetFocus(active_editor(window));
+        return 1;
+    }
     char path[MAX_PATH] = "";
     if (has_argument) {
-        if (strcmp(name, "tabe") && strcmp(name, "w"))
+        if (!horizontal && !vertical && strcmp(name, "tabe") && strcmp(name, "w"))
             return window_command_error(state, "invalid command arguments");
         if (*position == '"') {
             if (end - position < 2 || end[-1] != '"')
@@ -1409,6 +1684,24 @@ static int execute_window_command(HWND window, MainWindowState *state, const cha
         editor_core_send(state->core, EDITOR_GET_DIRECTORY, &directory);
         if (!directory_full_path(directory.active ? directory.path : NULL, argument, path))
             return window_command_error(state, "invalid file name");
+    }
+    if (horizontal || vertical) {
+        if (state->second_editor)
+            return window_command_error(state, "two panes maximum; use :only first");
+        if (!split_document(window, state, vertical, has_argument ? path : NULL))
+            return window_command_error(state, "split could not be opened");
+        return 1;
+    }
+    if (close || only) {
+        if (!state->second_editor) {
+            if (close)
+                return window_command_error(state, "cannot close the last window");
+            cancel_window_command(window, state);
+            layout_main_children(window);
+            SetFocus(active_editor(window));
+            return 1;
+        }
+        return retain_pane(window, state, only ? state->active_pane : 1 - state->active_pane);
     }
     if (!strcmp(name, "tabe")) {
         if (has_argument && GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES &&
@@ -1452,6 +1745,8 @@ static int execute_window_command(HWND window, MainWindowState *state, const cha
     }
     int all = name[1] == 'a';
     int force = name[strlen(name) - 1] == '!';
+    if (!all && state->second_editor)
+        return retain_pane(window, state, 1 - state->active_pane);
     if (!force) {
         size_t first = all ? 0 : state->active_buffer;
         size_t limit = all ? state->buffer_count : first + 1;
@@ -1505,7 +1800,7 @@ static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM 
             if (!success)
                 MessageBeep(MB_ICONWARNING);
         }
-        SendMessageA(GetDlgItem(parent, ID_EDITOR), WM_EDITOR_REFRESH, 0, 0);
+        SendMessageA(active_editor(parent), WM_EDITOR_REFRESH, 0, 0);
         return 0;
     }
     return CallWindowProcA(state->command_proc, window, message, wp, lp);
@@ -1514,7 +1809,7 @@ static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM 
 LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (legacy_wheel_message && msg == legacy_wheel_message)
-        return SendMessageA(GetDlgItem(hWnd, ID_EDITOR), msg, wp, lp);
+        return SendMessageA(active_editor(hWnd), msg, wp, lp);
     MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(hWnd, GWLP_USERDATA);
     switch (msg) {
     case WM_CREATE: {
@@ -1529,7 +1824,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             !AppendMenuA(file_menu, MF_STRING, ID_FILE_OPEN, "&Open...\tCtrl+O") ||
             !AppendMenuA(file_menu, MF_STRING, ID_FILE_SAVE, "&Save\tCtrl+S") ||
             !AppendMenuA(file_menu, MF_STRING, ID_FILE_SAVE_AS, "Save &As...") ||
-            !AppendMenuA(file_menu, MF_STRING, ID_FILE_CLOSE, "&Close\tCtrl+W") ||
+            !AppendMenuA(file_menu, MF_STRING, ID_FILE_CLOSE, "&Close\tCtrl+F4") ||
             !AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL) ||
             !AppendMenu(file_menu, MF_STRING, ID_FILE_EXIT, "E&xit") ||
             !AppendMenu(menu, MF_POPUP, (UINT_PTR)file_menu, "&File")) {
@@ -1591,6 +1886,30 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         layout_main_children(hWnd);
         return 0;
+    case WM_EDITOR_FOCUS:
+        if (state)
+            select_pane(hWnd, state, (HWND)wp == state->second_editor ? 1 : 0);
+        return 0;
+    case WM_EDITOR_WINDOW_KEY: {
+        if (!state)
+            return 0;
+        EditorMode mode;
+        editor_core_send(state->core, EDITOR_GET_MODE, &mode);
+        if (!state->window_pending) {
+            if (wp != 23 || mode != EDITOR_MODE_COMMAND)
+                return 0;
+            unsigned long escape = 27;
+            editor_core_send(state->core, EDITOR_HANDLE_KEY, &escape);
+            state->window_pending = 1;
+            return 1;
+        }
+        state->window_pending = 0;
+        if (mode != EDITOR_MODE_COMMAND)
+            return 0;
+        if (!execute_window_key(hWnd, state, (unsigned long)wp))
+            MessageBeep(MB_ICONWARNING);
+        return 1;
+    }
     case WM_EDITOR_SWITCH_BUFFER: {
         const EditorBufferSwitch *request = (const EditorBufferSwitch *)lp;
         if (!state || !request || !request->count || !state->buffer_count)
@@ -1657,6 +1976,10 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_EDITOR_MODE_CHANGED: {
         synchronize_directory_path(hWnd, state);
+        if (state->second_editor && state->pane_buffers[0] == state->pane_buffers[1]) {
+            HWND other = state->active_pane ? GetDlgItem(hWnd, ID_EDITOR) : state->second_editor;
+            InvalidateRect(other, NULL, FALSE);
+        }
         if ((EditorMode)wp != EDITOR_MODE_COMMAND_LINE)
             state->command_error = NULL;
         RECT item_rect;
@@ -1720,16 +2043,18 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             EnableWindow(command, FALSE);
             SetWindowTextA(command, "");
             layout_main_children(hWnd);
-            SetFocus(GetDlgItem(hWnd, ID_EDITOR));
+            SetFocus(active_editor(hWnd));
         }
         return 0;
     }
     case WM_MOUSEWHEEL:
-        return SendMessageA(GetDlgItem(hWnd, ID_EDITOR), msg, wp, lp);
+        return SendMessageA(active_editor(hWnd), msg, wp, lp);
     case WM_SETFOCUS:
-        SetFocus(GetDlgItem(hWnd, state && state->command_active ? ID_COMMAND_LINE : ID_EDITOR));
+        SetFocus(state && state->command_active ? GetDlgItem(hWnd, ID_COMMAND_LINE) : active_editor(hWnd));
         return 0;
     case WM_COMMAND: {
+        if (state)
+            state->window_pending = 0;
         if (LOWORD(wp) == ID_BUFFER_LIST && HIWORD(wp) == LBN_SELCHANGE) {
             LRESULT index = SendMessageA(GetDlgItem(hWnd, ID_BUFFER_LIST), LB_GETCURSEL, 0, 0);
             if (index != LB_ERR)
@@ -1832,7 +2157,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         { FVIRTKEY | FCONTROL, 'N', ID_FILE_NEW },
         { FVIRTKEY | FCONTROL, 'O', ID_FILE_OPEN },
         { FVIRTKEY | FCONTROL, 'S', ID_FILE_SAVE },
-        { FVIRTKEY | FCONTROL, 'W', ID_FILE_CLOSE }
+        { FVIRTKEY | FCONTROL, VK_F4, ID_FILE_CLOSE }
     };
     HACCEL accelerators = CreateAcceleratorTableA(shortcuts, sizeof(shortcuts) / sizeof(shortcuts[0]));
     ShowWindow(g_hwnd, nCmdShow);
@@ -1842,7 +2167,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     MSG msg;
     int result;
     while ((result = GetMessageA(&msg, NULL, 0, 0)) > 0) {
-        if (!accelerators || !TranslateAcceleratorA(g_hwnd, accelerators, &msg)) {
+        MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(g_hwnd, GWLP_USERDATA);
+        int window_command = state && state->window_pending && msg.hwnd == active_editor(g_hwnd);
+        if (window_command || !accelerators || !TranslateAcceleratorA(g_hwnd, accelerators, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
