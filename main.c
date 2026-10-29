@@ -1451,7 +1451,7 @@ static int split_document(HWND window, MainWindowState *state, int vertical, con
     HWND first_editor = GetDlgItem(window, ID_EDITOR);
     EditorControl *first = (EditorControl *)GetWindowLongPtrA(first_editor, GWLP_USERDATA);
     HWND second = CreateWindowExA(WS_EX_CLIENTEDGE, "PARAPAD_EDITOR", NULL,
-        WS_CHILD | WS_TABSTOP, 0, 0, 0, 0, window, (HMENU)(INT_PTR)ID_SECOND_EDITOR,
+        WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS, 0, 0, 0, 0, window, (HMENU)(INT_PTR)ID_SECOND_EDITOR,
         (HINSTANCE)GetWindowLongPtrA(window, GWLP_HINSTANCE), state->core);
     if (!second) {
         if (owned) {
@@ -1543,8 +1543,46 @@ static int retain_pane(HWND window, MainWindowState *state, int pane)
     return 1;
 }
 
+static int swap_panes(HWND window, MainWindowState *state)
+{
+    if (!state->second_editor)
+        return 0;
+    HWND first = GetDlgItem(window, ID_EDITOR);
+    HWND second = state->second_editor;
+    HWND focused = active_editor(window);
+    if (!SetWindowLongPtrA(first, GWLP_ID, ID_SECOND_EDITOR))
+        return 0;
+    if (!SetWindowLongPtrA(second, GWLP_ID, ID_EDITOR)) {
+        SetWindowLongPtrA(first, GWLP_ID, ID_EDITOR);
+        return 0;
+    }
+    editor_core_send(state->core, EDITOR_GET_CARET, &state->pane_carets[state->active_pane]);
+    cancel_window_command(window, state);
+    TextBuffer *buffer = state->pane_buffers[0];
+    state->pane_buffers[0] = state->pane_buffers[1];
+    state->pane_buffers[1] = buffer;
+    EditorCaret caret = state->pane_carets[0];
+    state->pane_carets[0] = state->pane_carets[1];
+    state->pane_carets[1] = caret;
+    state->second_editor = first;
+    state->active_pane = 1 - state->active_pane;
+    state->window_pending = 0;
+    layout_main_children(window);
+    SetFocus(focused);
+    SendMessageA(focused, WM_EDITOR_REFRESH, 0, 0);
+    EditorControl *first_control = (EditorControl *)GetWindowLongPtrA(first, GWLP_USERDATA);
+    EditorControl *second_control = (EditorControl *)GetWindowLongPtrA(second, GWLP_USERDATA);
+    first_control->bitmap_valid = 0;
+    second_control->bitmap_valid = 0;
+    RedrawWindow(first, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    RedrawWindow(second, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    return 1;
+}
+
 static int execute_window_key(HWND window, MainWindowState *state, unsigned long key)
 {
+    if (key == 'x' || key == 24)
+        return swap_panes(window, state);
     if (key == 's' || key == 19)
         return split_document(window, state, 0, NULL);
     if (key == 'v' || key == 22)
@@ -1862,7 +1900,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             return -1;
 
         HWND editor = CreateWindowExA(WS_EX_CLIENTEDGE, "PARAPAD_EDITOR", NULL,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
             0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_EDITOR,
             ((LPCREATESTRUCTA)lp)->hInstance, state->core);
         if (!editor)

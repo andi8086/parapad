@@ -75,9 +75,14 @@ In command mode, Ctrl+W starts Vim-style window commands:
 | Ctrl+W then `s` / `v` | Create a horizontal / vertical split |
 | Ctrl+W then `w` (or Ctrl+W again) | Switch to the other pane |
 | Ctrl+W then `h/j/k/l` or an arrow | Focus the pane in that direction |
+| Ctrl+W then `x`, or `:wincmd x` | Exchange the two panes, keeping focus with the same view |
 | Ctrl+W then `c`, or `:close` (`:clo`) | Close the active pane |
 | Ctrl+W then `o`, or `:only` (`:on`) | Keep only the active pane |
-| `:wincmd w` | Execute a window command; also accepts `s/v/h/j/k/l/c/o` |
+| `:wincmd w` | Execute a window command; also accepts `s/v/h/j/k/l/x/c/o` |
+
+Exchanging panes works in either split orientation and moves each view's
+scroll position, caret bookmark, and font with it. Buffer contents, undo history,
+and the buffer list are unchanged. Two displayed panes are required.
 
 Closing a pane never deletes its buffer or discards unsaved edits; hidden
 buffers remain in the buffer list. While split, `:q` and `:q!` also close only
