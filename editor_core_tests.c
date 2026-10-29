@@ -1142,8 +1142,143 @@ static void test_search_backwards(void)
     editor_core_destroy(core);
 }
 
+static void test_first_nonblank_and_word_search(void)
+{
+    EditorCore *core = editor_core_create(" \t  one two one someone one_ one\n\n   ");
+    assert(core);
+    send_keys(core, "$^");
+    expect_caret(core, 0, 4);
+    send_key(core, '*');
+    expect_caret(core, 0, 12);
+    send_key(core, 'n');
+    expect_caret(core, 0, 29);
+    send_key(core, 'N');
+    expect_caret(core, 0, 12);
+    send_keys(core, "2*");
+    expect_caret(core, 0, 4);
+    send_keys(core, "ld^");
+    expect_line(core, 0, " \t  ne two one someone one_ one");
+    send_keys(core, "uG^");
+    expect_caret(core, 2, 3);
+    send_keys(core, "k^");
+    expect_caret(core, 1, 0);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/one"));
+    expect_caret(core, 0, 4);
+    send_keys(core, "2n");
+    expect_caret(core, 0, 20);
+    editor_core_destroy(core);
+}
+
+static void test_repeat_change(void)
+{
+    EditorCore *core = editor_core_create("abcdefghijklmno");
+    assert(core);
+    send_key(core, '.');
+    EditorStatus status;
+    assert(editor_core_send(core, EDITOR_GET_STATUS, &status) && status == EDITOR_STATUS_NO_CHANGE);
+    send_keys(core, "2x.");
+    expect_line(core, 0, "efghijklmno");
+    send_keys(core, "3.");
+    expect_line(core, 0, "hijklmno");
+    send_key(core, '.');
+    expect_line(core, 0, "klmno");
+    send_keys(core, "u.");
+    expect_line(core, 0, "klmno");
+    send_keys(core, "yy0.");
+    expect_line(core, 0, "no");
+    editor_core_destroy(core);
+
+    core = editor_core_create("one two three four five six seven eight");
+    assert(core);
+    send_keys(core, "d2w3.");
+    expect_line(core, 0, "six seven eight");
+    send_key(core, 'u');
+    expect_line(core, 0, "three four five six seven eight");
+    send_key(core, '.');
+    expect_line(core, 0, "six seven eight");
+    editor_core_destroy(core);
+
+    core = editor_core_create("abc");
+    assert(core);
+    send_keys(core, "iXY\033l.");
+    expect_line(core, 0, "XYaXYbc");
+    send_key(core, 'u');
+    expect_line(core, 0, "XYabc");
+    send_keys(core, "3.");
+    expect_line(core, 0, "XYaXYXYXYbc");
+    send_key(core, 'u');
+    expect_line(core, 0, "XYabc");
+    send_keys(core, "Ai\bZ\033" "0.");
+    expect_line(core, 0, "XYabcZZ");
+    send_keys(core, "u0r!l.");
+    expect_line(core, 0, "!!abcZ");
+    editor_core_destroy(core);
+
+    core = editor_core_create("abcdef");
+    assert(core);
+    send_keys(core, "RXY\033l.");
+    expect_line(core, 0, "XYXYef");
+    send_key(core, 'u');
+    expect_line(core, 0, "XYcdef");
+    send_keys(core, "0vld.");
+    expect_line(core, 0, "ef");
+    editor_core_destroy(core);
+
+    core = editor_core_create("ab");
+    assert(core);
+    send_keys(core, "ylp.");
+    expect_line(core, 0, "aaab");
+    send_keys(core, "u\033i\033.");
+    expect_line(core, 0, "aaab");
+    editor_core_destroy(core);
+
+    core = editor_core_create("abc");
+    assert(core);
+    send_keys(core, "iXY");
+    EditorCaret clicked = { 0, 0 };
+    assert(editor_core_send(core, EDITOR_SET_CARET, &clicked));
+    send_key(core, 0xE4);
+    EditorMode mode;
+    assert(editor_core_send(core, EDITOR_GET_MODE, &mode) && mode == EDITOR_MODE_INSERT);
+    send_keys(core, "\033.");
+    expect_line(core, 0, "\xC3\xA4\xC3\xA4XYabc");
+    send_key(core, 'u');
+    expect_line(core, 0, "\xC3\xA4XYabc");
+    send_keys(core, "iZ");
+    send_key(core, EDITOR_KEY_RIGHT);
+    send_keys(core, "Q\033.");
+    expect_line(core, 0, "\xC3\xA4ZXQQYabc");
+    editor_core_destroy(core);
+
+    core = editor_core_create("abcdef");
+    assert(core);
+    send_key(core, 'd');
+    send_key(core, EDITOR_KEY_RIGHT);
+    send_key(core, '.');
+    expect_line(core, 0, "cdef");
+    send_key(core, 'v');
+    send_key(core, EDITOR_KEY_RIGHT);
+    send_keys(core, "d.");
+    expect_line(core, 0, "");
+    editor_core_destroy(core);
+
+    core = editor_core_create("abc\ndef\nghi");
+    assert(core);
+    send_key(core, 22);
+    send_keys(core, "jx.");
+    expect_line(core, 0, "c");
+    expect_line(core, 1, "f");
+    expect_line(core, 2, "ghi");
+    send_key(core, 'u');
+    expect_line(core, 0, "bc");
+    expect_line(core, 1, "ef");
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_repeat_change();
+    test_first_nonblank_and_word_search();
     test_search_backwards();
     test_search_repeat();
     test_append_word_commands();

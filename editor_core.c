@@ -35,6 +35,15 @@ struct EditorCore {
     char command_prefix;
     char *search_text;
     size_t search_length;
+    int search_whole_word;
+    unsigned long *change_keys;
+    size_t change_length;
+    size_t change_capacity;
+    int change_dirty;
+    unsigned long *last_change;
+    size_t last_change_length;
+    size_t last_change_capacity;
+    size_t repeat_count;
     size_t anchor;
     size_t count;
     size_t operator_count;
@@ -358,6 +367,8 @@ void editor_core_destroy(EditorCore *core)
     if (core) {
         clear_replace_history(core);
         free(core->search_text);
+        free(core->change_keys);
+        free(core->last_change);
         free_history(core->undo);
         free_history(core->redo);
         free(core->replace_edits);
@@ -566,6 +577,8 @@ static void reset_document(EditorCore *core)
     core->undo = core->redo = NULL;
     core->revision = core->next_revision = core->saved_revision = core->revision_cursor = 0;
     core->history_open = core->history_changed = 0;
+    core->change_length = 0;
+    core->change_dirty = 0;
     clear_replace_history(core);
     core->block_insert = 0;
     core->cursor = 0;
@@ -780,6 +793,19 @@ static void goto_line(EditorCore *core, size_t number)
     core->cursor = position;
 }
 
+static int search_matches(const EditorCore *core, size_t position)
+{
+    if (core->search_length > core->length - position ||
+        memcmp(core->text + position, core->search_text, core->search_length) != 0)
+        return 0;
+    if (!core->search_whole_word)
+        return 1;
+    size_t end = position + core->search_length;
+    int category = word_class(core, position);
+    return (!position || word_class(core, previous_character(core, position)) != category) &&
+        (end == core->length || word_class(core, end) != category);
+}
+
 static int repeat_search(EditorCore *core, size_t count, int backwards)
 {
     if (!core->search_length) {
@@ -789,8 +815,7 @@ static int repeat_search(EditorCore *core, size_t count, int backwards)
     size_t matches = 0;
     size_t first = SIZE_MAX;
     for (size_t position = 0; position < core->length; position = next_character(core, position)) {
-        if (core->search_length <= core->length - position &&
-            memcmp(core->text + position, core->search_text, core->search_length) == 0) {
+        if (search_matches(core, position)) {
             if ((backwards && position < core->cursor) ||
                 (!backwards && first == SIZE_MAX && position > core->cursor))
                 first = matches;
@@ -807,8 +832,7 @@ static int repeat_search(EditorCore *core, size_t count, int backwards)
     size_t target = backwards ? (offset > first ? matches - (offset - first) : first - offset) :
         (offset >= matches - first ? offset - (matches - first) : first + offset);
     for (size_t position = 0; position < core->length; position = next_character(core, position)) {
-        if (core->search_length <= core->length - position &&
-            memcmp(core->text + position, core->search_text, core->search_length) == 0) {
+        if (search_matches(core, position)) {
             if (!target--) {
                 core->cursor = position;
                 core->status = EDITOR_STATUS_NONE;
@@ -830,8 +854,39 @@ static int start_search(EditorCore *core, const char *text)
         free(core->search_text);
         core->search_text = copy;
         core->search_length = length;
+        core->search_whole_word = 0;
     }
     return repeat_search(core, 1, 0);
+}
+
+static int search_word(EditorCore *core, size_t count)
+{
+    size_t start = core->cursor;
+    size_t end = line_end(core, start);
+    while (start < end && !word_class(core, start))
+        start = next_character(core, start);
+    if (start == end)
+        return 1;
+    int category = word_class(core, start);
+    size_t line = line_start(core, start);
+    while (start > line &&
+        word_class(core, previous_character(core, start)) == category)
+        start = previous_character(core, start);
+    end = start;
+    while (end < core->length && word_class(core, end) == category)
+        end = next_character(core, end);
+    size_t length = end - start;
+    char *text = malloc(length + 1);
+    if (!text)
+        return 0;
+    memcpy(text, core->text + start, length);
+    text[length] = 0;
+    free(core->search_text);
+    core->search_text = text;
+    core->search_length = length;
+    core->search_whole_word = 1;
+    core->cursor = start;
+    return repeat_search(core, count, 0);
 }
 
 static int move_command(EditorCore *core, unsigned long key, size_t count, int explicit_count)
@@ -866,12 +921,21 @@ static int move_command(EditorCore *core, unsigned long key, size_t count, int e
     }
     EditorMessage message;
     switch (key) {
+    case '*': return search_word(core, count);
     case 'n': case 'N': return repeat_search(core, count, key == 'N');
     case 'h': case EDITOR_KEY_LEFT: message = EDITOR_MOVE_LEFT; break;
     case 'l': case EDITOR_KEY_RIGHT: message = EDITOR_MOVE_RIGHT; break;
     case 'j': case EDITOR_KEY_DOWN: message = EDITOR_MOVE_DOWN; break;
     case 'k': case EDITOR_KEY_UP: message = EDITOR_MOVE_UP; break;
     case '0': case EDITOR_KEY_HOME: message = EDITOR_MOVE_HOME; break;
+    case '^': {
+        core->cursor = line_start(core, core->cursor);
+        size_t end = line_end(core, core->cursor);
+        while (core->cursor < end &&
+            (core->text[core->cursor] == ' ' || core->text[core->cursor] == '\t'))
+            core->cursor = next_character(core, core->cursor);
+        return 1;
+    }
     case '$': case EDITOR_KEY_END:
         if (count > 1)
             move_command(core, 'j', count - 1, 1);
@@ -1145,6 +1209,8 @@ static int replace_characters(EditorCore *core, unsigned long key, size_t count)
     return success;
 }
 
+static int repeat_change(EditorCore *core, size_t count, int explicit_count);
+
 static int handle_key(EditorCore *core, unsigned long key)
 {
     core->status = EDITOR_STATUS_NONE;
@@ -1267,6 +1333,8 @@ static int handle_key(EditorCore *core, unsigned long key)
     }
     if (key == 'u' || key == 18)
         return step_history(core, count, key == 18);
+    if (key == '.' && core->mode == EDITOR_MODE_COMMAND)
+        return repeat_change(core, count, explicit_count);
     if (key == 'r') {
         core->pending = key;
         core->operator_count = count;
@@ -1341,6 +1409,83 @@ static int handle_key(EditorCore *core, unsigned long key)
         key != EDITOR_KEY_UP && key != EDITOR_KEY_DOWN && key != 'G')
         core->block_column = character_column(core, core->cursor);
     return 1;
+}
+
+static int repeat_change(EditorCore *core, size_t count, int explicit_count)
+{
+    if (!core->last_change_length) {
+        core->status = EDITOR_STATUS_NO_CHANGE;
+        return 1;
+    }
+    size_t override = explicit_count ? count : core->repeat_count;
+    size_t first = 0;
+    if (override) {
+        while (first < core->last_change_length &&
+            core->last_change[first] >= '0' && core->last_change[first] <= '9')
+            ++first;
+    }
+    unsigned long command = core->last_change[first];
+    int session = command == 'i' || command == 'a' || command == 'A' || command == 'R';
+    if (session && override && core->last_change[core->last_change_length - 1] == 27) {
+        if (!handle_key(core, command))
+            return 0;
+        while (override--) {
+            for (size_t index = first + 1; index + 1 < core->last_change_length; ++index)
+                if (!handle_key(core, core->last_change[index]))
+                    return 0;
+        }
+        if (!handle_key(core, 27))
+            return 0;
+    } else {
+        if (override)
+            core->count = override;
+        for (size_t index = first; index < core->last_change_length; ++index) {
+            if (!handle_key(core, core->last_change[index]))
+                return 0;
+            if (override && index == first && command == 'd' &&
+                index + 1 < core->last_change_length &&
+                core->last_change[index + 1] >= '1' && core->last_change[index + 1] <= '9') {
+                while (index + 1 < core->last_change_length &&
+                    core->last_change[index + 1] >= '0' && core->last_change[index + 1] <= '9')
+                    ++index;
+            }
+        }
+    }
+    if (explicit_count)
+        core->repeat_count = count;
+    return 1;
+}
+
+static int record_change_key(EditorCore *core, unsigned long key)
+{
+    if (core->change_length == core->change_capacity) {
+        size_t capacity = core->change_capacity ? core->change_capacity * 2 : 32;
+        if (capacity < core->change_capacity || capacity > SIZE_MAX / sizeof(*core->change_keys))
+            return 0;
+        unsigned long *keys = realloc(core->change_keys, capacity * sizeof(*keys));
+        if (!keys)
+            return 0;
+        core->change_keys = keys;
+        core->change_capacity = capacity;
+    }
+    core->change_keys[core->change_length++] = key;
+    return 1;
+}
+
+static void finish_change_recording(EditorCore *core)
+{
+    if (core->change_dirty) {
+        unsigned long *keys = core->last_change;
+        size_t capacity = core->last_change_capacity;
+        core->last_change = core->change_keys;
+        core->last_change_length = core->change_length;
+        core->last_change_capacity = core->change_capacity;
+        core->change_keys = keys;
+        core->change_capacity = capacity;
+        core->repeat_count = 0;
+    }
+    core->change_length = 0;
+    core->change_dirty = 0;
 }
 
 static int retab(EditorCore *core)
@@ -1760,8 +1905,37 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
         return 0;
     int outer = core->dispatch_depth == 0;
     int independent = 0;
+    int recording = 0;
     if (outer) {
         core->history_changed = 0;
+        int navigation = message == EDITOR_SET_CARET ||
+            (message >= EDITOR_MOVE_LEFT && message <= EDITOR_MOVE_END) ||
+            (message == EDITOR_HANDLE_KEY && data &&
+                *(const unsigned long *)data >= EDITOR_KEY_LEFT &&
+                *(const unsigned long *)data <= EDITOR_KEY_END);
+        int session_navigation = navigation &&
+            (core->mode == EDITOR_MODE_INSERT || core->mode == EDITOR_MODE_REPLACE);
+        if (session_navigation && core->change_length) {
+            if (!record_change_key(core, 27))
+                return 0;
+            finish_change_recording(core);
+        }
+        if (message == EDITOR_HANDLE_KEY && data && core->mode != EDITOR_MODE_COMMAND_LINE) {
+            unsigned long key = *(const unsigned long *)data;
+            recording = !session_navigation &&
+                !(key == '.' && core->mode == EDITOR_MODE_COMMAND && !core->pending);
+            if (recording) {
+                if (!core->change_length &&
+                    (core->mode == EDITOR_MODE_INSERT || core->mode == EDITOR_MODE_REPLACE) &&
+                    !record_change_key(core, core->mode == EDITOR_MODE_INSERT ? 'i' : 'R'))
+                    return 0;
+                if (!record_change_key(core, key))
+                    return 0;
+            } else {
+                core->change_length = 0;
+                core->change_dirty = 0;
+            }
+        }
         switch (message) {
         case EDITOR_ADD_CHAR: case EDITOR_ADD_CODEPOINT: case EDITOR_INSERT_TEXT:
         case EDITOR_BACKSPACE: case EDITOR_DELETE_CHAR: case EDITOR_DELETE_LINE:
@@ -1782,6 +1956,15 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
     int success = dispatch_message(core, message, data);
     --core->dispatch_depth;
     if (outer) {
+        if (recording) {
+            core->change_dirty |= core->history_changed;
+            if (!success || core->mode == EDITOR_MODE_COMMAND_LINE) {
+                core->change_length = 0;
+                core->change_dirty = 0;
+            } else if (core->mode == EDITOR_MODE_COMMAND && !core->pending && !core->count) {
+                finish_change_recording(core);
+            }
+        }
         if (core->history_changed || (core->history_open && core->mode == EDITOR_MODE_COMMAND))
             core->revision_cursor = core->cursor;
         if (independent || (message == EDITOR_HANDLE_KEY &&

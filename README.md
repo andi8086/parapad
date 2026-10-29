@@ -50,7 +50,9 @@ for a future hex view, not an implemented hex editor.
 | `/` in command mode | Open forward literal-text search; Enter searches and Esc cancels |
 | `n` | Repeat the latest search, wrapping at the document end; `3n` repeats three matches |
 | `N` (Shift+N) | Repeat the latest search backward, wrapping at the document beginning; supports counts |
+| `*` | Search forward for the whole word under the caret; supports counts and wrapping |
 | `0`, `$`, Home, End | Move to the start/end of the line |
+| `^` | Move to the first character other than a space or Tab on the current line; also works with operators |
 | `v` | Toggle inclusive character selection |
 | `V` (Shift+V) | Toggle whole-line selection |
 | Ctrl+V | Toggle rectangular visual-block selection; motions extend the rectangle |
@@ -60,6 +62,7 @@ for a future hex view, not an implemented hex editor.
 | `:` in command mode | Open the command input above the status bar; Enter executes and Esc cancels |
 | `u` in command mode | Undo the last change; `3u` undoes three changes |
 | Ctrl+R in command mode | Redo an undone change; `3` then Ctrl+R redoes three changes |
+| `.` in command mode | Repeat the last keyboard editing command at the caret; a count overrides its saved count |
 | `y` in visual mode | Copy the selection to the core's register and return to command mode |
 | `yy` | Copy the current line |
 | `p` | Paste after the caret, or below the current line for a linewise register |
@@ -80,6 +83,17 @@ nonzero digit extends a count, e.g. `10j`. Counts are overflow-checked, and moti
 at document boundaries stops without looping through the remaining count.
 `d` and `y` wait for a motion or a second matching key; unsupported continuations
 cancel the pending operator. Counts do not repeat insert/replace-mode sessions.
+
+`.` repeats keyboard changes such as `x`, `dw`, `dd`, `r`, paste, and completed
+insert/replace sessions. Motions, searches, yanks, undo/redo, and empty insert
+sessions leave the last change available. Each replay is one undo step. A count
+such as `3.` replaces the saved command count, including counts on operator
+motions; for insert/replace sessions it repeats the session's input three times.
+Later `.` presses retain that override until a new change is recorded. Visual
+changes replay their selection motions relative to the new caret. Arrow or mouse
+navigation separates insert/replace recordings, matching undo boundaries.
+Direct edit API calls and colon commands are not recorded. With no previous
+keyboard change, `.` leaves the buffer unchanged and displays `no change`.
 
 `r` waits for the replacement character; Esc cancels it. A count such as `3rx`
 replaces three characters with `x`, staying on the current line. If fewer than
@@ -127,6 +141,11 @@ pattern; counts such as `3n` advance multiple matches. `N` (Shift+N) searches
 backward, wrapping to the final match; `3N` moves back three matches. An empty `/` submission
 reuses the previous pattern. Search patterns are UTF-8, and the ANSI frontend
 converts native input before dispatch. Matches start on character boundaries.
+`*` selects the word under the caret (or the next word on the current line when
+on whitespace) and searches for its next whole-word occurrence. It uses the same
+word classes as word motions, including separate punctuation runs. Counts such
+as `2*` skip multiple occurrences. Subsequent `n`/`N` retain whole-word matching;
+entering a new nonempty `/` pattern returns to literal substring matching.
 Regular expressions, `?` search input, and search highlighting are not implemented.
 
 A failed search leaves the caret unchanged and displays `pattern not found`;
