@@ -4,6 +4,7 @@
 
 #include "editor_core.h"
 #include "lexer_c_cpp.h"
+#include "lexer_intel_asm.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -428,7 +429,7 @@ EditorCore *editor_core_create(const char *initial_text)
     EditorCore *core = calloc(1, sizeof(*core));
     if (!core)
         return NULL;
-    static const Lexer *const available_lexers[] = { &lexer_c_cpp };
+    static const Lexer *const available_lexers[] = { &lexer_c_cpp, &lexer_intel_asm };
     for (size_t index = 0; index < sizeof(available_lexers) / sizeof(available_lexers[0]); ++index) {
         if (!register_lexer(core, available_lexers[index])) {
             editor_core_destroy(core);

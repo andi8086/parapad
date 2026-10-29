@@ -53,18 +53,19 @@ for a future hex view, not an implemented hex editor.
 ## Syntax Highlighting
 
 Files whose names end in `.c`, `.h`, or `.hpp` (case-insensitive) automatically
-use the C/C++ lexer. Save As enables or disables highlighting when the extension changes;
+use the C/C++ lexer. `.asm`, `.inc`, and `.s` select the Intel assembly lexer.
+Save As switches lexers or disables highlighting when the extension changes;
 unnamed buffers and other extensions keep the existing plain-text colors.
 Keywords are cyan, comments green, strings and character literals yellow,
-numbers violet, and preprocessor directives orange. Ordinary C/C++ text is
+numbers violet, and preprocessor/assembler directives orange. Ordinary source text is
 light gray on black. Selection colors take precedence.
 
 `lexer.h` defines a language-neutral descriptor: extension matching, line lexing,
 state comparison, and line cleanup callbacks. Each core registers all built-in
 lexers at creation. `EDITOR_SELECT_LEXER` asks the registered lexers whether they
 support a filename's extension, and `EDITOR_GET_LEXER` returns the selected
-descriptor, or NULL for plain text. The C/C++ lexer itself owns the case-insensitive
-`.c`, `.h`, and `.hpp` checks; the window and renderer contain no language list.
+descriptor, or NULL for plain text. Each lexer owns its case-insensitive extension
+checks; the window and renderer contain no language list.
 
 To add a built-in language, implement a `Lexer` descriptor, add its source to the
 project and its descriptor to `available_lexers` in the core. Hosts can also use
@@ -80,6 +81,26 @@ comments, escaped and continued literals, continued directives and line
 comments, include filenames, and C++ raw strings. It is a lexical highlighter,
 not a preprocessor or a complete C/C++ parser; inactive conditional branches
 are not evaluated. Raw document bytes are never changed.
+
+`lexer_intel_asm.c` recognizes Intel-syntax mnemonics case-insensitively from
+8086 through Pentium MMX: integer, string, bit, control-flow, protected-mode,
+privileged/system, the complete pre-P6 x87 set (including waiting/nonwaiting
+forms), and every original MMX mnemonic. All Jcc/SETcc condition aliases,
+size-specific string/stack/return forms, repeat/lock/size prefixes, and legacy
+mnemonics such as SALC, ICEBP, LOADALL, IBTS/XBTS, and FFREEP are included.
+Pentium MMX's RDPMC is included; Pentium Pro-only CMOV/FCMOV/FCOMI and later
+SSE, extended MMX, 3DNow!, and x86-64 additions are not part of this lexer.
+The instruction families are cross-referenced against the
+[NASM instruction list](https://www.nasm.us/doc/nasmaf.html).
+
+Assembly highlighting also recognizes 8/16/32-bit, segment, control/debug/test,
+x87, and MMX registers; NASM/MASM-style directives and operand qualifiers;
+decimal, binary, octal, hexadecimal, and decimal floating literals; quoted
+strings (including doubled quotes and backtick escapes); semicolon comments;
+and MASM delimiter-based multiline `COMMENT` blocks. Labels and other symbols
+retain the ordinary text color. This is highlighting, not operand validation,
+macro expansion, or CPU-feature checking. `.s` is interpreted as Intel syntax,
+not AT&T syntax. Like C/C++, this lexer has no Windows dependency.
 
 Each buffer owns its selected lexer and token/state cache. The renderer uses only
 the generic callbacks and token kinds; switching lexers clears the previous
@@ -420,7 +441,7 @@ From a Visual Studio Developer Command Prompt in the repository directory:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c editor_core_tests.c
+cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c editor_core_tests.c
 Debug\core-tests\editor_core_tests.exe
 ```
 
@@ -430,7 +451,7 @@ From a Visual Studio Developer Command Prompt, run:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
 Debug\core-tests\editor_window_tests.exe
 ```
 
