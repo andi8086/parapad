@@ -15,6 +15,7 @@
 
 typedef struct ReplaceEdit {
     size_t position;
+    size_t cursor;
     size_t original_length;
     size_t inserted_length;
     char *original;
@@ -1393,6 +1394,230 @@ static size_t tab_spaces(const EditorCore *core)
     return core->settings.tabwidth - column % core->settings.tabwidth;
 }
 
+typedef struct CIndentFrame {
+    char opener;
+    size_t base;
+    size_t body;
+    int aligned;
+    int switch_block;
+    int case_active;
+} CIndentFrame;
+
+static int c_indent_identifier(unsigned char value)
+{
+    return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+        (value >= '0' && value <= '9') || value == '_' || value >= 128;
+}
+
+static size_t c_indent_write(char *text, size_t column, const EditorSettings *settings)
+{
+    size_t tabs = settings->expandtabs ? 0 : column / settings->tabwidth;
+    size_t spaces = settings->expandtabs ? column : column % settings->tabwidth;
+    memset(text, '\t', tabs);
+    memset(text + tabs, ' ', spaces);
+    return tabs + spaces;
+}
+
+static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **text, size_t *length)
+{
+    CIndentFrame *frames = NULL;
+    size_t depth = 0, capacity = 0;
+    size_t fallback = 0, switch_base = 0;
+    int switch_pending = 0;
+    size_t current_start = line_start(core, core->cursor);
+    size_t current_first = current_start;
+    while (current_first < core->cursor &&
+        (core->text[current_first] == ' ' || core->text[current_first] == '\t'))
+        ++current_first;
+    size_t current_indent = advance_columns(core, 0, current_start, current_first);
+    size_t corrected_indent = current_indent;
+    LexerCCppState state = { 0 };
+    for (size_t start = 0; start <= core->cursor;) {
+        size_t end = line_end(core, start);
+        if (end > core->cursor)
+            end = core->cursor;
+        size_t first = start;
+        while (first < end && (core->text[first] == ' ' || core->text[first] == '\t'))
+            ++first;
+        size_t original_indent = advance_columns(core, 0, start, first);
+        size_t indent = original_indent;
+        size_t column = 0, measured = start;
+        int seen_code = 0;
+        LexerCCppLine parsed = { 0 };
+        if (!lexer_c_cpp_line(core->text + start, end - start, state, &parsed)) {
+            free(frames);
+            return 0;
+        }
+        state = parsed.end_state;
+        for (size_t token_index = 0; token_index < parsed.count; ++token_index) {
+            const LexerCCppToken *token = &parsed.tokens[token_index];
+            if (token->kind == LEXER_C_CPP_COMMENT || token->kind == LEXER_C_CPP_PREPROCESSOR)
+                continue;
+            size_t token_end = start + token->start + token->length;
+            for (size_t position = start + token->start; position < token_end;) {
+                unsigned char value = (unsigned char)core->text[position];
+                if (value == ' ' || value == '\t' || value == '\r') {
+                    ++position;
+                    continue;
+                }
+                column = advance_columns(core, column, measured, position);
+                measured = position;
+                size_t next = next_character(core, position);
+                int literal = token->kind == LEXER_C_CPP_STRING;
+                if (literal)
+                    next = token_end;
+                else if (c_indent_identifier(value))
+                    while (next < token_end && c_indent_identifier((unsigned char)core->text[next]))
+                        ++next;
+                size_t word_length = next - position;
+                int case_label = !literal && !seen_code &&
+                    ((word_length == 4 && !memcmp(core->text + position, "case", 4)) ||
+                        (word_length == 7 && !memcmp(core->text + position, "default", 7)));
+                int closing = !literal && (value == ')' || value == ']' || value == '}');
+                if (case_label) {
+                    for (size_t index = depth; index > 0; --index) {
+                        CIndentFrame *frame = &frames[index - 1];
+                        if (frame->opener == '{' && frame->switch_block) {
+                            frame->case_active = 1;
+                            indent = frame->base;
+                            break;
+                        }
+                    }
+                }
+                if (closing) {
+                    char opener = value == ')' ? '(' : value == ']' ? '[' : '{';
+                    for (size_t index = depth; index > 0; --index) {
+                        CIndentFrame closed = frames[index - 1];
+                        if (closed.opener != opener)
+                            continue;
+                        depth = index - 1;
+                        fallback = closed.base;
+                        if (!seen_code)
+                            indent = closed.base;
+                        if (closed.switch_block && opener == '(') {
+                            switch_pending = 1;
+                            switch_base = closed.base;
+                        }
+                        break;
+                    }
+                } else {
+                    if (column >= original_indent && indent > SIZE_MAX - (column - original_indent)) {
+                        lexer_c_cpp_free_line(&parsed);
+                        free(frames);
+                        return 0;
+                    }
+                    size_t adjusted_column = column >= original_indent ?
+                        column - original_indent + indent : column;
+                    if (depth && !case_label && (!frames[depth - 1].aligned || !seen_code) &&
+                        value != ',' && value != ';' && value != ':') {
+                        frames[depth - 1].body = adjusted_column;
+                        frames[depth - 1].aligned = 1;
+                    }
+                    if (!literal && word_length == 6 && !memcmp(core->text + position, "switch", 6)) {
+                        switch_pending = 1;
+                        switch_base = indent;
+                    }
+                    if (!literal && (value == '(' || value == '[' || value == '{')) {
+                        if (depth == capacity) {
+                            size_t grown = capacity ? capacity * 2 : 16;
+                            if (grown < capacity || grown > SIZE_MAX / sizeof(*frames)) {
+                                lexer_c_cpp_free_line(&parsed);
+                                free(frames);
+                                return 0;
+                            }
+                            CIndentFrame *replacement = realloc(frames, grown * sizeof(*frames));
+                            if (!replacement) {
+                                lexer_c_cpp_free_line(&parsed);
+                                free(frames);
+                                return 0;
+                            }
+                            frames = replacement;
+                            capacity = grown;
+                        }
+                        CIndentFrame frame = { 0 };
+                        frame.opener = (char)value;
+                        frame.switch_block = switch_pending && (value == '(' || value == '{');
+                        frame.base = frame.switch_block ? switch_base : indent;
+                        frames[depth++] = frame;
+                        switch_pending = 0;
+                    }
+                    if (!literal && value == ';')
+                        switch_pending = 0;
+                    if (!seen_code && !depth)
+                        fallback = indent;
+                }
+                seen_code = 1;
+                position = next;
+            }
+        }
+        lexer_c_cpp_free_line(&parsed);
+        if (start == current_start)
+            corrected_indent = indent;
+        if (end == core->cursor)
+            break;
+        start = end + 1;
+    }
+    size_t next_indent = fallback;
+    if (depth) {
+        const CIndentFrame *frame = &frames[depth - 1];
+        if (frame->opener == '{' && frame->switch_block && !frame->case_active) {
+            next_indent = frame->base;
+        } else if (frame->aligned && !(frame->opener == '{' && frame->switch_block)) {
+            next_indent = frame->body;
+        } else {
+            if (frame->base > SIZE_MAX - core->settings.tabwidth) {
+                free(frames);
+                return 0;
+            }
+            next_indent = frame->base + core->settings.tabwidth;
+        }
+    } else if (current_first == core->cursor && current_indent) {
+        next_indent = current_indent;
+    }
+    free(frames);
+    int rewrite = corrected_indent != current_indent ||
+        (current_first == core->cursor && current_first > current_start);
+    size_t prefix_column = current_first == core->cursor ? 0 : corrected_indent;
+    size_t prefix_bytes = !rewrite ? 0 : core->settings.expandtabs ? prefix_column :
+        prefix_column / core->settings.tabwidth + prefix_column % core->settings.tabwidth;
+    size_t content_bytes = rewrite ? core->cursor - current_first : 0;
+    size_t indent_bytes = core->settings.expandtabs ? next_indent :
+        next_indent / core->settings.tabwidth + next_indent % core->settings.tabwidth;
+    if (prefix_bytes > SIZE_MAX - content_bytes || prefix_bytes + content_bytes > SIZE_MAX - 2 ||
+        indent_bytes > SIZE_MAX - 2 - prefix_bytes - content_bytes)
+        return 0;
+    *length = prefix_bytes + content_bytes + 1 + indent_bytes;
+    *text = malloc(*length + 1);
+    if (!*text)
+        return 0;
+    size_t offset = 0;
+    if (rewrite) {
+        offset = c_indent_write(*text, prefix_column, &core->settings);
+        memcpy(*text + offset, core->text + current_first, content_bytes);
+        offset += content_bytes;
+    }
+    (*text)[offset++] = '\n';
+    offset += c_indent_write(*text + offset, next_indent, &core->settings);
+    (*text)[offset] = 0;
+    *replacement_start = rewrite ? current_start : core->cursor;
+    return 1;
+}
+
+static int insert_newline(EditorCore *core)
+{
+    if (core->lexer != &lexer_c_cpp)
+        return editor_core_send(core, EDITOR_ADD_CHAR, "\n");
+    size_t start, length;
+    char *text;
+    if (!c_indent_newline(core, &start, &text, &length))
+        return 0;
+    int success = write_span(core, start, core->cursor, text, length);
+    free(text);
+    if (success)
+        core->cursor = start + length;
+    return success;
+}
+
 static int insert_tab(EditorCore *core)
 {
     if (!core->settings.expandtabs)
@@ -1414,7 +1639,12 @@ static int replace_input(EditorCore *core, unsigned long key)
     char *expanded = NULL;
     const char *text = encoded;
     size_t length;
-    if (key == '\t' && core->settings.expandtabs) {
+    size_t start = core->cursor;
+    if ((key == '\r' || key == '\n') && core->lexer == &lexer_c_cpp) {
+        if (!c_indent_newline(core, &start, &expanded, &length))
+            return 0;
+        text = expanded;
+    } else if (key == '\t' && core->settings.expandtabs) {
         length = tab_spaces(core);
         expanded = malloc(length);
         if (!expanded)
@@ -1447,23 +1677,24 @@ static int replace_input(EditorCore *core, unsigned long key)
         core->replace_capacity = capacity;
     }
     ReplaceEdit edit;
-    edit.position = core->cursor;
-    edit.original_length = end - core->cursor;
+    edit.position = start;
+    edit.cursor = core->cursor;
+    edit.original_length = end - start;
     edit.inserted_length = length;
     edit.original = malloc(edit.original_length ? edit.original_length : 1);
     if (!edit.original) {
         free(expanded);
         return 0;
     }
-    memcpy(edit.original, core->text + core->cursor, edit.original_length);
-    if (!write_span(core, core->cursor, end, text, length)) {
+    memcpy(edit.original, core->text + start, edit.original_length);
+    if (!write_span(core, start, end, text, length)) {
         free(edit.original);
         free(expanded);
         return 0;
     }
     free(expanded);
     core->replace_edits[core->replace_count++] = edit;
-    core->cursor += length;
+    core->cursor = start + length;
     return 1;
 }
 
@@ -1596,7 +1827,7 @@ static int handle_key(EditorCore *core, unsigned long key)
             if (!write_span(core, edit->position, edit->position + edit->inserted_length,
                 edit->original, edit->original_length))
                 return 0;
-            core->cursor = edit->position;
+            core->cursor = edit->cursor;
             free(edit->original);
             --core->replace_count;
             return 1;
@@ -1630,7 +1861,7 @@ static int handle_key(EditorCore *core, unsigned long key)
         case '\b': return editor_core_send(core, EDITOR_BACKSPACE, NULL);
         case '\t': return insert_tab(core);
         case '\r':
-        case '\n': return editor_core_send(core, EDITOR_ADD_CHAR, "\n");
+        case '\n': return insert_newline(core);
         default:
             if (key < ' ' || key == 127)
                 return 1;

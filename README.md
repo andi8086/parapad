@@ -312,6 +312,31 @@ the search input remains open for correction or Esc. `n`/`N` without a pattern s
 `no previous search`. Searching does not modify bytes, the yank register, or undo
 history. Each open buffer retains its own search pattern when switching buffers.
 
+## C/C++ Indentation
+
+When the active buffer uses the C/C++ lexer, Enter in insert or replace mode
+inserts context-sensitive indentation. Other lexers and plain-text buffers
+retain their existing Enter behavior.
+
+Open braces, parentheses, and brackets establish indentation contexts. New
+parameter/member lines align with the most recent existing parameter or member
+column; without one, they start one `tabwidth` step beyond the context's base
+indentation. Ordinary block lines similarly retain their existing indentation.
+Closing delimiters restore the enclosing block/list's remembered indentation
+rather than carrying continuation indentation into subsequent statements.
+
+`case` and `default` labels align with their `switch`; statements within a case
+start one indentation step farther right. Enter also corrects the leading
+whitespace on a case-label or closing-delimiter line. Nested switches and blocks
+retain separate indentation contexts. Braces and keywords in comments, quoted
+strings/characters, C++ raw strings, and preprocessor text do not affect nesting.
+
+Generated indentation honors `tabwidth` and `expandtabs`: spaces when expansion
+is enabled, otherwise tabs plus any alignment spaces. Line endings continue to
+use the buffer's LF/CRLF mode. Automatic whitespace is part of the current edit
+session for undo/dot-repeat; replace-mode Backspace restores both the previous
+text and caret position. Direct text insertion APIs do not auto-format input.
+
 ## Settings
 
 Press `:` in normal (command) mode to open and focus the command input above the
