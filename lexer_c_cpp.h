@@ -1,16 +1,16 @@
 #ifndef LEXER_C_CPP_H
 #define LEXER_C_CPP_H
 
-#include <stddef.h>
+#include "lexer.h"
 
-typedef enum LexerCCppKind {
-    LEXER_C_CPP_TEXT,
-    LEXER_C_CPP_KEYWORD,
-    LEXER_C_CPP_NUMBER,
-    LEXER_C_CPP_STRING,
-    LEXER_C_CPP_COMMENT,
-    LEXER_C_CPP_PREPROCESSOR
-} LexerCCppKind;
+typedef LexerTokenKind LexerCCppKind;
+
+#define LEXER_C_CPP_TEXT LEXER_TEXT
+#define LEXER_C_CPP_KEYWORD LEXER_KEYWORD
+#define LEXER_C_CPP_NUMBER LEXER_NUMBER
+#define LEXER_C_CPP_STRING LEXER_STRING
+#define LEXER_C_CPP_COMMENT LEXER_COMMENT
+#define LEXER_C_CPP_PREPROCESSOR LEXER_PREPROCESSOR
 
 typedef enum LexerCCppMode {
     LEXER_C_CPP_NORMAL,
@@ -30,11 +30,7 @@ typedef struct LexerCCppState {
     char delimiter[17];
 } LexerCCppState;
 
-typedef struct LexerCCppToken {
-    size_t start;
-    size_t length;
-    LexerCCppKind kind;
-} LexerCCppToken;
+typedef LexerToken LexerCCppToken;
 
 typedef struct LexerCCppLine {
     LexerCCppToken *tokens;
@@ -46,5 +42,7 @@ typedef struct LexerCCppLine {
 int lexer_c_cpp_line(const char *text, size_t length, LexerCCppState state, LexerCCppLine *result);
 int lexer_c_cpp_state_equal(const LexerCCppState *left, const LexerCCppState *right);
 void lexer_c_cpp_free_line(LexerCCppLine *line);
+
+extern const Lexer lexer_c_cpp;
 
 #endif

@@ -59,6 +59,21 @@ Keywords are cyan, comments green, strings and character literals yellow,
 numbers violet, and preprocessor directives orange. Ordinary C/C++ text is
 light gray on black. Selection colors take precedence.
 
+`lexer.h` defines a language-neutral descriptor: extension matching, line lexing,
+state comparison, and line cleanup callbacks. Each core registers all built-in
+lexers at creation. `EDITOR_SELECT_LEXER` asks the registered lexers whether they
+support a filename's extension, and `EDITOR_GET_LEXER` returns the selected
+descriptor, or NULL for plain text. The C/C++ lexer itself owns the case-insensitive
+`.c`, `.h`, and `.hpp` checks; the window and renderer contain no language list.
+
+To add a built-in language, implement a `Lexer` descriptor, add its source to the
+project and its descriptor to `available_lexers` in the core. Hosts can also use
+`EDITOR_REGISTER_LEXER` to register additional descriptors, then select again.
+The first matching registered lexer wins. Descriptors must outlive the core and
+any cached lines. `lex_line` receives NULL for the initial state and returns owned
+tokens and opaque ending state; `free_line` releases both and must accept a
+zero-initialized line. Failed lexing must release its temporary allocations.
+
 The standalone `lexer_c_cpp.c` module returns byte-based token spans and ending
 line states, without Windows or editor-core dependencies. It handles multiline
 comments, escaped and continued literals, continued directives and line
@@ -66,7 +81,9 @@ comments, include filenames, and C++ raw strings. It is a lexical highlighter,
 not a preprocessor or a complete C/C++ parser; inactive conditional branches
 are not evaluated. Raw document bytes are never changed.
 
-Each buffer owns its token/state cache. Core change ranges start incremental
+Each buffer owns its selected lexer and token/state cache. The renderer uses only
+the generic callbacks and token kinds; switching lexers clears the previous
+lexer's cached lines and invalidates their paint versions. Core change ranges start incremental
 re-lexing at the first affected line; processing continues through the changed
 range until the ending state converges with the cached state. Line insertion
 or deletion, raw replacement, and undo/redo conservatively invalidate the
@@ -299,6 +316,9 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save exactly the current buffer's byte length |
 | `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
 | `EDITOR_TAKE_CHANGE` | `EditorChange *` receiving the change revision and accumulated inclusive changed-line range; consumes the range without affecting undo groups |
+| `EDITOR_REGISTER_LEXER` | `const Lexer *`; register an additional lexer descriptor on this core; registering the same pointer again is a no-op |
+| `EDITOR_SELECT_LEXER` | NUL-terminated filename; select the first registered lexer that supports its extension, or plain text when none matches |
+| `EDITOR_GET_LEXER` | `const Lexer **` receiving the selected descriptor, or NULL for plain text |
 | `EDITOR_UNDO`, `EDITOR_REDO` | NULL; restore one history step, returning to command mode |
 | `EDITOR_GET_SELECTION` | `EditorSelection *`; supply `line`, receive byte `start`/exclusive `end`, `active`, and `includes_newline` |
 | `EDITOR_GET_REGISTER` | `EditorRegister *` receiving borrowed UTF-8 `text`, byte `length`, and `linewise` |
@@ -400,7 +420,7 @@ From a Visual Studio Developer Command Prompt in the repository directory:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c editor_core_tests.c
+cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c editor_core_tests.c
 Debug\core-tests\editor_core_tests.exe
 ```
 

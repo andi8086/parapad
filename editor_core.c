@@ -3,6 +3,7 @@
 #endif
 
 #include "editor_core.h"
+#include "lexer_c_cpp.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +26,9 @@ typedef struct HistoryEntry {
 } HistoryEntry;
 
 struct EditorCore {
+    const Lexer **lexers;
+    size_t lexer_count;
+    const Lexer *lexer;
     char *text;
     size_t length;
     size_t capacity;
@@ -76,6 +80,50 @@ struct EditorCore {
     int history_open;
     int history_changed;
 };
+
+static int register_lexer(EditorCore *core, const Lexer *lexer)
+{
+    if (!lexer || !lexer->name || !*lexer->name || !lexer->supports_extension ||
+        !lexer->lex_line || !lexer->states_equal || !lexer->free_line)
+        return 0;
+    for (size_t index = 0; index < core->lexer_count; ++index) {
+        if (core->lexers[index] == lexer)
+            return 1;
+        if (!strcmp(core->lexers[index]->name, lexer->name))
+            return 0;
+    }
+    if (core->lexer_count >= SIZE_MAX / sizeof(*core->lexers))
+        return 0;
+    const Lexer **lexers = realloc(core->lexers, (core->lexer_count + 1) * sizeof(*lexers));
+    if (!lexers)
+        return 0;
+    core->lexers = lexers;
+    core->lexers[core->lexer_count++] = lexer;
+    return 1;
+}
+
+static int select_lexer(EditorCore *core, const char *filename)
+{
+    if (!filename)
+        return 0;
+    const char *extension = NULL;
+    for (const char *position = filename; *position; ++position) {
+        if (*position == '/' || *position == '\\')
+            extension = NULL;
+        else if (*position == '.')
+            extension = position;
+    }
+    core->lexer = NULL;
+    if (extension) {
+        for (size_t index = 0; index < core->lexer_count; ++index) {
+            if (core->lexers[index]->supports_extension(extension)) {
+                core->lexer = core->lexers[index];
+                break;
+            }
+        }
+    }
+    return 1;
+}
 
 static void clear_replace_history(EditorCore *core)
 {
@@ -380,6 +428,13 @@ EditorCore *editor_core_create(const char *initial_text)
     EditorCore *core = calloc(1, sizeof(*core));
     if (!core)
         return NULL;
+    static const Lexer *const available_lexers[] = { &lexer_c_cpp };
+    for (size_t index = 0; index < sizeof(available_lexers) / sizeof(available_lexers[0]); ++index) {
+        if (!register_lexer(core, available_lexers[index])) {
+            editor_core_destroy(core);
+            return NULL;
+        }
+    }
     core->settings.maxcol = 80;
     core->settings.tabwidth = 8;
     core->settings.expandtabs = 1;
@@ -398,6 +453,7 @@ EditorCore *editor_core_create(const char *initial_text)
 void editor_core_destroy(EditorCore *core)
 {
     if (core) {
+    free(core->lexers);
         clear_replace_history(core);
         free(core->search_text);
         free(core->change_keys);
@@ -1692,6 +1748,15 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     default: break;
     }
     switch (message) {
+    case EDITOR_REGISTER_LEXER:
+        return register_lexer(core, data);
+    case EDITOR_SELECT_LEXER:
+        return select_lexer(core, data);
+    case EDITOR_GET_LEXER:
+        if (!data)
+            return 0;
+        *(const Lexer **)data = core->lexer;
+        return 1;
     case EDITOR_TAKE_CHANGE:
         if (!data)
             return 0;

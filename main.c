@@ -7,10 +7,10 @@
 #include <string.h>
 
 #include "editor_core.h"
-#include "lexer_c_cpp.h"
+#include "lexer.h"
 
 typedef struct SyntaxLine {
-    LexerCCppLine parsed;
+    LexerLine parsed;
     size_t version;
     int valid;
 } SyntaxLine;
@@ -21,7 +21,7 @@ typedef struct SyntaxCache {
     size_t revision;
     size_t serial;
     int valid;
-    int enabled;
+    const Lexer *lexer;
 } SyntaxCache;
 
 #define ID_EDITOR 100
@@ -94,14 +94,24 @@ typedef struct MainWindowState {
 static void clear_syntax_cache(SyntaxCache *cache)
 {
     for (size_t index = 0; index < cache->line_count; ++index)
-        lexer_c_cpp_free_line(&cache->lines[index].parsed);
+        cache->lexer->free_line(&cache->lines[index].parsed);
     free(cache->lines);
     memset(cache, 0, sizeof(*cache));
 }
 
 static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
 {
-    if (!cache || !cache->enabled)
+    if (!cache)
+        return 1;
+    const Lexer *lexer = NULL;
+    editor_core_send(core, EDITOR_GET_LEXER, &lexer);
+    if (cache->lexer != lexer) {
+        size_t serial = cache->serial;
+        clear_syntax_cache(cache);
+        cache->serial = serial;
+        cache->lexer = lexer;
+    }
+    if (!lexer)
         return 1;
     EditorChange change;
     editor_core_send(core, EDITOR_TAKE_CHANGE, &change);
@@ -125,7 +135,7 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
         if (retained)
             memcpy(lines, cache->lines, retained * sizeof(*lines));
         for (size_t index = retained; index < cache->line_count; ++index)
-            lexer_c_cpp_free_line(&cache->lines[index].parsed);
+            lexer->free_line(&cache->lines[index].parsed);
         free(cache->lines);
         cache->lines = lines;
         cache->line_count = count;
@@ -135,7 +145,7 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
         first = count - 1;
     if (first && !cache->lines[first - 1].valid)
         first = 0;
-    LexerCCppState state = { 0 };
+    const void *state = NULL;
     if (first)
         state = cache->lines[first - 1].parsed.end_state;
     EditorBuffer buffer;
@@ -154,13 +164,13 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
         const unsigned char *newline = memchr(text, '\n', buffer.length - offset);
         size_t length = newline ? (size_t)(newline - text) : buffer.length - offset;
         SyntaxLine *line = &cache->lines[index];
-        LexerCCppLine parsed = { 0 };
-        if (!lexer_c_cpp_line((const char *)text, length, state, &parsed)) {
+        LexerLine parsed = { 0 };
+        if (!lexer->lex_line((const char *)text, length, state, &parsed)) {
             cache->valid = 0;
             return 0;
         }
-        int converged = line->valid && lexer_c_cpp_state_equal(&line->parsed.end_state, &parsed.end_state);
-        lexer_c_cpp_free_line(&line->parsed);
+        int converged = line->valid && lexer->states_equal(line->parsed.end_state, parsed.end_state);
+        lexer->free_line(&line->parsed);
         line->parsed = parsed;
         line->valid = 1;
         if (!++cache->serial)
@@ -176,14 +186,14 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
     return 1;
 }
 
-static COLORREF syntax_color(LexerCCppKind kind)
+static COLORREF syntax_color(LexerTokenKind kind)
 {
     switch (kind) {
-    case LEXER_C_CPP_KEYWORD: return RGB(86, 200, 255);
-    case LEXER_C_CPP_NUMBER: return RGB(205, 160, 240);
-    case LEXER_C_CPP_STRING: return RGB(235, 200, 120);
-    case LEXER_C_CPP_COMMENT: return RGB(110, 180, 120);
-    case LEXER_C_CPP_PREPROCESSOR: return RGB(255, 160, 110);
+    case LEXER_KEYWORD: return RGB(86, 200, 255);
+    case LEXER_NUMBER: return RGB(205, 160, 240);
+    case LEXER_STRING: return RGB(235, 200, 120);
+    case LEXER_COMMENT: return RGB(110, 180, 120);
+    case LEXER_PREPROCESSOR: return RGB(255, 160, 110);
     default: return RGB(225, 225, 225);
     }
 }
@@ -257,8 +267,8 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
         editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
     COLORREF normal_color = GetTextColor(dc);
     COLORREF normal_background = GetBkColor(dc);
-    const LexerCCppLine *syntax = paint && editor->syntax && editor->syntax_ready &&
-        editor->syntax->enabled && index < editor->syntax->line_count ?
+    const LexerLine *syntax = paint && editor->syntax && editor->syntax_ready &&
+        editor->syntax->lexer && index < editor->syntax->line_count ?
         &editor->syntax->lines[index].parsed : NULL;
     size_t token_index = 0;
     EditorSettings settings;
@@ -299,7 +309,7 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
                     syntax->tokens[token_index].start + syntax->tokens[token_index].length)
                     ++token_index;
                 color = syntax_color(token_index < syntax->count ?
-                    syntax->tokens[token_index].kind : LEXER_C_CPP_TEXT);
+                    syntax->tokens[token_index].kind : LEXER_TEXT);
             }
             SetTextColor(dc, color);
             int selected = selection.active && character.column >= selection.start && character.column < selection.end;
@@ -460,7 +470,7 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
         if (exists && focused && index != primary.line)
             editor_core_send(editor->core, EDITOR_GET_LINE_CARET, &caret);
         CachedLine *cached = editor->lines ? &editor->lines[index % rows] : NULL;
-        size_t syntax_version = syntax_ready && editor->syntax && editor->syntax->enabled &&
+        size_t syntax_version = syntax_ready && editor->syntax && editor->syntax->lexer &&
             index < editor->syntax->line_count ? editor->syntax->lines[index].version : 0;
         if (reuse && cached && cached->valid && cached->index == index && cached->exists == exists &&
             cached->syntax_version == syntax_version &&
@@ -744,13 +754,7 @@ static const char *buffer_filename(const TextBuffer *buffer)
 
 static void configure_document_syntax(TextBuffer *buffer)
 {
-    const char *extension = strrchr(buffer_filename(buffer), '.');
-    int enabled = extension && (lstrcmpiA(extension, ".c") == 0 ||
-        lstrcmpiA(extension, ".h") == 0 || lstrcmpiA(extension, ".hpp") == 0);
-    if (enabled != buffer->syntax.enabled) {
-        clear_syntax_cache(&buffer->syntax);
-        buffer->syntax.enabled = enabled;
-    }
+    editor_core_send(buffer->core, EDITOR_SELECT_LEXER, buffer->path);
 }
 
 static TextBuffer *create_document(const char *path)

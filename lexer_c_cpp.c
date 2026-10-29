@@ -262,3 +262,65 @@ int lexer_c_cpp_line(const char *text, size_t length, LexerCCppState state, Lexe
     *result = line;
     return 1;
 }
+
+static int supports_extension(const char *extension)
+{
+    static const char *const extensions[] = { ".c", ".h", ".hpp" };
+    if (!extension)
+        return 0;
+    for (size_t index = 0; index < sizeof(extensions) / sizeof(extensions[0]); ++index) {
+        const char *candidate = extensions[index];
+        size_t position = 0;
+        while (extension[position] && candidate[position]) {
+            unsigned char character = (unsigned char)extension[position];
+            if (character >= 'A' && character <= 'Z')
+                character += 'a' - 'A';
+            if (character != (unsigned char)candidate[position])
+                break;
+            ++position;
+        }
+        if (!extension[position] && !candidate[position])
+            return 1;
+    }
+    return 0;
+}
+
+static int lex_line(const char *text, size_t length, const void *state, LexerLine *result)
+{
+    if (!result)
+        return 0;
+    LexerCCppState initial = { 0 };
+    if (state)
+        initial = *(const LexerCCppState *)state;
+    LexerCCppLine parsed = { 0 };
+    if (!lexer_c_cpp_line(text, length, initial, &parsed))
+        return 0;
+    LexerCCppState *ending = malloc(sizeof(*ending));
+    if (!ending) {
+        lexer_c_cpp_free_line(&parsed);
+        return 0;
+    }
+    *ending = parsed.end_state;
+    result->tokens = parsed.tokens;
+    result->count = parsed.count;
+    result->end_state = ending;
+    return 1;
+}
+
+static int states_equal(const void *left, const void *right)
+{
+    if (!left || !right)
+        return left == right;
+    return lexer_c_cpp_state_equal(left, right);
+}
+
+static void free_line(LexerLine *line)
+{
+    free(line->tokens);
+    free(line->end_state);
+    memset(line, 0, sizeof(*line));
+}
+
+const Lexer lexer_c_cpp = {
+    "C/C++", supports_extension, lex_line, states_equal, free_line
+};

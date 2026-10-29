@@ -2,6 +2,7 @@
 #define EDITOR_CORE_H
 
 #include <stddef.h>
+#include "lexer.h"
 
 typedef struct EditorCore EditorCore;
 
@@ -69,7 +70,10 @@ typedef enum EditorMessage {
     EDITOR_EXECUTE_COMMAND,
     EDITOR_GET_COMMAND_PREFIX,
     EDITOR_TAKE_BUFFER_SWITCH,
-    EDITOR_TAKE_CHANGE
+    EDITOR_TAKE_CHANGE,
+    EDITOR_REGISTER_LEXER,
+    EDITOR_SELECT_LEXER,
+    EDITOR_GET_LEXER
 } EditorMessage;
 
 typedef struct EditorChange {
