@@ -32,6 +32,9 @@ struct EditorCore {
     EditorMode mode;
     EditorStatus status;
     EditorSettings settings;
+    char command_prefix;
+    char *search_text;
+    size_t search_length;
     size_t anchor;
     size_t count;
     size_t operator_count;
@@ -339,6 +342,7 @@ EditorCore *editor_core_create(const char *initial_text)
     core->settings.maxcol = 80;
     core->settings.tabwidth = 8;
     core->settings.expandtabs = 1;
+    core->command_prefix = ':';
     if (!insert_text(core, initial_text ? initial_text : "")) {
         editor_core_destroy(core);
         return NULL;
@@ -353,6 +357,7 @@ void editor_core_destroy(EditorCore *core)
 {
     if (core) {
         clear_replace_history(core);
+        free(core->search_text);
         free_history(core->undo);
         free_history(core->redo);
         free(core->replace_edits);
@@ -732,6 +737,23 @@ static size_t word_forward(const EditorCore *core, size_t position)
     return position;
 }
 
+static size_t word_end(const EditorCore *core, size_t position)
+{
+    size_t original = position;
+    if (position == core->length)
+        return position;
+    position = next_character(core, position);
+    while (position < core->length && !word_class(core, position))
+        position = next_character(core, position);
+    if (position == core->length)
+        return original;
+    int category = word_class(core, position);
+    while (next_character(core, position) < core->length &&
+        word_class(core, next_character(core, position)) == category)
+        position = next_character(core, position);
+    return position;
+}
+
 static size_t word_backward(const EditorCore *core, size_t position)
 {
     if (!position)
@@ -756,6 +778,60 @@ static void goto_line(EditorCore *core, size_t number)
         --number;
     }
     core->cursor = position;
+}
+
+static int repeat_search(EditorCore *core, size_t count, int backwards)
+{
+    if (!core->search_length) {
+        core->status = EDITOR_STATUS_NO_PREVIOUS_SEARCH;
+        return 0;
+    }
+    size_t matches = 0;
+    size_t first = SIZE_MAX;
+    for (size_t position = 0; position < core->length; position = next_character(core, position)) {
+        if (core->search_length <= core->length - position &&
+            memcmp(core->text + position, core->search_text, core->search_length) == 0) {
+            if ((backwards && position < core->cursor) ||
+                (!backwards && first == SIZE_MAX && position > core->cursor))
+                first = matches;
+            ++matches;
+        }
+    }
+    if (!matches) {
+        core->status = EDITOR_STATUS_PATTERN_NOT_FOUND;
+        return 0;
+    }
+    if (first == SIZE_MAX)
+        first = backwards ? matches - 1 : 0;
+    size_t offset = (count - 1) % matches;
+    size_t target = backwards ? (offset > first ? matches - (offset - first) : first - offset) :
+        (offset >= matches - first ? offset - (matches - first) : first + offset);
+    for (size_t position = 0; position < core->length; position = next_character(core, position)) {
+        if (core->search_length <= core->length - position &&
+            memcmp(core->text + position, core->search_text, core->search_length) == 0) {
+            if (!target--) {
+                core->cursor = position;
+                core->status = EDITOR_STATUS_NONE;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int start_search(EditorCore *core, const char *text)
+{
+    size_t length = strlen(text);
+    if (length) {
+        char *copy = malloc(length + 1);
+        if (!copy)
+            return 0;
+        memcpy(copy, text, length + 1);
+        free(core->search_text);
+        core->search_text = copy;
+        core->search_length = length;
+    }
+    return repeat_search(core, 1, 0);
 }
 
 static int move_command(EditorCore *core, unsigned long key, size_t count, int explicit_count)
@@ -790,6 +866,7 @@ static int move_command(EditorCore *core, unsigned long key, size_t count, int e
     }
     EditorMessage message;
     switch (key) {
+    case 'n': case 'N': return repeat_search(core, count, key == 'N');
     case 'h': case EDITOR_KEY_LEFT: message = EDITOR_MOVE_LEFT; break;
     case 'l': case EDITOR_KEY_RIGHT: message = EDITOR_MOVE_RIGHT; break;
     case 'j': case EDITOR_KEY_DOWN: message = EDITOR_MOVE_DOWN; break;
@@ -807,10 +884,11 @@ static int move_command(EditorCore *core, unsigned long key, size_t count, int e
             core->cursor = column_position(core, start, line_end(core, start), core->block_column);
         }
         return 1;
-    case 'w': case 'b':
+    case 'w': case 'b': case 'e':
         while (count--) {
             size_t previous = core->cursor;
-            core->cursor = key == 'w' ? word_forward(core, previous) : word_backward(core, previous);
+            core->cursor = key == 'w' ? word_forward(core, previous) :
+                (key == 'b' ? word_backward(core, previous) : word_end(core, previous));
             if (previous == core->cursor)
                 break;
         }
@@ -1169,6 +1247,8 @@ static int handle_key(EditorCore *core, unsigned long key)
             return 1;
         TextRange range = { original < core->cursor ? original : core->cursor,
             original > core->cursor ? original : core->cursor, 0 };
+        if (key == 'e')
+            range.end = next_character(core, range.end);
         if (key == 'j' || key == 'k' || key == 'G' || key == EDITOR_KEY_UP || key == EDITOR_KEY_DOWN) {
             range.linewise = 1;
             range.start = line_start(core, range.start);
@@ -1180,7 +1260,8 @@ static int handle_key(EditorCore *core, unsigned long key)
         return use_range(core, range, pending == 'd');
     }
     core->count = 0;
-    if (key == ':' && core->mode == EDITOR_MODE_COMMAND) {
+    if ((key == ':' || key == '/') && core->mode == EDITOR_MODE_COMMAND) {
+        core->command_prefix = (char)key;
         core->mode = EDITOR_MODE_COMMAND_LINE;
         return 1;
     }
@@ -1240,7 +1321,11 @@ static int handle_key(EditorCore *core, unsigned long key)
         core->operator_has_count = explicit_count;
         return 1;
     }
-    if (key == 'i' && !is_visual(core)) {
+    if ((key == 'i' || key == 'a' || key == 'A') && !is_visual(core)) {
+        if (key == 'A')
+            core->cursor = line_end(core, core->cursor);
+        else if (key == 'a' && core->cursor < line_end(core, core->cursor))
+            core->cursor = next_character(core, core->cursor);
         core->mode = EDITOR_MODE_INSERT;
         return 1;
     }
@@ -1333,8 +1418,15 @@ static int execute_command(EditorCore *core, const char *text)
     core->status = EDITOR_STATUS_INVALID_COMMAND;
     if (!text)
         return 0;
+    if (core->mode == EDITOR_MODE_COMMAND_LINE && core->command_prefix == '/') {
+        if (*text == '/')
+            ++text;
+        return start_search(core, text) ? complete_command(core) : 0;
+    }
     while (*text == ' ' || *text == '\t')
         ++text;
+    if (*text == '/')
+        return start_search(core, text + 1) ? complete_command(core) : 0;
     if (*text == ':')
         ++text;
     while (*text == ' ' || *text == '\t')
@@ -1409,6 +1501,11 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     default: break;
     }
     switch (message) {
+    case EDITOR_GET_COMMAND_PREFIX:
+        if (!data)
+            return 0;
+        *(char *)data = core->command_prefix;
+        return 1;
     case EDITOR_EXECUTE_COMMAND:
         return execute_command(core, data);
     case EDITOR_GET_SETTINGS:

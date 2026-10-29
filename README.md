@@ -43,7 +43,13 @@ for a future hex view, not an implemented hex editor.
 | Keys | Action |
 | --- | --- |
 | `h/j/k/l`, arrow keys | Move left/down/up/right |
+| `a` in command mode | Enter insert mode after the current character, staying on the same line |
+| `A` (Shift+A) in command mode | Enter insert mode at the end of the current line |
 | `w`, `b` | Move to the next/previous word; ASCII punctuation forms separate words |
+| `e` | Move to the end of the current/next word; supports counts and inclusive `de`/`ye` operators |
+| `/` in command mode | Open forward literal-text search; Enter searches and Esc cancels |
+| `n` | Repeat the latest search, wrapping at the document end; `3n` repeats three matches |
+| `N` (Shift+N) | Repeat the latest search backward, wrapping at the document beginning; supports counts |
 | `0`, `$`, Home, End | Move to the start/end of the line |
 | `v` | Toggle inclusive character selection |
 | `V` (Shift+V) | Toggle whole-line selection |
@@ -112,6 +118,21 @@ pressing Delete, or inserting a newline ends repetition and continues ordinary
 editing on the first line. An empty insert followed by Esc changes nothing.
 Block yank/delete stores newline-separated row slices in the ordinary register;
 blockwise paste is not implemented, and `p`/`P` while selecting a block is a no-op.
+
+## Search
+
+Press `/`, type a case-sensitive literal pattern, and press Enter. Search starts
+after the caret and wraps to the document beginning. `n` repeats the latest
+pattern; counts such as `3n` advance multiple matches. `N` (Shift+N) searches
+backward, wrapping to the final match; `3N` moves back three matches. An empty `/` submission
+reuses the previous pattern. Search patterns are UTF-8, and the ANSI frontend
+converts native input before dispatch. Matches start on character boundaries.
+Regular expressions, `?` search input, and search highlighting are not implemented.
+
+A failed search leaves the caret unchanged and displays `pattern not found`;
+the search input remains open for correction or Esc. `n`/`N` without a pattern shows
+`no previous search`. Searching does not modify bytes, the yank register, or undo
+history. The latest pattern belongs to the core instance and survives New/load.
 
 ## Settings
 
@@ -203,10 +224,11 @@ allocation failure. Failed edits leave the document unchanged.
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
 | `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block/command-line mode |
-| `EDITOR_GET_STATUS` | `EditorStatus *` receiving `EDITOR_STATUS_NONE`, `EDITOR_STATUS_NO_CHANGE`, or `EDITOR_STATUS_INVALID_COMMAND` without clearing it |
+| `EDITOR_GET_STATUS` | `EditorStatus *` receiving the current no-change, invalid-command, pattern-not-found, or no-previous-search status, or `EDITOR_STATUS_NONE`, without clearing it |
+| `EDITOR_GET_COMMAND_PREFIX` | `char *` receiving `:` for settings/commands or `/` for search input |
 | `EDITOR_GET_SETTINGS` | `EditorSettings *` receiving `maxcol`, `tabwidth`, and `expandtabs` |
 | `EDITOR_SET_SETTINGS` | `const EditorSettings *` supplying all three settings |
-| `EDITOR_EXECUTE_COMMAND` | NUL-terminated command string, with an optional leading `:`; execute `set name=value` or `retab` in the core |
+| `EDITOR_EXECUTE_COMMAND` | NUL-terminated UTF-8 input; execute `set name=value` or `retab` with an optional `:`, or search with `/pattern` |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |
@@ -233,10 +255,12 @@ allocation failure. Failed edits leave the document unchanged.
 
 `EDITOR_HANDLE_KEY` runs the core's per-instance state machine. ASCII `i` changes
 command mode to insert mode without inserting itself; scalar 27 (Esc) returns to
-command mode without inserting a character. ASCII `R` enters
+command mode without inserting a character. ASCII `a` and `A` enter insert mode
+after a character or at line end. ASCII `R` enters
 `EDITOR_MODE_REPLACE`, while `r` waits for a one-shot replacement character.
-In normal mode, `:` enters `EDITOR_MODE_COMMAND_LINE`; the frontend edits the
-command text and submits it with `EDITOR_EXECUTE_COMMAND`. Successful execution
+In normal mode, `:` or `/` enters `EDITOR_MODE_COMMAND_LINE`; the core supplies
+the prompt through `EDITOR_GET_COMMAND_PREFIX`. The frontend edits the input
+and submits it with `EDITOR_EXECUTE_COMMAND`. Successful execution
 returns to command mode; invalid input returns 0, sets the invalid-command
 status, and leaves command-line mode active. Esc cancels command-line mode.
 Backspace, Tab, and Enter are passed
@@ -292,7 +316,7 @@ yank/delete or core destruction; clients must not modify it.
 ## ANSI Frontend
 
 The GUI uses ANSI window and GDI entry points, not the Win95 Unicode stubs.
-The core handles all UTF-8 encoding and decoding. The GUI queries Unicode scalar
+The core stores UTF-8 text independently of the system code page. The GUI queries Unicode scalar
 values for layout and converts them to the active ANSI code page for `TextOutA`.
 ANSI `WM_CHAR` input, including DBCS lead/trail bytes, is converted using
 `MultiByteToWideChar(CP_ACP)` and sent to the core as scalars. The temporary

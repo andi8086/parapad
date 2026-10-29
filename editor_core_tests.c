@@ -275,7 +275,7 @@ static void test_modes(void)
     EditorSettings settings = { 80, 4, 1 };
     assert(editor_core_send(core, EDITOR_SET_SETTINGS, &settings));
     expect_mode(core, EDITOR_MODE_COMMAND);
-    send_key(core, 'a');
+    send_key(core, 'z');
     send_key(core, '\r');
     send_key(core, '\t');
     send_key(core, '\b');
@@ -987,8 +987,166 @@ static void test_retab(void)
     editor_core_destroy(core);
 }
 
+static void test_append_word_commands(void)
+{
+    EditorCore *core = editor_core_create("A\xC3\xA4Z\nnext");
+    assert(core);
+    send_keys(core, "laX");
+    expect_mode(core, EDITOR_MODE_INSERT);
+    expect_line(core, 0, "A\xC3\xA4XZ");
+    send_key(core, 27);
+    send_keys(core, "0AY");
+    expect_line(core, 0, "A\xC3\xA4XZY");
+    expect_line(core, 1, "next");
+    send_key(core, 27);
+    send_key(core, 'u');
+    expect_line(core, 0, "A\xC3\xA4XZ");
+    send_key(core, 'u');
+    expect_line(core, 0, "A\xC3\xA4Z");
+    editor_core_destroy(core);
+
+    core = editor_core_create("");
+    assert(core);
+    send_keys(core, "aX");
+    send_key(core, 27);
+    send_keys(core, "$aY");
+    expect_line(core, 0, "XY");
+    send_key(core, 27);
+    editor_core_destroy(core);
+
+    core = editor_core_create("one two,xy\nlast");
+    assert(core);
+    send_key(core, 'e');
+    expect_caret(core, 0, 2);
+    send_key(core, 'e');
+    expect_caret(core, 0, 6);
+    send_key(core, 'e');
+    expect_caret(core, 0, 7);
+    send_key(core, 'e');
+    expect_caret(core, 0, 9);
+    send_key(core, 'e');
+    expect_caret(core, 1, 3);
+    send_keys(core, "99e");
+    expect_caret(core, 1, 3);
+    send_key(core, 'b');
+    expect_caret(core, 1, 0);
+    send_keys(core, "2b");
+    expect_caret(core, 0, 7);
+    send_keys(core, "gg2e");
+    expect_caret(core, 0, 6);
+    send_keys(core, "0ye");
+    expect_register(core, "one", 0);
+    send_keys(core, "0de");
+    expect_line(core, 0, " two,xy");
+    send_key(core, 'u');
+    send_keys(core, "0d2e");
+    expect_line(core, 0, ",xy");
+    expect_register(core, "one two", 0);
+    send_key(core, 'u');
+    send_keys(core, "0vey");
+    expect_register(core, "one", 0);
+    editor_core_destroy(core);
+}
+
+static void test_search_repeat(void)
+{
+    EditorCore *core = editor_core_create("one two one\nlast one");
+    assert(core);
+    send_key(core, 'n');
+    EditorStatus status;
+    assert(editor_core_send(core, EDITOR_GET_STATUS, &status) && status == EDITOR_STATUS_NO_PREVIOUS_SEARCH);
+    send_key(core, '/');
+    expect_mode(core, EDITOR_MODE_COMMAND_LINE);
+    char prefix;
+    assert(editor_core_send(core, EDITOR_GET_COMMAND_PREFIX, &prefix) && prefix == '/');
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/one"));
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    expect_caret(core, 0, 8);
+    send_key(core, 'n');
+    expect_caret(core, 1, 5);
+    send_key(core, 'n');
+    expect_caret(core, 0, 0);
+    send_keys(core, "2n");
+    expect_caret(core, 1, 5);
+    send_keys(core, "999999n");
+    expect_caret(core, 1, 5);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/"));
+    expect_caret(core, 0, 0);
+    assert(!editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/absent"));
+    expect_caret(core, 0, 0);
+    assert(editor_core_send(core, EDITOR_GET_STATUS, &status) && status == EDITOR_STATUS_PATTERN_NOT_FOUND);
+    send_key(core, 'n');
+    assert(editor_core_send(core, EDITOR_GET_STATUS, &status) && status == EDITOR_STATUS_PATTERN_NOT_FOUND);
+    int modified = 1;
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/one"));
+    send_keys(core, "0dn");
+    expect_line(core, 0, "one");
+    send_key(core, 'u');
+    expect_line(core, 0, "one two one");
+    send_key(core, ':');
+    assert(editor_core_send(core, EDITOR_GET_COMMAND_PREFIX, &prefix) && prefix == ':');
+    send_key(core, 27);
+    assert(!editor_core_send(core, EDITOR_GET_COMMAND_PREFIX, NULL));
+    editor_core_destroy(core);
+
+    core = editor_core_create("\xC3\xA4X\xC3\xA4");
+    assert(core);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/\xC3\xA4"));
+    expect_caret(core, 0, 3);
+    send_key(core, 'n');
+    expect_caret(core, 0, 0);
+    editor_core_destroy(core);
+}
+
+static void test_search_backwards(void)
+{
+    EditorCore *core = editor_core_create("one two one\nlast one");
+    assert(core);
+    send_key(core, 'N');
+    EditorStatus status;
+    assert(editor_core_send(core, EDITOR_GET_STATUS, &status) && status == EDITOR_STATUS_NO_PREVIOUS_SEARCH);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/one"));
+    expect_caret(core, 0, 8);
+    send_key(core, 'N');
+    expect_caret(core, 0, 0);
+    send_key(core, 'N');
+    expect_caret(core, 1, 5);
+    send_keys(core, "2N");
+    expect_caret(core, 0, 0);
+    send_keys(core, "999999N");
+    expect_caret(core, 0, 0);
+    send_key(core, 'n');
+    expect_caret(core, 0, 8);
+    EditorCaret between = { 0, 5 };
+    assert(editor_core_send(core, EDITOR_SET_CARET, &between));
+    send_key(core, 'N');
+    expect_caret(core, 0, 0);
+    int modified = 1;
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    assert(!editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/absent"));
+    send_key(core, 'N');
+    expect_caret(core, 0, 0);
+    assert(editor_core_send(core, EDITOR_GET_STATUS, &status) && status == EDITOR_STATUS_PATTERN_NOT_FOUND);
+    editor_core_destroy(core);
+
+    core = editor_core_create("\xC3\xA4X\xC3\xA4");
+    assert(core);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "/\xC3\xA4"));
+    send_key(core, 'N');
+    expect_caret(core, 0, 0);
+    send_key(core, 'N');
+    expect_caret(core, 0, 3);
+    send_keys(core, "2N");
+    expect_caret(core, 0, 3);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_search_backwards();
+    test_search_repeat();
+    test_append_word_commands();
     test_retab();
     test_set_commands();
     test_settings();

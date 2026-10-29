@@ -633,6 +633,42 @@ static void layout_main_children(HWND window)
     MoveWindow(GetDlgItem(window, ID_COMMAND_LINE), 12, content_height, width, command_height, TRUE);
 }
 
+static int execute_ansi_command(EditorCore *core, const char *text)
+{
+    WCHAR units[1024];
+    int count = MultiByteToWideChar(CP_ACP, 0, text, -1, units, 1024);
+    if (!count)
+        return editor_core_send(core, EDITOR_EXECUTE_COMMAND, NULL);
+    char utf8[4096];
+    size_t length = 0;
+    for (int index = 0; index < count - 1; ++index) {
+        unsigned long value = units[index];
+        if (value >= 0xD800 && value <= 0xDBFF && index + 1 < count - 1 &&
+            units[index + 1] >= 0xDC00 && units[index + 1] <= 0xDFFF) {
+            value = 0x10000 + ((value - 0xD800) << 10) + units[++index] - 0xDC00;
+        } else if (value >= 0xD800 && value <= 0xDFFF) {
+            return editor_core_send(core, EDITOR_EXECUTE_COMMAND, NULL);
+        }
+        if (value < 0x80) {
+            utf8[length++] = (char)value;
+        } else if (value < 0x800) {
+            utf8[length++] = (char)(0xC0 | (value >> 6));
+            utf8[length++] = (char)(0x80 | (value & 0x3F));
+        } else if (value < 0x10000) {
+            utf8[length++] = (char)(0xE0 | (value >> 12));
+            utf8[length++] = (char)(0x80 | ((value >> 6) & 0x3F));
+            utf8[length++] = (char)(0x80 | (value & 0x3F));
+        } else {
+            utf8[length++] = (char)(0xF0 | (value >> 18));
+            utf8[length++] = (char)(0x80 | ((value >> 12) & 0x3F));
+            utf8[length++] = (char)(0x80 | ((value >> 6) & 0x3F));
+            utf8[length++] = (char)(0x80 | (value & 0x3F));
+        }
+    }
+    utf8[length] = 0;
+    return editor_core_send(core, EDITOR_EXECUTE_COMMAND, utf8);
+}
+
 static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 {
     HWND parent = GetParent(window);
@@ -661,7 +697,7 @@ static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM 
                 success = editor_core_send(state->core, EDITOR_EXECUTE_COMMAND, NULL);
             } else {
                 GetWindowTextA(window, text, sizeof(text));
-                success = editor_core_send(state->core, EDITOR_EXECUTE_COMMAND, text);
+                success = execute_ansi_command(state->core, text);
             }
             if (!success)
                 MessageBeep(MB_ICONWARNING);
@@ -743,19 +779,30 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case EDITOR_MODE_VISUAL: mode_text = "VISUAL"; break;
         case EDITOR_MODE_VISUAL_LINE: mode_text = "VISUAL LINE"; break;
         case EDITOR_MODE_VISUAL_BLOCK: mode_text = "VISUAL BLOCK"; break;
-        case EDITOR_MODE_COMMAND_LINE: mode_text = "COMMAND LINE"; break;
+        case EDITOR_MODE_COMMAND_LINE: {
+            char prefix;
+            editor_core_send(state->core, EDITOR_GET_COMMAND_PREFIX, &prefix);
+            mode_text = prefix == '/' ? "SEARCH" : "COMMAND LINE";
+            break;
+        }
         default: mode_text = "COMMAND"; break;
         }
         if ((EditorStatus)lp == EDITOR_STATUS_NO_CHANGE)
             mode_text = "no change";
         else if ((EditorStatus)lp == EDITOR_STATUS_INVALID_COMMAND)
             mode_text = "invalid command";
+        else if ((EditorStatus)lp == EDITOR_STATUS_PATTERN_NOT_FOUND)
+            mode_text = "pattern not found";
+        else if ((EditorStatus)lp == EDITOR_STATUS_NO_PREVIOUS_SEARCH)
+            mode_text = "no previous search";
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
             (LPARAM)mode_text);
         HWND command = GetDlgItem(hWnd, ID_COMMAND_LINE);
         if ((EditorMode)wp == EDITOR_MODE_COMMAND_LINE && !state->command_active) {
             state->command_active = 1;
-            SetWindowTextA(command, ":");
+            char prompt[2] = { 0, 0 };
+            editor_core_send(state->core, EDITOR_GET_COMMAND_PREFIX, prompt);
+            SetWindowTextA(command, prompt);
             EnableWindow(command, TRUE);
             ShowWindow(command, SW_SHOW);
             layout_main_children(hWnd);
