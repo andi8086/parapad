@@ -167,7 +167,9 @@ static void update_editor_caret(HWND window, EditorControl *editor)
 {
     EditorMode mode;
     editor_core_send(editor->core, EDITOR_GET_MODE, &mode);
-    SendMessageA(GetParent(window), WM_EDITOR_MODE_CHANGED, (WPARAM)mode, 0);
+    EditorStatus status;
+    editor_core_send(editor->core, EDITOR_GET_STATUS, &status);
+    SendMessageA(GetParent(window), WM_EDITOR_MODE_CHANGED, (WPARAM)mode, (LPARAM)status);
     EditorCaret caret;
     editor_core_send(editor->core, EDITOR_GET_CARET, &caret);
     HDC dc = GetDC(window);
@@ -636,6 +638,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case EDITOR_MODE_VISUAL_BLOCK: mode_text = "VISUAL BLOCK"; break;
         default: mode_text = "COMMAND"; break;
         }
+        if ((EditorStatus)lp == EDITOR_STATUS_NO_CHANGE)
+            mode_text = "no change";
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
             (LPARAM)mode_text);
         return 0;

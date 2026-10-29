@@ -14,6 +14,11 @@ typedef enum EditorMode {
     EDITOR_MODE_REPLACE
 } EditorMode;
 
+typedef enum EditorStatus {
+    EDITOR_STATUS_NONE,
+    EDITOR_STATUS_NO_CHANGE
+} EditorStatus;
+
 typedef enum EditorKey {
     EDITOR_KEY_DELETE = 0x110000,
     EDITOR_KEY_LEFT,
@@ -51,7 +56,10 @@ typedef enum EditorMessage {
     EDITOR_LOAD_FILE,
     EDITOR_SAVE_FILE,
     EDITOR_GET_MODIFIED,
-    EDITOR_GET_LINE_CARET
+    EDITOR_GET_LINE_CARET,
+    EDITOR_UNDO,
+    EDITOR_REDO,
+    EDITOR_GET_STATUS
 } EditorMessage;
 
 typedef struct EditorLine {

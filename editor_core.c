@@ -16,12 +16,21 @@ typedef struct ReplaceEdit {
     char original[16];
 } ReplaceEdit;
 
+typedef struct HistoryEntry {
+    char *text;
+    size_t length;
+    size_t cursor;
+    size_t revision;
+    struct HistoryEntry *next;
+} HistoryEntry;
+
 struct EditorCore {
     char *text;
     size_t length;
     size_t capacity;
     size_t cursor;
     EditorMode mode;
+    EditorStatus status;
     size_t anchor;
     size_t count;
     size_t operator_count;
@@ -41,7 +50,57 @@ struct EditorCore {
     ReplaceEdit *replace_edits;
     size_t replace_count;
     size_t replace_capacity;
+    HistoryEntry *undo;
+    HistoryEntry *redo;
+    size_t revision;
+    size_t next_revision;
+    size_t saved_revision;
+    size_t revision_cursor;
+    unsigned int dispatch_depth;
+    int history_enabled;
+    int history_open;
+    int history_changed;
 };
+
+static void free_history(HistoryEntry *entry)
+{
+    while (entry) {
+        HistoryEntry *next = entry->next;
+        free(entry->text);
+        free(entry);
+        entry = next;
+    }
+}
+
+static int prepare_edit(EditorCore *core)
+{
+    if (!core->history_enabled)
+        return 1;
+    if (!core->history_open) {
+        if (core->next_revision == SIZE_MAX)
+            return 0;
+        HistoryEntry *entry = malloc(sizeof(*entry));
+        if (!entry)
+            return 0;
+        entry->text = malloc(core->length + 1);
+        if (!entry->text) {
+            free(entry);
+            return 0;
+        }
+        memcpy(entry->text, core->text, core->length + 1);
+        entry->length = core->length;
+        entry->cursor = core->cursor;
+        entry->revision = core->revision;
+        entry->next = core->undo;
+        core->undo = entry;
+        free_history(core->redo);
+        core->redo = NULL;
+        core->revision = ++core->next_revision;
+        core->history_open = 1;
+    }
+    core->history_changed = 1;
+    return 1;
+}
 
 static size_t encode_character(unsigned long value, char text[5])
 {
@@ -160,6 +219,10 @@ static int insert_text(EditorCore *core, const char *text)
         free(normalized);
         return 0;
     }
+    if (count && !prepare_edit(core)) {
+        free(normalized);
+        return 0;
+    }
     memmove(core->text + core->cursor + count, core->text + core->cursor,
         core->length - core->cursor + 1);
     memcpy(core->text + core->cursor, normalized, count);
@@ -226,8 +289,10 @@ static size_t next_character(const EditorCore *core, size_t position)
     return position + (length ? length : 1);
 }
 
-static void erase_text(EditorCore *core, size_t start, size_t end)
+static int erase_text(EditorCore *core, size_t start, size_t end)
 {
+    if (start != end && !prepare_edit(core))
+        return 0;
     if (core->block_insert && (start < core->block_insert_start || end > core->cursor))
         core->block_insert = 0;
     if (start != end)
@@ -242,6 +307,7 @@ static void erase_text(EditorCore *core, size_t start, size_t end)
     if (core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE ||
         core->mode == EDITOR_MODE_VISUAL_BLOCK)
         core->mode = EDITOR_MODE_COMMAND;
+    return 1;
 }
 
 static size_t clamp_column(const EditorCore *core, size_t start, size_t end, size_t column)
@@ -269,12 +335,15 @@ EditorCore *editor_core_create(const char *initial_text)
     }
     core->cursor = 0;
     core->modified = 0;
+    core->history_enabled = 1;
     return core;
 }
 
 void editor_core_destroy(EditorCore *core)
 {
     if (core) {
+        free_history(core->undo);
+        free_history(core->redo);
         free(core->replace_edits);
         free(core->register_text);
         free(core->text);
@@ -355,6 +424,10 @@ static int finish_block_insert(EditorCore *core)
             size_t position = column_position(core, start, end, core->block_insert_column);
             if (character_column(core, position) < core->block_insert_column)
                 continue;
+            if (!prepare_edit(core)) {
+                free(text);
+                return 0;
+            }
             memmove(core->text + position + length, core->text + position,
                 core->length - position + 1);
             memcpy(core->text + position, text, length);
@@ -401,7 +474,8 @@ static int use_block(EditorCore *core, int remove)
             find_line(core, line, &start, &end);
             start = column_position(core, start, end, left);
             end = column_position(core, start, end, right - left + 1);
-            erase_text(core, start, end);
+            if (!erase_text(core, start, end))
+                return 0;
             if (line == first)
                 break;
         }
@@ -421,8 +495,49 @@ static void reset_command(EditorCore *core)
     core->pending = 0;
 }
 
+static int step_history(EditorCore *core, size_t count, int redo)
+{
+    int changed = 0;
+    HistoryEntry **source = redo ? &core->redo : &core->undo;
+    HistoryEntry **destination = redo ? &core->undo : &core->redo;
+    while (count-- && *source) {
+        HistoryEntry *entry = *source;
+        *source = entry->next;
+        char *text = core->text;
+        size_t length = core->length;
+        size_t cursor = core->revision_cursor;
+        size_t revision = core->revision;
+        core->text = entry->text;
+        core->length = entry->length;
+        core->capacity = entry->length + 1;
+        core->cursor = core->revision_cursor = entry->cursor;
+        core->revision = entry->revision;
+        entry->text = text;
+        entry->length = length;
+        entry->cursor = cursor;
+        entry->revision = revision;
+        entry->next = *destination;
+        *destination = entry;
+        core->modified = core->revision != core->saved_revision;
+        changed = 1;
+    }
+    core->status = changed ? EDITOR_STATUS_NONE : EDITOR_STATUS_NO_CHANGE;
+    core->history_open = 0;
+    core->block_insert = 0;
+    core->replace_count = 0;
+    core->anchor = core->cursor;
+    core->mode = EDITOR_MODE_COMMAND;
+    reset_command(core);
+    return 1;
+}
+
 static void reset_document(EditorCore *core)
 {
+    free_history(core->undo);
+    free_history(core->redo);
+    core->undo = core->redo = NULL;
+    core->revision = core->next_revision = core->saved_revision = core->revision_cursor = 0;
+    core->history_open = core->history_changed = 0;
     core->replace_count = 0;
     core->block_insert = 0;
     core->cursor = 0;
@@ -430,6 +545,7 @@ static void reset_document(EditorCore *core)
     core->mode = EDITOR_MODE_COMMAND;
     core->modified = 0;
     reset_command(core);
+    core->status = EDITOR_STATUS_NONE;
 }
 
 static int set_buffer(EditorCore *core, const EditorBuffer *buffer)
@@ -498,8 +614,11 @@ static int save_file(EditorCore *core, const char *path)
     int success = fwrite(core->text, 1, core->length, file) == core->length;
     if (fclose(file) != 0)
         success = 0;
-    if (success)
+    if (success) {
         core->modified = 0;
+        core->saved_revision = core->revision;
+        core->history_open = 0;
+    }
     return success;
 }
 
@@ -544,7 +663,8 @@ static int use_range(EditorCore *core, TextRange range, int remove)
     if (remove) {
         if (range.linewise && range.end == core->length && range.start > 0)
             --range.start;
-        erase_text(core, range.start, range.end);
+        if (!erase_text(core, range.start, range.end))
+            return 0;
         core->cursor = range.start;
         if (range.linewise)
             core->cursor = line_start(core, core->cursor);
@@ -728,11 +848,17 @@ static int paste_register(EditorCore *core, size_t count, int before)
         free(text);
         return 0;
     }
+    int changed = length != range.end - range.start ||
+        (length && memcmp(core->text + range.start, text, length) != 0);
+    if (changed && !prepare_edit(core)) {
+        free(text);
+        return 0;
+    }
     memmove(core->text + range.start + length, core->text + range.end,
         core->length - range.end + 1);
     memcpy(core->text + range.start, text, length);
     core->length = new_length;
-    if (length || range.start != range.end)
+    if (changed)
         core->modified = 1;
     core->cursor = core->register_linewise || range.linewise ? range.start + prefix :
         previous_character(core, range.start + length);
@@ -746,8 +872,11 @@ static int write_span(EditorCore *core, size_t start, size_t end, const char *te
     size_t remaining = core->length - (end - start);
     if (length > SIZE_MAX - 1 - remaining || !reserve_text(core, remaining + length))
         return 0;
-    if (length != end - start || (length && memcmp(core->text + start, text, length) != 0))
+    if (length != end - start || (length && memcmp(core->text + start, text, length) != 0)) {
+        if (!prepare_edit(core))
+            return 0;
         core->modified = 1;
+    }
     memmove(core->text + start + length, core->text + end, core->length - end + 1);
     if (length)
         memcpy(core->text + start, text, length);
@@ -873,6 +1002,7 @@ static int replace_characters(EditorCore *core, unsigned long key, size_t count)
 
 static int handle_key(EditorCore *core, unsigned long key)
 {
+    core->status = EDITOR_STATUS_NONE;
     if (key == 27) {
         if (!finish_block_insert(core))
             return 0;
@@ -980,6 +1110,8 @@ static int handle_key(EditorCore *core, unsigned long key)
         return use_range(core, range, pending == 'd');
     }
     core->count = 0;
+    if (key == 'u' || key == 18)
+        return step_history(core, count, key == 18);
     if (key == 'r') {
         core->pending = key;
         core->operator_count = count;
@@ -1052,7 +1184,7 @@ static int handle_key(EditorCore *core, unsigned long key)
     return 1;
 }
 
-int editor_core_send(EditorCore *core, EditorMessage message, void *data)
+static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
 {
     if (!core)
         return 0;
@@ -1062,10 +1194,20 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_SET_CARET: case EDITOR_MOVE_LEFT: case EDITOR_MOVE_RIGHT:
     case EDITOR_MOVE_UP: case EDITOR_MOVE_DOWN: case EDITOR_MOVE_HOME: case EDITOR_MOVE_END:
         core->replace_count = 0;
+        core->status = EDITOR_STATUS_NONE;
         break;
     default: break;
     }
     switch (message) {
+    case EDITOR_GET_STATUS:
+        if (!data)
+            return 0;
+        *(EditorStatus *)data = core->status;
+        return 1;
+    case EDITOR_UNDO:
+        return step_history(core, 1, 0);
+    case EDITOR_REDO:
+        return step_history(core, 1, 1);
     case EDITOR_SET_BUFFER:
         return set_buffer(core, data);
     case EDITOR_GET_BUFFER: {
@@ -1179,11 +1321,9 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_INSERT_TEXT:
         return insert_text(core, data);
     case EDITOR_BACKSPACE:
-        erase_text(core, previous_character(core, core->cursor), core->cursor);
-        return 1;
+        return erase_text(core, previous_character(core, core->cursor), core->cursor);
     case EDITOR_DELETE_CHAR:
-        erase_text(core, core->cursor, next_character(core, core->cursor));
-        return 1;
+        return erase_text(core, core->cursor, next_character(core, core->cursor));
     case EDITOR_GET_LINE: {
         EditorLine *line = data;
         size_t start, end;
@@ -1215,8 +1355,7 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
             ++end;
         else if (start > 0)
             --start;
-        erase_text(core, start, end);
-        return 1;
+        return erase_text(core, start, end);
     }
     case EDITOR_GET_LINE_COUNT: {
         if (!data)
@@ -1290,4 +1429,41 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
     default:
         return 0;
     }
+}
+
+int editor_core_send(EditorCore *core, EditorMessage message, void *data)
+{
+    if (!core)
+        return 0;
+    int outer = core->dispatch_depth == 0;
+    int independent = 0;
+    if (outer) {
+        core->history_changed = 0;
+        switch (message) {
+        case EDITOR_ADD_CHAR: case EDITOR_ADD_CODEPOINT: case EDITOR_INSERT_TEXT:
+        case EDITOR_BACKSPACE: case EDITOR_DELETE_CHAR: case EDITOR_DELETE_LINE:
+        case EDITOR_SET_CARET: case EDITOR_MOVE_LEFT: case EDITOR_MOVE_RIGHT:
+        case EDITOR_MOVE_UP: case EDITOR_MOVE_DOWN: case EDITOR_MOVE_HOME: case EDITOR_MOVE_END:
+            core->history_open = 0;
+            independent = 1;
+            break;
+        case EDITOR_HANDLE_KEY:
+            if (data && *(const unsigned long *)data >= EDITOR_KEY_LEFT &&
+                *(const unsigned long *)data <= EDITOR_KEY_END)
+                core->history_open = 0;
+            break;
+        default: break;
+        }
+    }
+    ++core->dispatch_depth;
+    int success = dispatch_message(core, message, data);
+    --core->dispatch_depth;
+    if (outer) {
+        if (core->history_changed || (core->history_open && core->mode == EDITOR_MODE_COMMAND))
+            core->revision_cursor = core->cursor;
+        if (independent || (message == EDITOR_HANDLE_KEY &&
+            core->mode != EDITOR_MODE_INSERT && core->mode != EDITOR_MODE_REPLACE))
+            core->history_open = 0;
+    }
+    return success;
 }

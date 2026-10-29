@@ -49,6 +49,8 @@ for a future hex view, not an implemented hex editor.
 | `I` (Shift+I) in visual-block mode | Insert at the left edge on the top selected line; Esc repeats the insertion on the other selected lines |
 | `r` then a character | Replace the character under the caret, or each selected character in visual mode |
 | `R` (Shift+R) in command mode | Enter continuous replace mode; Esc returns to command mode |
+| `u` in command mode | Undo the last change; `3u` undoes three changes |
+| Ctrl+R in command mode | Redo an undone change; `3` then Ctrl+R redoes three changes |
 | `y` in visual mode | Copy the selection to the core's register and return to command mode |
 | `yy` | Copy the current line |
 | `p` | Paste after the caret, or below the current line for a linewise register |
@@ -107,6 +109,27 @@ editing on the first line. An empty insert followed by Esc changes nothing.
 Block yank/delete stores newline-separated row slices in the ordinary register;
 blockwise paste is not implemented, and `p`/`P` while selecting a block is a no-op.
 
+## Undo And Redo
+
+`u` and Ctrl+R restore document bytes and caret positions, returning to command
+mode and clearing selections and pending commands. An insert or replace session
+is one undo step until Esc; block insertion includes the repetitions applied on
+Esc. Arrow/Home/End navigation, mouse positioning, direct edit/navigation messages,
+and successful saves end the current group. Each delete, paste, or one-shot
+replacement command is a separate step. Read-only queries do not break groups.
+Direct edit messages each create their own undo step.
+
+Editing after undo discards the redo branch. Navigation, yank, and no-op edits
+preserve it. Undo/redo does not change the yank register. Reaching either end of
+history is a no-op. If an undo/redo command restores no change, the status line
+shows `no change` until the next editor command. Read-only queries and redraws
+preserve the message. New, successful load, and buffer replacement clear history;
+saving retains it and records the clean revision, so undo/redo back to that
+revision clears the modified flag. History uses complete byte-buffer snapshots,
+preserving NULs and malformed UTF-8. It is per document instance, kept only in
+memory, and limited by available memory rather than a fixed step count. This is
+linear undo/redo, not Vim's branching undo tree or persistent undo files.
+
 ## Editor Core
 
 `editor_core.h` exposes an opaque `EditorCore` with no Windows dependencies.
@@ -122,12 +145,14 @@ allocation failure. Failed edits leave the document unchanged.
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
 | `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block mode |
+| `EDITOR_GET_STATUS` | `EditorStatus *` receiving `EDITOR_STATUS_NONE` or `EDITOR_STATUS_NO_CHANGE` without clearing it |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |
 | `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; load the file verbatim in binary mode |
 | `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save exactly the current buffer's byte length |
 | `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
+| `EDITOR_UNDO`, `EDITOR_REDO` | NULL; restore one history step, returning to command mode |
 | `EDITOR_GET_SELECTION` | `EditorSelection *`; supply `line`, receive byte `start`/exclusive `end`, `active`, and `includes_newline` |
 | `EDITOR_GET_REGISTER` | `EditorRegister *` receiving borrowed UTF-8 `text`, byte `length`, and `linewise` |
 | `EDITOR_ADD_CHAR` | NUL-terminated UTF-8 `char *` containing exactly one Unicode scalar |
@@ -152,6 +177,7 @@ command mode without inserting a character. ASCII `R` enters
 Backspace, Tab, and Enter are passed
 as their ASCII control values. Navigation and Delete use the `EditorKey` enum.
 Ctrl+V is scalar 22. Block selection and deferred insertion are owned by the core;
+Ctrl+R is scalar 18; ASCII `u` invokes undo outside insert/replace mode.
 `EDITOR_GET_LINE_CARET` supplies per-line caret positions for rendering. During
 deferred insertion, secondary rows remain unchanged until Esc, and `advance`
 positions their preview carets after the pending inserted characters. The primary
