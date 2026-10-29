@@ -6,6 +6,10 @@ enter insert mode and Esc to return to command mode. The main window's status ba
 shows `COMMAND`, `INSERT`, `VISUAL`, or `VISUAL LINE` directly from the core's state.
 The fixed black left gutter displays cyan one-based line numbers in a five-character field,
 right-aligned and padded with spaces. Lines above 99999 display `#####`.
+The editor retains its GDI bitmap and shifts existing rows during small vertical
+scrolls. Only exposed rows or rows with changed bytes/selection are redrawn;
+ordinary window exposure copies the cached pixels. Resizing, horizontal scrolling,
+buffer replacement, and large jumps fall back to a full redraw.
 
 In insert mode, typing inserts text, Enter splits the line, Backspace deletes the
 previous character, and Tab inserts four spaces. Arrow keys, Home, End, Delete,

@@ -4,6 +4,7 @@
 #include <commdlg.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "editor_core.h"
 
@@ -16,6 +17,15 @@
 #define ID_FILE_SAVE_AS 106
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
+
+typedef struct CachedLine {
+    char *text;
+    size_t index;
+    size_t length;
+    EditorSelection selection;
+    int exists;
+    int valid;
+} CachedLine;
 
 typedef struct EditorControl {
     EditorCore *core;
@@ -30,6 +40,11 @@ typedef struct EditorControl {
     size_t first_line;
     int left_pixel;
     char pending_lead;
+    CachedLine *lines;
+    size_t line_count;
+    size_t painted_first_line;
+    int painted_left_pixel;
+    int bitmap_valid;
 } EditorControl;
 
 typedef struct MainWindowState {
@@ -182,6 +197,116 @@ static void update_editor_caret(HWND window, EditorControl *editor)
     InvalidateRect(window, NULL, FALSE);
 }
 
+static void clear_line_cache(EditorControl *editor)
+{
+    for (size_t index = 0; index < editor->line_count; ++index)
+        free(editor->lines[index].text);
+    free(editor->lines);
+    editor->lines = NULL;
+    editor->line_count = 0;
+    editor->bitmap_valid = 0;
+}
+
+static void paint_editor(HDC dc, EditorControl *editor, int width, int height, int buffered)
+{
+    size_t rows = height > 16 ? (size_t)((height - 17) / editor->line_height + 1) : 0;
+    if (editor->line_count != rows) {
+        clear_line_cache(editor);
+        if (rows) {
+            editor->lines = calloc(rows, sizeof(*editor->lines));
+            if (editor->lines)
+                editor->line_count = rows;
+        }
+    }
+    int reuse = buffered && editor->bitmap_valid && editor->line_count == rows;
+    size_t distance = editor->first_line > editor->painted_first_line ?
+        editor->first_line - editor->painted_first_line : editor->painted_first_line - editor->first_line;
+    if (reuse && (editor->left_pixel != editor->painted_left_pixel || distance >= rows))
+        reuse = 0;
+    if (reuse && distance) {
+        int shift = (int)distance * editor->line_height;
+        int content_height = height - 16;
+        BOOL moved;
+        if (editor->first_line > editor->painted_first_line) {
+            moved = BitBlt(dc, 0, 8, width, content_height - shift, dc, 0, 8 + shift, SRCCOPY);
+            if (content_height % editor->line_height) {
+                size_t partial = editor->painted_first_line + rows - 1;
+                editor->lines[partial % rows].valid = 0;
+            }
+        } else {
+            moved = BitBlt(dc, 0, 8 + shift, width, content_height - shift, dc, 0, 8, SRCCOPY);
+        }
+        if (!moved)
+            reuse = 0;
+    }
+    if (!reuse) {
+        RECT rect = { 0, 0, width, height };
+        FillRect(dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        for (size_t index = 0; index < editor->line_count; ++index)
+            editor->lines[index].valid = 0;
+    }
+
+    HGDIOBJ old_font = SelectObject(dc, editor->font);
+    SetBkMode(dc, TRANSPARENT);
+    for (size_t row = 0; row < rows; ++row) {
+        size_t index = editor->first_line + row;
+        EditorLine line = { index, NULL, 0 };
+        int exists = editor_core_send(editor->core, EDITOR_GET_LINE, &line);
+        EditorSelection selection = { index, 0, 0, 0, 0 };
+        if (exists)
+            editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
+        CachedLine *cached = editor->lines ? &editor->lines[index % rows] : NULL;
+        if (reuse && cached && cached->valid && cached->index == index && cached->exists == exists &&
+            cached->length == line.length && cached->selection.start == selection.start &&
+            cached->selection.end == selection.end && cached->selection.active == selection.active &&
+            cached->selection.includes_newline == selection.includes_newline &&
+            (!line.length || memcmp(cached->text, line.text, line.length) == 0))
+            continue;
+
+        int top = 8 + (int)row * editor->line_height;
+        RECT dirty = { 0, top, width, top + editor->line_height };
+        if (dirty.bottom > height - 8)
+            dirty.bottom = height - 8;
+        FillRect(dc, &dirty, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        if (exists) {
+            int saved_dc = SaveDC(dc);
+            if (saved_dc) {
+                IntersectClipRect(dc, 8, top, width - 8, dirty.bottom);
+                SetTextColor(dc, RGB(0, 255, 255));
+                char number[6] = "#####";
+                if (index < 99999)
+                    wsprintfA(number, "%5lu", (unsigned long)(index + 1));
+                TextOutA(dc, 8, top, number, 5);
+                IntersectClipRect(dc, editor->text_left, top, width - 8, dirty.bottom);
+                SetTextColor(dc, RGB(255, 0, 0));
+                layout_editor_line(dc, editor, index, line.length, top, 1, 0, NULL);
+                RestoreDC(dc, saved_dc);
+            } else if (cached) {
+                cached->valid = 0;
+                continue;
+            }
+        }
+        if (cached) {
+            cached->valid = 0;
+            char *text = realloc(cached->text, line.length ? line.length : 1);
+            if (text) {
+                cached->text = text;
+                if (line.length)
+                    memcpy(text, line.text, line.length);
+                cached->length = line.length;
+                cached->index = index;
+                cached->exists = exists;
+                cached->selection = selection;
+                cached->valid = buffered;
+            }
+        }
+    }
+    SelectObject(dc, old_font);
+    editor->painted_first_line = editor->first_line;
+    editor->painted_left_pixel = editor->left_pixel;
+    editor->bitmap_valid = buffered && editor->line_count == rows;
+}
+
 LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     EditorControl *editor = (EditorControl *)GetWindowLongPtrA(hWnd, GWLP_USERDATA);
@@ -214,6 +339,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_GETDLGCODE:
         return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB;
     case WM_EDITOR_BUFFER_CHANGED:
+        editor->bitmap_valid = 0;
         editor->first_line = 0;
         editor->left_pixel = 0;
         editor->pending_lead = 0;
@@ -324,6 +450,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
                         editor->back_bitmap = replacement;
                         editor->back_width = width;
                         editor->back_height = height;
+                        editor->bitmap_valid = 0;
                     } else {
                         DeleteObject(replacement);
                     }
@@ -332,40 +459,12 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
             HDC draw_dc = editor->back_bitmap && editor->back_width == width &&
                 editor->back_height == height ? editor->memdc : dc;
-            FillRect(draw_dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
-            SetBkMode(draw_dc, TRANSPARENT);
-
-            HGDIOBJ old_font = SelectObject(draw_dc, editor->font);
-            int saved_dc = SaveDC(draw_dc);
-            IntersectClipRect(draw_dc, 8, 8, width - 8, height - 8);
-            SetTextColor(draw_dc, RGB(0, 255, 255));
-            size_t index = editor->first_line;
-            for (int top = 8; top < height - 8; top += editor->line_height, ++index) {
-                EditorLine line = { index, NULL, 0 };
-                if (!editor_core_send(editor->core, EDITOR_GET_LINE, &line))
-                    break;
-                char number[6] = "#####";
-                if (index < 99999)
-                    wsprintfA(number, "%5lu", (unsigned long)(index + 1));
-                TextOutA(draw_dc, 8, top, number, 5);
-            }
-            IntersectClipRect(draw_dc, editor->text_left, 8, width - 8, height - 8);
-            SetTextColor(draw_dc, RGB(255, 0, 0));
-            index = editor->first_line;
-            for (int top = 8; top < height - 8; top += editor->line_height, ++index) {
-                EditorLine line = { index, NULL, 0 };
-                if (!editor_core_send(editor->core, EDITOR_GET_LINE, &line))
-                    break;
-                layout_editor_line(draw_dc, editor, index, line.length,
-                    top, 1, 0, NULL);
-            }
-            if (saved_dc)
-                RestoreDC(draw_dc, saved_dc);
-            if (old_font && old_font != HGDI_ERROR)
-                SelectObject(draw_dc, old_font);
+            paint_editor(draw_dc, editor, width, height, draw_dc == editor->memdc);
 
             if (draw_dc == editor->memdc)
-                BitBlt(dc, 0, 0, width, height, editor->memdc, 0, 0, SRCCOPY);
+                BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+                    ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+                    editor->memdc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
         }
 
         EndPaint(hWnd, &ps);
@@ -375,6 +474,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return 1;
     case WM_NCDESTROY:
         if (editor) {
+            clear_line_cache(editor);
             if (editor->back_bitmap) {
                 SelectObject(editor->memdc, editor->original_bitmap);
                 DeleteObject(editor->back_bitmap);
