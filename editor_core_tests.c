@@ -871,8 +871,59 @@ static void test_settings(void)
     editor_core_destroy(core);
 }
 
+static void test_set_commands(void)
+{
+    EditorCore *core = editor_core_create("abc");
+    assert(core);
+    send_key(core, ':');
+    expect_mode(core, EDITOR_MODE_COMMAND_LINE);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, ":set maxcol=120"));
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "set expandtabs=0"));
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, " \t:set tabwidth = 4 \t"));
+    EditorSettings settings;
+    assert(editor_core_send(core, EDITOR_GET_SETTINGS, &settings));
+    assert(settings.maxcol == 120 && settings.tabwidth == 4 && !settings.expandtabs);
+    int modified = 1;
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    const char *invalid[] = {
+        "", ":", "set", "setmaxcol=1", "set unknown=1", "set maxcol=-1",
+        "set maxcol=+1", "set maxcol=1x", "set maxcol=", "set maxcol=1 2",
+        "set expandtabs=true", "set expandtabs=2", "set tabwidth=0",
+        "set maxcol=99999999999999999999999999999999999999999999999999"
+    };
+    send_key(core, ':');
+    for (size_t index = 0; index < sizeof(invalid) / sizeof(invalid[0]); ++index) {
+        assert(!editor_core_send(core, EDITOR_EXECUTE_COMMAND, (void *)invalid[index]));
+        expect_mode(core, EDITOR_MODE_COMMAND_LINE);
+        EditorStatus status;
+        assert(editor_core_send(core, EDITOR_GET_STATUS, &status) && status == EDITOR_STATUS_INVALID_COMMAND);
+        assert(editor_core_send(core, EDITOR_GET_SETTINGS, &settings));
+        assert(settings.maxcol == 120 && settings.tabwidth == 4 && !settings.expandtabs);
+    }
+    assert(!editor_core_send(core, EDITOR_EXECUTE_COMMAND, NULL));
+    send_key(core, 27);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    send_keys(core, "r:");
+    expect_line(core, 0, ":bc");
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    send_keys(core, "i:");
+    expect_mode(core, EDITOR_MODE_INSERT);
+    expect_line(core, 0, "::bc");
+    send_key(core, 27);
+    send_key(core, ':');
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "set expandtabs=1"));
+    assert(editor_core_send(core, EDITOR_EXECUTE_COMMAND, "set maxcol=0"));
+    send_key(core, 'u');
+    expect_line(core, 0, ":bc");
+    assert(editor_core_send(core, EDITOR_GET_SETTINGS, &settings));
+    assert(!settings.maxcol && settings.tabwidth == 4 && settings.expandtabs);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_set_commands();
     test_settings();
     test_undo_redo();
     test_replace();

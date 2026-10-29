@@ -3,7 +3,7 @@
 Build `parapad.sln` in Visual Studio with the v142 C++ toolset and Windows SDK.
 The application starts with an empty text buffer in command mode. Press `i` to
 enter insert mode and Esc to return to command mode. The main window's status bar
-shows `COMMAND`, `INSERT`, `REPLACE`, `VISUAL`, `VISUAL LINE`, or `VISUAL BLOCK`
+shows `COMMAND`, `INSERT`, `REPLACE`, `VISUAL`, `VISUAL LINE`, `VISUAL BLOCK`, or `COMMAND LINE`
 directly from the core's state.
 The fixed black left gutter displays cyan one-based line numbers in a five-character field,
 right-aligned and padded with spaces. Lines above 99999 display `#####`.
@@ -51,6 +51,7 @@ for a future hex view, not an implemented hex editor.
 | `I` (Shift+I) in visual-block mode | Insert at the left edge on the top selected line; Esc repeats the insertion on the other selected lines |
 | `r` then a character | Replace the character under the caret, or each selected character in visual mode |
 | `R` (Shift+R) in command mode | Enter continuous replace mode; Esc returns to command mode |
+| `:` in command mode | Open the command input above the status bar; Enter executes and Esc cancels |
 | `u` in command mode | Undo the last change; `3u` undoes three changes |
 | Ctrl+R in command mode | Redo an undone change; `3` then Ctrl+R redoes three changes |
 | `y` in visual mode | Copy the selection to the core's register and return to command mode |
@@ -114,6 +115,27 @@ blockwise paste is not implemented, and `p`/`P` while selecting a block is a no-
 
 ## Settings
 
+Press `:` in normal (command) mode to open and focus the command input above the
+status bar. For example:
+
+```text
+:set maxcol=100
+:set tabwidth=4
+:set expandtabs=0
+:set expandtabs=1
+```
+
+Enter applies the setting, closes the input, and returns focus to the editor.
+Esc closes it without applying the pending command. The input is hidden and
+disabled when inactive, and does not open for colons typed in insert/replace
+mode or as the character following `r`. Commands are limited to 1023 input bytes.
+
+Values are unsigned decimal integers; `expandtabs` accepts only numeric 0 or 1.
+Whitespace around `=` is allowed. Unknown commands/settings, negative values,
+invalid booleans, trailing text, integer overflow, and zero `tabwidth` are
+rejected without changing settings. The input stays open for correction and the
+status bar shows `invalid command`.
+
 Each core owns an `EditorSettings` value, queried with `EDITOR_GET_SETTINGS` and
 updated with `EDITOR_SET_SETTINGS`.
 
@@ -172,10 +194,11 @@ allocation failure. Failed edits leave the document unchanged.
 | Message | Data |
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
-| `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block mode |
-| `EDITOR_GET_STATUS` | `EditorStatus *` receiving `EDITOR_STATUS_NONE` or `EDITOR_STATUS_NO_CHANGE` without clearing it |
+| `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block/command-line mode |
+| `EDITOR_GET_STATUS` | `EditorStatus *` receiving `EDITOR_STATUS_NONE`, `EDITOR_STATUS_NO_CHANGE`, or `EDITOR_STATUS_INVALID_COMMAND` without clearing it |
 | `EDITOR_GET_SETTINGS` | `EditorSettings *` receiving `maxcol`, `tabwidth`, and `expandtabs` |
 | `EDITOR_SET_SETTINGS` | `const EditorSettings *` supplying all three settings |
+| `EDITOR_EXECUTE_COMMAND` | NUL-terminated command string, with an optional leading `:`; parse and apply `set name=value` in the core |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |
@@ -204,6 +227,10 @@ allocation failure. Failed edits leave the document unchanged.
 command mode to insert mode without inserting itself; scalar 27 (Esc) returns to
 command mode without inserting a character. ASCII `R` enters
 `EDITOR_MODE_REPLACE`, while `r` waits for a one-shot replacement character.
+In normal mode, `:` enters `EDITOR_MODE_COMMAND_LINE`; the frontend edits the
+command text and submits it with `EDITOR_EXECUTE_COMMAND`. Successful execution
+returns to command mode; invalid input returns 0, sets the invalid-command
+status, and leaves command-line mode active. Esc cancels command-line mode.
 Backspace, Tab, and Enter are passed
 as their ASCII control values. Navigation and Delete use the `EditorKey` enum.
 Ctrl+V is scalar 22. Block selection and deferred insertion are owned by the core;

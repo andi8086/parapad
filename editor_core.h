@@ -11,12 +11,14 @@ typedef enum EditorMode {
     EDITOR_MODE_VISUAL,
     EDITOR_MODE_VISUAL_LINE,
     EDITOR_MODE_VISUAL_BLOCK,
-    EDITOR_MODE_REPLACE
+    EDITOR_MODE_REPLACE,
+    EDITOR_MODE_COMMAND_LINE
 } EditorMode;
 
 typedef enum EditorStatus {
     EDITOR_STATUS_NONE,
-    EDITOR_STATUS_NO_CHANGE
+    EDITOR_STATUS_NO_CHANGE,
+    EDITOR_STATUS_INVALID_COMMAND
 } EditorStatus;
 
 typedef enum EditorKey {
@@ -61,7 +63,8 @@ typedef enum EditorMessage {
     EDITOR_REDO,
     EDITOR_GET_STATUS,
     EDITOR_GET_SETTINGS,
-    EDITOR_SET_SETTINGS
+    EDITOR_SET_SETTINGS,
+    EDITOR_EXECUTE_COMMAND
 } EditorMessage;
 
 typedef struct EditorSettings {

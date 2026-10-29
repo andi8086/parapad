@@ -1084,6 +1084,8 @@ static int handle_key(EditorCore *core, unsigned long key)
     if (!key || key > EDITOR_KEY_END ||
         (key > 0x10FFFF && key < EDITOR_KEY_DELETE) || (key >= 0xD800 && key <= 0xDFFF))
         return 0;
+    if (core->mode == EDITOR_MODE_COMMAND_LINE)
+        return 1;
     if (core->mode == EDITOR_MODE_REPLACE) {
         if (key == '\b') {
             if (!core->replace_count)
@@ -1178,6 +1180,10 @@ static int handle_key(EditorCore *core, unsigned long key)
         return use_range(core, range, pending == 'd');
     }
     core->count = 0;
+    if (key == ':' && core->mode == EDITOR_MODE_COMMAND) {
+        core->mode = EDITOR_MODE_COMMAND_LINE;
+        return 1;
+    }
     if (key == 'u' || key == 18)
         return step_history(core, count, key == 18);
     if (key == 'r') {
@@ -1252,6 +1258,69 @@ static int handle_key(EditorCore *core, unsigned long key)
     return 1;
 }
 
+static int execute_command(EditorCore *core, const char *text)
+{
+    core->status = EDITOR_STATUS_INVALID_COMMAND;
+    if (!text)
+        return 0;
+    while (*text == ' ' || *text == '\t')
+        ++text;
+    if (*text == ':')
+        ++text;
+    while (*text == ' ' || *text == '\t')
+        ++text;
+    if (strncmp(text, "set", 3) || (text[3] != ' ' && text[3] != '\t'))
+        return 0;
+    text += 3;
+    while (*text == ' ' || *text == '\t')
+        ++text;
+    const char *name = text;
+    while (*text >= 'a' && *text <= 'z')
+        ++text;
+    size_t length = (size_t)(text - name);
+    while (*text == ' ' || *text == '\t')
+        ++text;
+    if (*text != '=')
+        return 0;
+    ++text;
+    while (*text == ' ' || *text == '\t')
+        ++text;
+    if (*text < '0' || *text > '9')
+        return 0;
+    size_t value = 0;
+    while (*text >= '0' && *text <= '9') {
+        size_t digit = (size_t)(*text++ - '0');
+        if (value > (SIZE_MAX - digit) / 10)
+            return 0;
+        value = value * 10 + digit;
+    }
+    while (*text == ' ' || *text == '\t')
+        ++text;
+    if (*text)
+        return 0;
+    EditorSettings settings = core->settings;
+    if (length == 6 && memcmp(name, "maxcol", 6) == 0)
+        settings.maxcol = value;
+    else if (length == 8 && memcmp(name, "tabwidth", 8) == 0) {
+        if (!value || value == SIZE_MAX)
+            return 0;
+        settings.tabwidth = value;
+    } else if (length == 10 && memcmp(name, "expandtabs", 10) == 0) {
+        if (value > 1)
+            return 0;
+        settings.expandtabs = (int)value;
+    } else {
+        return 0;
+    }
+    core->settings = settings;
+    core->status = EDITOR_STATUS_NONE;
+    if (core->mode == EDITOR_MODE_COMMAND_LINE) {
+        core->mode = EDITOR_MODE_COMMAND;
+        reset_command(core);
+    }
+    return 1;
+}
+
 static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
 {
     if (!core)
@@ -1267,6 +1336,8 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     default: break;
     }
     switch (message) {
+    case EDITOR_EXECUTE_COMMAND:
+        return execute_command(core, data);
     case EDITOR_GET_SETTINGS:
         if (!data)
             return 0;

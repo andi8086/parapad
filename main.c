@@ -15,8 +15,10 @@
 #define ID_FILE_OPEN 104
 #define ID_FILE_SAVE 105
 #define ID_FILE_SAVE_AS 106
+#define ID_COMMAND_LINE 107
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
+#define WM_EDITOR_REFRESH (WM_APP + 3)
 
 typedef struct CachedLine {
     char *text;
@@ -52,6 +54,8 @@ typedef struct EditorControl {
 typedef struct MainWindowState {
     EditorCore *core;
     char path[MAX_PATH];
+    WNDPROC command_proc;
+    int command_active;
 } MainWindowState;
 
 static int character_to_ansi(unsigned long value, char *text, int capacity)
@@ -393,6 +397,9 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_GETDLGCODE:
         return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB;
+    case WM_EDITOR_REFRESH:
+        update_editor_caret(hWnd, editor);
+        return 0;
     case WM_EDITOR_BUFFER_CHANGED:
         editor->bitmap_valid = 0;
         editor->first_line = 0;
@@ -600,6 +607,71 @@ static int confirm_document_close(HWND window, MainWindowState *state)
     return answer != IDYES || save_document(window, state, 0);
 }
 
+static void layout_main_children(HWND window)
+{
+    MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(window, GWLP_USERDATA);
+    HWND editor = GetDlgItem(window, ID_EDITOR);
+    if (!state || !editor)
+        return;
+    RECT rect;
+    GetClientRect(window, &rect);
+    HWND status = GetDlgItem(window, ID_STATUS);
+    SendMessageA(status, WM_SIZE, 0, 0);
+    RECT status_rect = { 0 };
+    GetWindowRect(status, &status_rect);
+    int available_height = rect.bottom - (status_rect.bottom - status_rect.top);
+    if (available_height < 0)
+        available_height = 0;
+    EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
+    int command_height = state->command_active ? (control ? control->line_height + 8 : 28) : 0;
+    if (command_height > available_height)
+        command_height = available_height;
+    int content_height = available_height - command_height;
+    int width = rect.right > 24 ? rect.right - 24 : 0;
+    int height = content_height > 24 ? content_height - 24 : 0;
+    MoveWindow(editor, 12, 12, width, height, TRUE);
+    MoveWindow(GetDlgItem(window, ID_COMMAND_LINE), 12, content_height, width, command_height, TRUE);
+}
+
+static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM wp, LPARAM lp)
+{
+    HWND parent = GetParent(window);
+    MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(parent, GWLP_USERDATA);
+    if (!state || !state->command_proc)
+        return DefWindowProcA(window, message, wp, lp);
+    if (message == WM_GETDLGCODE)
+        return DLGC_WANTALLKEYS;
+    if (message == WM_KEYDOWN) {
+        if (wp == VK_RETURN || wp == VK_ESCAPE)
+            return 0;
+        if (wp == 'A' && GetKeyState(VK_CONTROL) < 0) {
+            SendMessageA(window, EM_SETSEL, 0, -1);
+            return 0;
+        }
+    }
+    if (message == WM_CHAR && (wp == '\r' || wp == 27)) {
+        if (wp == 27) {
+            unsigned long key = 27;
+            editor_core_send(state->core, EDITOR_HANDLE_KEY, &key);
+        } else {
+            char text[1024];
+            int length = GetWindowTextLengthA(window);
+            int success;
+            if (length >= (int)sizeof(text)) {
+                success = editor_core_send(state->core, EDITOR_EXECUTE_COMMAND, NULL);
+            } else {
+                GetWindowTextA(window, text, sizeof(text));
+                success = editor_core_send(state->core, EDITOR_EXECUTE_COMMAND, text);
+            }
+            if (!success)
+                MessageBeep(MB_ICONWARNING);
+        }
+        SendMessageA(GetDlgItem(parent, ID_EDITOR), WM_EDITOR_REFRESH, 0, 0);
+        return 0;
+    }
+    return CallWindowProcA(state->command_proc, window, message, wp, lp);
+}
+
 LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(hWnd, GWLP_USERDATA);
@@ -645,22 +717,24 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             ((LPCREATESTRUCTA)lp)->hInstance, ((LPCREATESTRUCTA)lp)->lpCreateParams);
         if (!editor)
             return -1;
+        HWND command = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
+            WS_CHILD | WS_DISABLED | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_COMMAND_LINE,
+            ((LPCREATESTRUCTA)lp)->hInstance, NULL);
+        if (!command)
+            return -1;
+        EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
+        SendMessageA(command, WM_SETFONT, (WPARAM)control->font, FALSE);
+        SendMessageA(command, EM_LIMITTEXT, 1023, 0);
+        state->command_proc = (WNDPROC)SetWindowLongPtrA(command, GWLP_WNDPROC, (LONG_PTR)command_line_wnd_proc);
+        if (!state->command_proc)
+            return -1;
         update_document_title(hWnd, state);
         return 0;
     }
-    case WM_SIZE: {
-        RECT rect;
-        GetClientRect(hWnd, &rect);
-        HWND status = GetDlgItem(hWnd, ID_STATUS);
-        SendMessageA(status, WM_SIZE, 0, 0);
-        RECT status_rect = { 0 };
-        GetWindowRect(status, &status_rect);
-        int available_height = rect.bottom - (status_rect.bottom - status_rect.top);
-        int width = rect.right > 24 ? rect.right - 24 : 0;
-        int height = available_height > 24 ? available_height - 24 : 0;
-        MoveWindow(GetDlgItem(hWnd, ID_EDITOR), 12, 12, width, height, TRUE);
+    case WM_SIZE:
+        layout_main_children(hWnd);
         return 0;
-    }
     case WM_EDITOR_MODE_CHANGED: {
         const char *mode_text;
         switch ((EditorMode)wp) {
@@ -669,16 +743,36 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case EDITOR_MODE_VISUAL: mode_text = "VISUAL"; break;
         case EDITOR_MODE_VISUAL_LINE: mode_text = "VISUAL LINE"; break;
         case EDITOR_MODE_VISUAL_BLOCK: mode_text = "VISUAL BLOCK"; break;
+        case EDITOR_MODE_COMMAND_LINE: mode_text = "COMMAND LINE"; break;
         default: mode_text = "COMMAND"; break;
         }
         if ((EditorStatus)lp == EDITOR_STATUS_NO_CHANGE)
             mode_text = "no change";
+        else if ((EditorStatus)lp == EDITOR_STATUS_INVALID_COMMAND)
+            mode_text = "invalid command";
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
             (LPARAM)mode_text);
+        HWND command = GetDlgItem(hWnd, ID_COMMAND_LINE);
+        if ((EditorMode)wp == EDITOR_MODE_COMMAND_LINE && !state->command_active) {
+            state->command_active = 1;
+            SetWindowTextA(command, ":");
+            EnableWindow(command, TRUE);
+            ShowWindow(command, SW_SHOW);
+            layout_main_children(hWnd);
+            SetFocus(command);
+            SendMessageA(command, EM_SETSEL, 1, 1);
+        } else if ((EditorMode)wp != EDITOR_MODE_COMMAND_LINE && state->command_active) {
+            state->command_active = 0;
+            ShowWindow(command, SW_HIDE);
+            EnableWindow(command, FALSE);
+            SetWindowTextA(command, "");
+            layout_main_children(hWnd);
+            SetFocus(GetDlgItem(hWnd, ID_EDITOR));
+        }
         return 0;
     }
     case WM_SETFOCUS:
-        SetFocus(GetDlgItem(hWnd, ID_EDITOR));
+        SetFocus(GetDlgItem(hWnd, state && state->command_active ? ID_COMMAND_LINE : ID_EDITOR));
         return 0;
     case WM_COMMAND: {
         switch (LOWORD(wp)) {
