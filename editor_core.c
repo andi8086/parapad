@@ -8,6 +8,10 @@
 #include "lexer_makefile.h"
 #include "lexer_batch.h"
 
+#define PCRE2_CODE_UNIT_WIDTH 8
+#define PCRE2_STATIC
+#include "third_party/pcre2/src/pcre2.h"
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +56,9 @@ struct EditorCore {
     EditorSettings settings;
     size_t page_lines;
     char command_prefix;
+    int command_has_range;
+    size_t command_range_start;
+    size_t command_range_end;
     char *search_text;
     size_t search_length;
     int search_whole_word;
@@ -673,6 +680,7 @@ static void reset_command(EditorCore *core)
     core->operator_count = 0;
     core->operator_has_count = 0;
     core->pending = 0;
+    core->command_has_range = 0;
 }
 
 static int step_history(EditorCore *core, size_t count, int redo)
@@ -2175,7 +2183,15 @@ static int handle_key(EditorCore *core, unsigned long key)
         return use_range(core, range, pending == 'd');
     }
     core->count = 0;
-    if ((key == ':' || key == '/') && core->mode == EDITOR_MODE_COMMAND) {
+    if ((key == ':' && (core->mode == EDITOR_MODE_COMMAND || is_visual(core))) ||
+        (key == '/' && core->mode == EDITOR_MODE_COMMAND)) {
+        core->command_has_range = key == ':' && is_visual(core);
+        if (core->command_has_range) {
+            size_t first = core->anchor < core->cursor ? core->anchor : core->cursor;
+            size_t last = core->anchor > core->cursor ? core->anchor : core->cursor;
+            core->command_range_start = line_start(core, first);
+            core->command_range_end = line_end(core, last);
+        }
         core->command_prefix = (char)key;
         core->mode = EDITOR_MODE_COMMAND_LINE;
         return 1;
@@ -2412,6 +2428,217 @@ static int complete_command(EditorCore *core)
     return 1;
 }
 
+static char *substitute_field(const char **command, char delimiter, int required)
+{
+    const char *position = *command;
+    char *field = malloc(strlen(position) + 1);
+    if (!field)
+        return NULL;
+    size_t length = 0;
+    while (*position && *position != delimiter) {
+        if (*position == '\\') {
+            field[length++] = *position++;
+            if (!*position) {
+                free(field);
+                return NULL;
+            }
+        }
+        field[length++] = *position++;
+    }
+    if (required && !*position) {
+        free(field);
+        return NULL;
+    }
+    field[length] = 0;
+    *command = *position ? position + 1 : position;
+    return field;
+}
+
+static int substitute_callout(pcre2_callout_block *block, void *context)
+{
+    size_t *budget = context;
+    (void)block;
+    if (!*budget)
+        return PCRE2_ERROR_CALLOUT;
+    --*budget;
+    return 0;
+}
+
+static int substitute_replacement(EditorCore *output, const char *replacement,
+    const char *subject, const PCRE2_SIZE *offsets, uint32_t captures)
+{
+    while (*replacement) {
+        char value = *replacement++;
+        unsigned int capture = 0;
+        int reference = value == '&';
+        if (value == '\\') {
+            value = *replacement++;
+            if (value >= '0' && value <= '9') {
+                reference = 1;
+                capture = (unsigned int)(value - '0');
+            } else if (value == 'n' || value == 'r') {
+                value = '\n';
+            } else if (value == 't') {
+                value = '\t';
+            }
+        }
+        if (reference) {
+            if (capture < captures && offsets[2 * capture] != PCRE2_UNSET &&
+                !append_edit_text(output, subject + offsets[2 * capture],
+                    offsets[2 * capture + 1] - offsets[2 * capture]))
+                return 0;
+        } else if (!append_edit_text(output, &value, 1)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int substitute(EditorCore *core, const char *command, size_t first, size_t last)
+{
+    if (core->directory_active)
+        return 0;
+    unsigned char delimiter = (unsigned char)*command;
+    if (delimiter <= 32 || delimiter >= 127 || delimiter == '\\' ||
+        (delimiter >= '0' && delimiter <= '9') ||
+        (delimiter >= 'a' && delimiter <= 'z') ||
+        (delimiter >= 'A' && delimiter <= 'Z'))
+        return 0;
+    ++command;
+    char *pattern = substitute_field(&command, (char)delimiter, 1);
+    char *replacement = NULL;
+    pcre2_code *code = NULL;
+    pcre2_match_data *matches = NULL;
+    pcre2_match_context *context = NULL;
+    pcre2_compile_context *compile_context = NULL;
+    EditorCore output = { 0 };
+    int success = 0;
+    if (!pattern || !*pattern)
+        goto cleanup;
+    replacement = substitute_field(&command, (char)delimiter, 0);
+    if (!replacement)
+        goto cleanup;
+    int global = 0;
+    uint32_t options = PCRE2_NEVER_UTF | PCRE2_NEVER_UCP | PCRE2_AUTO_CALLOUT;
+    while (*command == 'g' || *command == 'i') {
+        if (*command++ == 'g')
+            global = 1;
+        else
+            options |= PCRE2_CASELESS;
+    }
+    while (*command == ' ' || *command == '\t')
+        ++command;
+    if (*command)
+        goto cleanup;
+    core->status = EDITOR_STATUS_SUBSTITUTION_FAILED;
+    compile_context = pcre2_compile_context_create(NULL);
+    if (!compile_context)
+        goto cleanup;
+    pcre2_set_parens_nest_limit(compile_context, 100);
+    pcre2_set_max_pattern_length(compile_context, 65536);
+    int error;
+    PCRE2_SIZE error_offset;
+    code = pcre2_compile((PCRE2_SPTR)pattern, strlen(pattern), options,
+        &error, &error_offset, compile_context);
+    if (!code) {
+        core->status = EDITOR_STATUS_INVALID_PATTERN;
+        goto cleanup;
+    }
+    matches = pcre2_match_data_create_from_pattern(code, NULL);
+    context = pcre2_match_context_create(NULL);
+    if (!matches || !context)
+        goto cleanup;
+    size_t budget = 2000000;
+    pcre2_set_match_limit(context, 1000000);
+    pcre2_set_depth_limit(context, 1000);
+    pcre2_set_heap_limit(context, 8192);
+    pcre2_set_callout(context, substitute_callout, &budget);
+    size_t start = first;
+    size_t cursor = core->cursor;
+    int found = 0;
+    for (;;) {
+        size_t end = line_end(core, start);
+        const char *subject = core->text + start;
+        size_t length = end - start;
+        size_t copied = 0;
+        size_t offset = 0;
+        size_t output_line = first + output.length;
+        uint32_t match_options = 0;
+        for (;;) {
+            if (!budget) {
+                core->status = EDITOR_STATUS_REGEX_LIMIT;
+                goto cleanup;
+            }
+            --budget;
+            int result = pcre2_match(code, (PCRE2_SPTR)subject, length, offset,
+                match_options, matches, context);
+            if (result == PCRE2_ERROR_NOMATCH) {
+                if (match_options && offset < length) {
+                    ++offset;
+                    match_options = 0;
+                    continue;
+                }
+                break;
+            }
+            if (result < 0) {
+                if (result == PCRE2_ERROR_MATCHLIMIT || result == PCRE2_ERROR_DEPTHLIMIT ||
+                    result == PCRE2_ERROR_HEAPLIMIT || result == PCRE2_ERROR_CALLOUT)
+                    core->status = EDITOR_STATUS_REGEX_LIMIT;
+                goto cleanup;
+            }
+            PCRE2_SIZE *offsets = pcre2_get_ovector_pointer(matches);
+            if (offsets[0] < copied || offsets[1] < offsets[0] || offsets[1] > length)
+                goto cleanup;
+            if (!append_edit_text(&output, subject + copied, offsets[0] - copied) ||
+                !substitute_replacement(&output, replacement, subject, offsets,
+                    pcre2_get_ovector_count(matches)))
+                goto cleanup;
+            found = 1;
+            cursor = output_line;
+            copied = offset = offsets[1];
+            if (!global)
+                break;
+            match_options = offsets[0] == offsets[1] ? PCRE2_ANCHORED | PCRE2_NOTEMPTY_ATSTART : 0;
+        }
+        if (!append_edit_text(&output, subject + copied, length - copied))
+            goto cleanup;
+        if (end == last)
+            break;
+        if (!append_edit_text(&output, "\n", 1))
+            goto cleanup;
+        start = end + 1;
+    }
+    if (!found) {
+        core->status = EDITOR_STATUS_PATTERN_NOT_FOUND;
+        goto cleanup;
+    }
+    core->history_open = 0;
+    success = write_span(core, first, last, output.text, output.length);
+    core->history_open = 0;
+    if (success) {
+        core->cursor = line_start(core, cursor);
+        size_t end = line_end(core, core->cursor);
+        while (core->cursor < end &&
+            (core->text[core->cursor] == ' ' || core->text[core->cursor] == '\t'))
+            ++core->cursor;
+        core->anchor = core->cursor;
+        core->block_insert = 0;
+        clear_replace_history(core);
+        core->mode = EDITOR_MODE_COMMAND;
+        reset_command(core);
+        complete_command(core);
+    }
+cleanup:
+    free(output.text);
+    pcre2_compile_context_free(compile_context);
+    pcre2_match_context_free(context);
+    pcre2_match_data_free(matches);
+    pcre2_code_free(code);
+    free(replacement);
+    free(pattern);
+    return success;
+}
+
 static int execute_command(EditorCore *core, const char *text)
 {
     core->status = EDITOR_STATUS_INVALID_COMMAND;
@@ -2430,6 +2657,22 @@ static int execute_command(EditorCore *core, const char *text)
         ++text;
     while (*text == ' ' || *text == '\t')
         ++text;
+    if (strncmp(text, "'<,'>", 5) == 0) {
+        if (!core->command_has_range)
+            return 0;
+        text += 5;
+        while (*text == ' ' || *text == '\t')
+            ++text;
+        if (*text != 's')
+            return 0;
+        return substitute(core, text + 1, core->command_range_start, core->command_range_end);
+    }
+    if (text[0] == 's' && strncmp(text, "set", 3) != 0) {
+        size_t first = line_start(core, core->cursor);
+        return substitute(core, text + 1, first, line_end(core, first));
+    }
+    if (text[0] == '%' && text[1] == 's')
+        return substitute(core, text + 2, 0, core->length);
     if (strncmp(text, "retab", 5) == 0) {
         text += 5;
         while (*text == ' ' || *text == '\t')
@@ -2601,6 +2844,12 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
         if (!data)
             return 0;
         *(char *)data = core->command_prefix;
+        return 1;
+    case EDITOR_GET_COMMAND_PROMPT:
+        if (!data)
+            return 0;
+        *(const char **)data = core->command_prefix == '/' ? "/" :
+            core->command_has_range ? ":'<,'>" : ":";
         return 1;
     case EDITOR_EXECUTE_COMMAND:
         return execute_command(core, data);

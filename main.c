@@ -1691,6 +1691,12 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             mode_text = "pattern not found";
         else if ((EditorStatus)lp == EDITOR_STATUS_NO_PREVIOUS_SEARCH)
             mode_text = "no previous search";
+        else if ((EditorStatus)lp == EDITOR_STATUS_INVALID_PATTERN)
+            mode_text = "invalid regex";
+        else if ((EditorStatus)lp == EDITOR_STATUS_REGEX_LIMIT)
+            mode_text = "regex limit exceeded";
+        else if ((EditorStatus)lp == EDITOR_STATUS_SUBSTITUTION_FAILED)
+            mode_text = "substitution failed";
         if (state->command_error)
             mode_text = state->command_error;
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
@@ -1699,14 +1705,15 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND command = GetDlgItem(hWnd, ID_COMMAND_LINE);
         if ((EditorMode)wp == EDITOR_MODE_COMMAND_LINE && !state->command_active) {
             state->command_active = 1;
-            char prompt[2] = { 0, 0 };
-            editor_core_send(state->core, EDITOR_GET_COMMAND_PREFIX, prompt);
+            const char *prompt = ":";
+            editor_core_send(state->core, EDITOR_GET_COMMAND_PROMPT, (void *)&prompt);
             SetWindowTextA(command, prompt);
             EnableWindow(command, TRUE);
             ShowWindow(command, SW_SHOW);
             layout_main_children(hWnd);
             SetFocus(command);
-            SendMessageA(command, EM_SETSEL, 1, 1);
+            size_t prompt_length = strlen(prompt);
+            SendMessageA(command, EM_SETSEL, (WPARAM)prompt_length, (LPARAM)prompt_length);
         } else if ((EditorMode)wp != EDITOR_MODE_COMMAND_LINE && state->command_active) {
             state->command_active = 0;
             ShowWindow(command, SW_HIDE);

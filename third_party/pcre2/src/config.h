@@ -1,0 +1,21 @@
+#ifndef PARAPAD_PCRE2_CONFIG_H
+#define PARAPAD_PCRE2_CONFIG_H
+
+#define SUPPORT_PCRE2_8 1
+#define HAVE_ASSERT_H 1
+#define HAVE_INTTYPES_H 1
+#define HAVE_LIMITS_H 1
+#define HAVE_MEMMOVE 1
+#define HAVE_STDINT_H 1
+#define HAVE_STDIO_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_STRERROR 1
+#define HAVE_STRING_H 1
+#define MATCH_LIMIT 1000000
+#define MATCH_LIMIT_DEPTH 1000
+#define HEAP_LIMIT 8192
+#define PARENS_NEST_LIMIT 100
+
+#include "config.h.generic"
+
+#endif

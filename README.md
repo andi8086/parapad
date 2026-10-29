@@ -198,7 +198,7 @@ the system selection colors.
 | `I` (Shift+I) in visual-block mode | Insert at the left edge on the top selected line; Esc repeats the insertion on the other selected lines |
 | `r` then a character | Replace the character under the caret, or each selected character in visual mode |
 | `R` (Shift+R) in command mode | Enter continuous replace mode; Esc returns to command mode |
-| `:` in command mode | Open the command input above the status bar; Enter executes and Esc cancels |
+| `:` in command/visual mode | Open the command input above the status bar; visual mode prefills `:'<,'>` for the selected lines; Enter executes and Esc cancels |
 | `u` in command mode | Undo the last change; `3u` undoes three changes |
 | Ctrl+R in command mode | Redo an undone change; `3` then Ctrl+R redoes three changes |
 | `.` in command mode | Repeat the last keyboard editing command at the caret; a count overrides its saved count |
@@ -310,12 +310,74 @@ on whitespace) and searches for its next whole-word occurrence. It uses the same
 word classes as word motions, including separate punctuation runs. Counts such
 as `2*` skip multiple occurrences. Subsequent `n`/`N` retain whole-word matching;
 entering a new nonempty `/` pattern returns to literal substring matching.
-Regular expressions, `?` search input, and search highlighting are not implemented.
+Search remains literal, independent of regex substitution. `?` search input and
+search highlighting are not implemented.
 
 A failed search leaves the caret unchanged and displays `pattern not found`;
 the search input remains open for correction or Esc. `n`/`N` without a pattern shows
 `no previous search`. Searching does not modify bytes, the yank register, or undo
 history. Each open buffer retains its own search pattern when switching buffers.
+
+## Substitution
+
+```vim
+:s/old/new/
+:s/old/new/g
+:%s/old/new/g
+:%s/old/new/gi
+:s#old/path#new/path#g
+:%s/\b([A-Za-z_]\w*)_old\b/\1_new/g
+:'<,'>s/test/foo/g
+```
+
+`:s` replaces the first match on the caret's current line. `:%s` applies the
+same operation to every logical line, including an empty final line. Add `g` to
+replace all matches on each targeted line and `i` for case-insensitive matching.
+Without `g`, `:%s` replaces only the first match on each line. In character,
+line, or block visual mode, press `:` to prefill `:'<,'>`, then type
+`s/test/foo/g` to replace across the selected lines. This is a whole-line range,
+not a restriction to selected columns; reversed selections work identically.
+The saved range survives failed submissions while the input remains open and
+is cleared on success or Esc. Removing the range restores current-line `:s`
+behavior; `%` still selects the whole document. Visual marks are not retained
+for later commands after leaving this command input.
+Other flags and numeric ranges are rejected. The last delimiter is optional when no flags follow.
+Use any ASCII punctuation delimiter except backslash; escape it with backslash
+inside either field. An empty replacement deletes matches.
+
+Patterns use **PCRE2 syntax**, not Vim's regex dialect: `()`, `|`, `+`, `?`,
+character classes, anchors, lookarounds, and regex backreferences work normally.
+In replacements, `&` and `\0` insert the whole match, and `\1` through `\9`
+insert captured groups. Unmatched or nonexistent groups insert nothing.
+`\&` and `\\` insert literal ampersand and backslash; `\t` inserts a tab;
+`\n` and `\r` insert a line break in the buffer's LF/CRLF format. Other escaped
+replacement characters are literal. Use `\x00` in a pattern to match a NUL byte.
+
+Matching is line-by-line and byte-oriented, preserving NULs and malformed UTF-8
+outside replaced spans. A regex can match individual UTF-8 bytes; Unicode mode,
+Unicode properties, and Unicode case folding are unavailable. Patterns cannot
+match across line boundaries, even with inline regex flags. Empty patterns,
+previous-pattern reuse, interactive confirmation, and multiline matching are not
+supported. Literal `/` search and its saved pattern are unaffected.
+
+The command builds all replacements before changing the document. Invalid
+patterns, allocation failures, or regex resource limits leave text, caret, and
+undo history unchanged. Zero-length matches advance safely. Each successful
+change is one undo/redo step and leaves the yank register and saved dot-repeat
+command intact; identical output does not mark the buffer modified. The caret
+moves to the first nonblank character of the last matching line. Directory
+listings reject substitutions. Failures keep the input open and show
+`invalid regex`, `pattern not found`, `regex limit exceeded`, or
+`substitution failed` as appropriate; malformed command syntax shows
+`invalid command`.
+
+The vendored PCRE2 10.47 interpreter is statically linked, with no regex DLL,
+JIT, or Unicode tables enabled. Per-match limits are 1,000,000 match operations,
+depth 1,000, and 8 MiB of matching heap. A shared 2,000,000-step callout/match
+budget bounds the whole command, and patterns allow at most 100 nested groups
+and 65,536 bytes. These are resource guards, not wall-clock deadlines.
+See [the PCRE2 license](third_party/pcre2/LICENCE.md) and
+[vendoring notes](third_party/pcre2/README.md).
 
 ## Formatting And Indentation
 
@@ -481,11 +543,12 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
 | `EDITOR_SET_PAGE_SIZE` | `const size_t *` containing the positive number of fully visible text rows; hosts update it after resizing/zooming, default 20 |
 | `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block/command-line mode |
-| `EDITOR_GET_STATUS` | `EditorStatus *` receiving the current no-change, invalid-command, pattern-not-found, or no-previous-search status, or `EDITOR_STATUS_NONE`, without clearing it |
+| `EDITOR_GET_STATUS` | `EditorStatus *` receiving the current no-change, invalid-command, pattern-not-found, no-previous-search, invalid-pattern, regex-limit, or substitution-failed status, or `EDITOR_STATUS_NONE`, without clearing it |
 | `EDITOR_GET_COMMAND_PREFIX` | `char *` receiving `:` for settings/commands or `/` for search input |
+| `EDITOR_GET_COMMAND_PROMPT` | `const char **` receiving a borrowed static prompt: `:`, `/`, or `:'<,'>` for a visual line range; place the input caret after its full length |
 | `EDITOR_GET_SETTINGS` | `EditorSettings *` receiving `maxcol`, `tabwidth`, and `expandtabs` |
 | `EDITOR_SET_SETTINGS` | `const EditorSettings *` supplying all three settings |
-| `EDITOR_EXECUTE_COMMAND` | NUL-terminated UTF-8 input; execute `set name=value`, `set lf`, `set crlf`, or `retab` with an optional `:`, or search with `/pattern` |
+| `EDITOR_EXECUTE_COMMAND` | NUL-terminated UTF-8 input; execute `set name=value`, `set lf`, `set crlf`, `retab`, `s/pattern/replacement/flags`, `%s/pattern/replacement/flags`, or `'<,'>s/pattern/replacement/flags` for the pending visual range, with an optional `:`, or search with `/pattern` |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy `length` arbitrary bytes from `data`, detect line endings, and normalize CRLF pairs for editing |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed file-format `data` and byte `length`, serialized in the selected LF/CRLF mode |
@@ -530,7 +593,7 @@ after a character or at line end. ASCII `R` enters
 In normal mode, `:` or `/` enters `EDITOR_MODE_COMMAND_LINE`; the core supplies
 the prompt through `EDITOR_GET_COMMAND_PREFIX`. The frontend edits the input
 and submits it with `EDITOR_EXECUTE_COMMAND`. Successful execution
-returns to command mode; invalid input returns 0, sets the invalid-command
+returns to command mode; failed input returns 0, sets an appropriate error
 status, and leaves command-line mode active. Esc cancels command-line mode.
 Backspace, Tab, and Enter are passed
 as their ASCII control values. Navigation and Delete use the `EditorKey` enum.
@@ -622,20 +685,28 @@ is 32-bit only.
 ## Core Tests
 
 From a Visual Studio Developer Command Prompt in the repository directory:
+first compile the vendored regex objects once for that prompt's architecture.
+The Visual Studio project builds these automatically for the application.
+
+```bat
+if not exist Debug\pcre2 mkdir Debug\pcre2
+cl /nologo /W3 /std:c11 /c /DHAVE_CONFIG_H /DPCRE2_CODE_UNIT_WIDTH=8 /DPCRE2_STATIC /D_CRT_SECURE_NO_WARNINGS /FoDebug\pcre2\ third_party\pcre2\src\pcre2_*.c
+```
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c editor_core_tests.c
+cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c editor_core_tests.c Debug\pcre2\*.obj
 Debug\core-tests\editor_core_tests.exe
 ```
 
 ## Native Window Tests
 
-From a Visual Studio Developer Command Prompt, run:
+From a Visual Studio Developer Command Prompt, after compiling the PCRE2
+objects above for the same architecture, run:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c Debug\pcre2\*.obj user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
 Debug\core-tests\editor_window_tests.exe
 ```
 
