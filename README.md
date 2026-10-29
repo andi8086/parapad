@@ -32,11 +32,12 @@ settings, undo/redo history, search pattern, repeat command, and yank register.
 Switching buffers cancels any open search/colon input without submitting it.
 
 The status bar shows the current one-based row and total lines (`LN 35/2102`),
-then the display column, followed by
-the caret's byte-position percentage of the whole file and the LF/CRLF format.
+then the display column, followed by the caret's byte-position percentage of
+the whole file, `(byte offset / total bytes)`, and the LF/CRLF format.
 Columns include tab expansion and count each Unicode scalar as one cell.
 The percentage uses serialized file bytes, including CRLF pairs, rather than
-line count or scroll position. An empty buffer shows `LN 1/1, Col 1`, `100%`, and
+line count or scroll position. Byte offsets are zero-based. An empty buffer
+shows `LN 1/1, Col 1`, `100% (0 / 0)`, and
 `LF`; the end-of-file position in a nonempty buffer shows `100%`.
 
 File > Close (`Ctrl+W`) closes only the active buffer, asking whether to save

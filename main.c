@@ -957,9 +957,10 @@ static void update_buffer_status(HWND window, EditorCore *core)
     editor_core_send(core, EDITOR_GET_POSITION, &position);
     unsigned int percent = position.length
         ? (unsigned int)(100.0 * ((double)position.offset / (double)position.length)) : 100;
-    char text[128];
-    snprintf(text, sizeof(text), "LN %zu/%zu, Col %zu    %u%%",
-        position.line + 1, position.line_count, position.column + 1, percent);
+    char text[192];
+    snprintf(text, sizeof(text), "LN %zu/%zu, Col %zu    %u%% (%zu / %zu)",
+        position.line + 1, position.line_count, position.column + 1, percent,
+        position.offset, position.length);
     HWND status = GetDlgItem(window, ID_STATUS);
     SendMessageA(status, SB_SETTEXTA, 1, (LPARAM)text);
     SendMessageA(status, SB_SETTEXTA, 2,
@@ -1161,7 +1162,7 @@ static void layout_main_children(HWND window)
     GetClientRect(status, &status_client);
     int grip_width = GetSystemMetrics(SM_CXVSCROLL) + 4;
     int text_right = status_client.right > grip_width ? status_client.right - grip_width : 0;
-    int status_parts[3] = { text_right > 352 ? text_right - 352 : 0,
+    int status_parts[3] = { text_right > 544 ? text_right - 544 : 0,
         text_right > 64 ? text_right - 64 : 0, text_right };
     SendMessageA(status, SB_SETPARTS, 3, (LPARAM)status_parts);
     update_buffer_status(window, state->core);
