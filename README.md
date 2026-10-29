@@ -21,9 +21,21 @@ This is a Vim-style command subset, not a full Vim engine.
 ## Files
 
 Use File > Open (`Ctrl+O`), Save (`Ctrl+S`), or Save As. File > New (`Ctrl+N`)
-starts an empty document. The title shows the current path. New, Open, and Exit
-prompt to save modified documents; cancelling or failing a save keeps the current
-document open. Failed loads leave the current buffer, path, and viewport intact.
+adds an empty buffer; Open adds a loaded file without replacing any open buffer
+or prompting to discard its edits. The title shows the active buffer's full path.
+
+The list at the far left displays open filenames, or `Untitled` for unnamed
+buffers. Click a filename to switch buffers; a surrounding box marks the active
+one, and `*` marks unsaved changes. Long filenames are ellipsized within the list.
+Each buffer retains its own text, caret, scroll position, mode, selection,
+settings, undo/redo history, search pattern, repeat command, and yank register.
+Switching buffers cancels any open search/colon input without submitting it.
+
+File > Close (`Ctrl+W`) closes only the active buffer, asking whether to save
+unsaved changes. Cancel or a failed save keeps it open. Closing the final buffer
+creates a fresh untitled buffer. Exit checks every modified buffer, including
+inactive ones; cancelling keeps the application open with that buffer selected.
+Failed loads leave existing buffers and the selected buffer's state intact.
 
 File I/O uses binary `rb`/`wb` streams and explicit byte lengths. Loading and saving
 do not decode, transcode, normalize newlines, remove a BOM, or stop at NUL or
@@ -151,7 +163,7 @@ Regular expressions, `?` search input, and search highlighting are not implement
 A failed search leaves the caret unchanged and displays `pattern not found`;
 the search input remains open for correction or Esc. `n`/`N` without a pattern shows
 `no previous search`. Searching does not modify bytes, the yank register, or undo
-history. The latest pattern belongs to the core instance and survives New/load.
+history. Each open buffer retains its own search pattern when switching buffers.
 
 ## Settings
 
@@ -201,7 +213,8 @@ matching caret measurement, selection highlighting, and mouse hit-testing.
 `tabwidth` must be positive and less than `SIZE_MAX`; invalid settings leave the
 previous values intact. `expandtabs` is normalized to zero or one.
 
-Settings survive New/load/buffer replacement and are not document edits or undo
+Settings are per buffer; new buffers start with the defaults above. Within a core,
+settings survive raw load/buffer replacement and are not document edits or undo
 steps. They do not change existing bytes or mark the document modified. Hosts
 should refresh the view after changing settings. The retained bitmap is rebuilt
 when `maxcol` or `tabwidth` changes. The guide moves with horizontal scrolling;
@@ -221,7 +234,8 @@ Editing after undo discards the redo branch. Navigation, yank, and no-op edits
 preserve it. Undo/redo does not change the yank register. Reaching either end of
 history is a no-op. If an undo/redo command restores no change, the status line
 shows `no change` until the next editor command. Read-only queries and redraws
-preserve the message. New, successful load, and buffer replacement clear history;
+preserve the message. New/Open buffers have independent histories; switching
+buffers preserves them. A raw core load or buffer replacement clears its history;
 saving retains it and records the clean revision, so undo/redo back to that
 revision clears the modified flag. History uses complete byte-buffer snapshots,
 preserving NULs and malformed UTF-8. It is per document instance, kept only in
@@ -358,6 +372,21 @@ if not exist Debug\core-tests mkdir Debug\core-tests
 cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c editor_core_tests.c
 Debug\core-tests\editor_core_tests.exe
 ```
+
+## Native Window Tests
+
+From a Visual Studio Developer Command Prompt, run:
+
+```bat
+if not exist Debug\core-tests mkdir Debug\core-tests
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+Debug\core-tests\editor_window_tests.exe
+```
+
+These tests cover buffer switching, independent state and undo, raw file saves,
+the active filename's border, compact/large window layout, close confirmation,
+failed opens, and exit prompts for inactive modified buffers. Test-owned dialogs
+are answered automatically.
 
 The standalone tests do not link the GUI or Windows libraries. Assertions must
 remain enabled (do not define `NDEBUG`). Test objects use a separate directory so

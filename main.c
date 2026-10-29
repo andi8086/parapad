@@ -16,6 +16,8 @@
 #define ID_FILE_SAVE 105
 #define ID_FILE_SAVE_AS 106
 #define ID_COMMAND_LINE 107
+#define ID_BUFFER_LIST 108
+#define ID_FILE_CLOSE 109
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
 #define WM_EDITOR_REFRESH (WM_APP + 3)
@@ -51,9 +53,18 @@ typedef struct EditorControl {
     EditorSettings painted_settings;
 } EditorControl;
 
-typedef struct MainWindowState {
+typedef struct TextBuffer {
     EditorCore *core;
     char path[MAX_PATH];
+    size_t first_line;
+    int left_pixel;
+} TextBuffer;
+
+typedef struct MainWindowState {
+    EditorCore *core;
+    TextBuffer **buffers;
+    size_t buffer_count;
+    size_t active_buffer;
     WNDPROC command_proc;
     int command_active;
 } MainWindowState;
@@ -558,8 +569,107 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 static void update_document_title(HWND window, const MainWindowState *state)
 {
     char title[MAX_PATH + 16];
-    wsprintfA(title, "parapad - %s", state->path[0] ? state->path : "Untitled");
+    const char *path = state->buffers[state->active_buffer]->path;
+    wsprintfA(title, "parapad - %s", path[0] ? path : "Untitled");
     SetWindowTextA(window, title);
+}
+
+static const char *buffer_filename(const TextBuffer *buffer)
+{
+    const char *name = buffer->path;
+    for (const char *position = buffer->path; *position; ++position)
+        if (*position == '\\' || *position == '/')
+            name = position + 1;
+    return *name ? name : "Untitled";
+}
+
+static TextBuffer *create_document(const char *path)
+{
+    TextBuffer *buffer = calloc(1, sizeof(*buffer));
+    if (!buffer)
+        return NULL;
+    buffer->core = editor_core_create("");
+    if (!buffer->core || (path && !editor_core_send(buffer->core, EDITOR_LOAD_FILE, (void *)path))) {
+        editor_core_destroy(buffer->core);
+        free(buffer);
+        return NULL;
+    }
+    if (path)
+        lstrcpynA(buffer->path, path, MAX_PATH);
+    return buffer;
+}
+
+static void layout_main_children(HWND window);
+
+static void activate_document(HWND window, MainWindowState *state, size_t index)
+{
+    if (index >= state->buffer_count)
+        return;
+    HWND editor = GetDlgItem(window, ID_EDITOR);
+    EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
+    if (control && state->core) {
+        TextBuffer *previous = state->buffers[state->active_buffer];
+        previous->first_line = control->first_line;
+        previous->left_pixel = control->left_pixel;
+    }
+    if (state->command_active) {
+        unsigned long escape = 27;
+        editor_core_send(state->core, EDITOR_HANDLE_KEY, &escape);
+        state->command_active = 0;
+        HWND command = GetDlgItem(window, ID_COMMAND_LINE);
+        ShowWindow(command, SW_HIDE);
+        EnableWindow(command, FALSE);
+        SetWindowTextA(command, "");
+    }
+    state->active_buffer = index;
+    TextBuffer *buffer = state->buffers[index];
+    state->core = buffer->core;
+    SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)index, 0);
+    InvalidateRect(GetDlgItem(window, ID_BUFFER_LIST), NULL, FALSE);
+    update_document_title(window, state);
+    if (control) {
+        control->core = buffer->core;
+        control->first_line = buffer->first_line;
+        control->left_pixel = buffer->left_pixel;
+        control->pending_lead = 0;
+        control->bitmap_valid = 0;
+        layout_main_children(window);
+        SendMessageA(editor, WM_EDITOR_REFRESH, 0, 0);
+        SetFocus(editor);
+    }
+}
+
+static int add_document(HWND window, MainWindowState *state, TextBuffer *buffer)
+{
+    if (state->buffer_count >= INT_MAX ||
+        state->buffer_count >= (size_t)-1 / sizeof(*state->buffers) - 1)
+        return 0;
+    TextBuffer **buffers = realloc(state->buffers,
+        (state->buffer_count + 1) * sizeof(*buffers));
+    if (!buffers)
+        return 0;
+    state->buffers = buffers;
+    LRESULT item = SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_ADDSTRING,
+        0, (LPARAM)buffer_filename(buffer));
+    if (item == LB_ERR || item == LB_ERRSPACE)
+        return 0;
+    state->buffers[state->buffer_count++] = buffer;
+    activate_document(window, state, state->buffer_count - 1);
+    return 1;
+}
+
+static int open_document(HWND window, MainWindowState *state, const char *path)
+{
+    TextBuffer *buffer = create_document(path);
+    if (buffer && add_document(window, state, buffer))
+        return 1;
+    if (buffer) {
+        editor_core_destroy(buffer->core);
+        free(buffer);
+    }
+    MessageBoxA(window, "The document could not be opened. Check the path, access permissions, and available memory.",
+        "parapad", MB_OK | MB_ICONERROR);
+    return 0;
 }
 
 static int choose_file(HWND window, char *path, int save)
@@ -581,7 +691,8 @@ static int choose_file(HWND window, char *path, int save)
 static int save_document(HWND window, MainWindowState *state, int save_as)
 {
     char path[MAX_PATH];
-    lstrcpynA(path, state->path, MAX_PATH);
+    TextBuffer *buffer = state->buffers[state->active_buffer];
+    lstrcpynA(path, buffer->path, MAX_PATH);
     if ((save_as || !path[0]) && !choose_file(window, path, 1))
         return 0;
     if (!editor_core_send(state->core, EDITOR_SAVE_FILE, path)) {
@@ -589,7 +700,14 @@ static int save_document(HWND window, MainWindowState *state, int save_as)
             "parapad", MB_OK | MB_ICONERROR);
         return 0;
     }
-    lstrcpynA(state->path, path, MAX_PATH);
+    lstrcpynA(buffer->path, path, MAX_PATH);
+    HWND list = GetDlgItem(window, ID_BUFFER_LIST);
+    LRESULT item = SendMessageA(list, LB_INSERTSTRING, (WPARAM)state->active_buffer,
+        (LPARAM)buffer_filename(buffer));
+    if (item != LB_ERR && item != LB_ERRSPACE)
+        SendMessageA(list, LB_DELETESTRING, (WPARAM)(state->active_buffer + 1), 0);
+    SendMessageA(list, LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
+    InvalidateRect(list, NULL, FALSE);
     update_document_title(window, state);
     return 1;
 }
@@ -600,11 +718,37 @@ static int confirm_document_close(HWND window, MainWindowState *state)
     editor_core_send(state->core, EDITOR_GET_MODIFIED, &modified);
     if (!modified)
         return 1;
-    int answer = MessageBoxA(window, "Save changes before continuing?", "parapad",
+    char prompt[MAX_PATH + 64];
+    wsprintfA(prompt, "Save changes to %s before closing?", buffer_filename(state->buffers[state->active_buffer]));
+    int answer = MessageBoxA(window, prompt, "parapad",
         MB_YESNOCANCEL | MB_ICONQUESTION);
     if (answer == IDCANCEL)
         return 0;
     return answer != IDYES || save_document(window, state, 0);
+}
+
+static void close_document(HWND window, MainWindowState *state)
+{
+    if (!confirm_document_close(window, state))
+        return;
+    size_t closing = state->active_buffer;
+    if (state->buffer_count == 1) {
+        if (!open_document(window, state, NULL))
+            return;
+    } else {
+        activate_document(window, state, closing + 1 < state->buffer_count ? closing + 1 : closing - 1);
+    }
+    TextBuffer *buffer = state->buffers[closing];
+    SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_DELETESTRING, (WPARAM)closing, 0);
+    memmove(state->buffers + closing, state->buffers + closing + 1,
+        (state->buffer_count - closing - 1) * sizeof(*state->buffers));
+    --state->buffer_count;
+    if (state->active_buffer > closing)
+        --state->active_buffer;
+    editor_core_destroy(buffer->core);
+    free(buffer);
+    SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
+    InvalidateRect(GetDlgItem(window, ID_BUFFER_LIST), NULL, FALSE);
 }
 
 static void layout_main_children(HWND window)
@@ -627,10 +771,13 @@ static void layout_main_children(HWND window)
     if (command_height > available_height)
         command_height = available_height;
     int content_height = available_height - command_height;
-    int width = rect.right > 24 ? rect.right - 24 : 0;
+    int sidebar_width = rect.right >= 600 ? 180 : rect.right / 3;
+    int editor_left = sidebar_width + 12;
+    int width = rect.right > editor_left + 12 ? rect.right - editor_left - 12 : 0;
     int height = content_height > 24 ? content_height - 24 : 0;
-    MoveWindow(editor, 12, 12, width, height, TRUE);
-    MoveWindow(GetDlgItem(window, ID_COMMAND_LINE), 12, content_height, width, command_height, TRUE);
+    MoveWindow(GetDlgItem(window, ID_BUFFER_LIST), 0, 0, sidebar_width, available_height, TRUE);
+    MoveWindow(editor, editor_left, 12, width, height, TRUE);
+    MoveWindow(GetDlgItem(window, ID_COMMAND_LINE), editor_left, content_height, width, command_height, TRUE);
 }
 
 static int execute_ansi_command(EditorCore *core, const char *text)
@@ -716,7 +863,6 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         state = calloc(1, sizeof(*state));
         if (!state)
             return -1;
-        state->core = ((LPCREATESTRUCTA)lp)->lpCreateParams;
         SetWindowLongPtrA(hWnd, GWLP_USERDATA, (LONG_PTR)state);
         HMENU menu = CreateMenu();
         HMENU file_menu = CreatePopupMenu();
@@ -725,6 +871,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             !AppendMenuA(file_menu, MF_STRING, ID_FILE_OPEN, "&Open...\tCtrl+O") ||
             !AppendMenuA(file_menu, MF_STRING, ID_FILE_SAVE, "&Save\tCtrl+S") ||
             !AppendMenuA(file_menu, MF_STRING, ID_FILE_SAVE_AS, "Save &As...") ||
+            !AppendMenuA(file_menu, MF_STRING, ID_FILE_CLOSE, "&Close\tCtrl+W") ||
             !AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL) ||
             !AppendMenu(file_menu, MF_STRING, ID_FILE_EXIT, "E&xit") ||
             !AppendMenu(menu, MF_POPUP, (UINT_PTR)file_menu, "&File")) {
@@ -747,10 +894,21 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             return -1;
         SendMessageA(status, SB_SETTEXTA, 0, (LPARAM)"COMMAND");
 
+        HWND list = CreateWindowExA(0, "LISTBOX", NULL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+            LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
+            0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_BUFFER_LIST,
+            ((LPCREATESTRUCTA)lp)->hInstance, NULL);
+        if (!list)
+            return -1;
+        SendMessageA(list, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
+        if (!open_document(hWnd, state, NULL))
+            return -1;
+
         HWND editor = CreateWindowExA(WS_EX_CLIENTEDGE, "PARAPAD_EDITOR", NULL,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)ID_EDITOR,
-            ((LPCREATESTRUCTA)lp)->hInstance, ((LPCREATESTRUCTA)lp)->lpCreateParams);
+            ((LPCREATESTRUCTA)lp)->hInstance, state->core);
         if (!editor)
             return -1;
         HWND command = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
@@ -771,7 +929,58 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         layout_main_children(hWnd);
         return 0;
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT *item = (MEASUREITEMSTRUCT *)lp;
+        if (item->CtlID != ID_BUFFER_LIST)
+            break;
+        HDC dc = GetDC(hWnd);
+        HGDIOBJ font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+        TEXTMETRICA metrics;
+        GetTextMetricsA(dc, &metrics);
+        item->itemHeight = metrics.tmHeight + 12;
+        SelectObject(dc, font);
+        ReleaseDC(hWnd, dc);
+        return TRUE;
+    }
+    case WM_CTLCOLORLISTBOX:
+        if ((HWND)lp == GetDlgItem(hWnd, ID_BUFFER_LIST)) {
+            SetBkColor((HDC)wp, GetSysColor(COLOR_BTNFACE));
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        break;
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT *item = (const DRAWITEMSTRUCT *)lp;
+        if (item->CtlID != ID_BUFFER_LIST)
+            break;
+        FillRect(item->hDC, &item->rcItem, GetSysColorBrush(COLOR_BTNFACE));
+        if (!state || item->itemID >= state->buffer_count)
+            return TRUE;
+        RECT bounds = item->rcItem;
+        InflateRect(&bounds, -3, -2);
+        if (item->itemID == state->active_buffer)
+            FrameRect(item->hDC, &bounds, GetSysColorBrush(COLOR_BTNTEXT));
+        bounds.left += 6;
+        bounds.right -= 6;
+        int modified = 0;
+        TextBuffer *buffer = state->buffers[item->itemID];
+        editor_core_send(buffer->core, EDITOR_GET_MODIFIED, &modified);
+        char name[MAX_PATH + 4];
+        wsprintfA(name, "%s%s", modified ? "* " : "", buffer_filename(buffer));
+        HGDIOBJ font = SelectObject(item->hDC, GetStockObject(DEFAULT_GUI_FONT));
+        int background = SetBkMode(item->hDC, TRANSPARENT);
+        COLORREF color = SetTextColor(item->hDC, GetSysColor(COLOR_BTNTEXT));
+        DrawTextA(item->hDC, name, -1, &bounds,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SetTextColor(item->hDC, color);
+        SetBkMode(item->hDC, background);
+        SelectObject(item->hDC, font);
+        return TRUE;
+    }
     case WM_EDITOR_MODE_CHANGED: {
+        RECT item_rect;
+        HWND list = GetDlgItem(hWnd, ID_BUFFER_LIST);
+        if (SendMessageA(list, LB_GETITEMRECT, (WPARAM)state->active_buffer, (LPARAM)&item_rect) != LB_ERR)
+            InvalidateRect(list, &item_rect, FALSE);
         const char *mode_text;
         switch ((EditorMode)wp) {
         case EDITOR_MODE_INSERT: mode_text = "INSERT"; break;
@@ -822,36 +1031,26 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         SetFocus(GetDlgItem(hWnd, state && state->command_active ? ID_COMMAND_LINE : ID_EDITOR));
         return 0;
     case WM_COMMAND: {
+        if (LOWORD(wp) == ID_BUFFER_LIST && HIWORD(wp) == LBN_SELCHANGE) {
+            LRESULT index = SendMessageA(GetDlgItem(hWnd, ID_BUFFER_LIST), LB_GETCURSEL, 0, 0);
+            if (index != LB_ERR)
+                activate_document(hWnd, state, (size_t)index);
+            return 0;
+        }
         switch (LOWORD(wp)) {
         case ID_FILE_NEW: {
-            EditorBuffer empty = { NULL, 0 };
-            if (!confirm_document_close(hWnd, state))
-                return 0;
-            if (!editor_core_send(state->core, EDITOR_SET_BUFFER, &empty)) {
-                MessageBoxA(hWnd, "The new document could not be created.", "parapad", MB_OK | MB_ICONERROR);
-                return 0;
-            }
-            state->path[0] = 0;
-            update_document_title(hWnd, state);
-            SendMessageA(GetDlgItem(hWnd, ID_EDITOR), WM_EDITOR_BUFFER_CHANGED, 0, 0);
-            SetFocus(GetDlgItem(hWnd, ID_EDITOR));
+            open_document(hWnd, state, NULL);
             return 0;
         }
         case ID_FILE_OPEN: {
             char path[MAX_PATH] = "";
-            if (!choose_file(hWnd, path, 0) || !confirm_document_close(hWnd, state))
-                return 0;
-            if (!editor_core_send(state->core, EDITOR_LOAD_FILE, path)) {
-                MessageBoxA(hWnd, "The file could not be loaded. Check access permissions and available memory.",
-                    "parapad", MB_OK | MB_ICONERROR);
-                return 0;
-            }
-            lstrcpynA(state->path, path, MAX_PATH);
-            update_document_title(hWnd, state);
-            SendMessageA(GetDlgItem(hWnd, ID_EDITOR), WM_EDITOR_BUFFER_CHANGED, 0, 0);
-            SetFocus(GetDlgItem(hWnd, ID_EDITOR));
+            if (choose_file(hWnd, path, 0))
+                open_document(hWnd, state, path);
             return 0;
         }
+        case ID_FILE_CLOSE:
+            close_document(hWnd, state);
+            return 0;
         case ID_FILE_SAVE:
         case ID_FILE_SAVE_AS:
             save_document(hWnd, state, LOWORD(wp) == ID_FILE_SAVE_AS);
@@ -863,13 +1062,30 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     }
     case WM_CLOSE:
-        if (!state || confirm_document_close(hWnd, state))
-            DestroyWindow(hWnd);
+        if (state) {
+            for (size_t index = 0; index < state->buffer_count; ++index) {
+                int modified = 0;
+                editor_core_send(state->buffers[index]->core, EDITOR_GET_MODIFIED, &modified);
+                if (modified) {
+                    activate_document(hWnd, state, index);
+                    if (!confirm_document_close(hWnd, state))
+                        return 0;
+                }
+            }
+        }
+        DestroyWindow(hWnd);
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
     case WM_NCDESTROY:
+        if (state) {
+            for (size_t index = 0; index < state->buffer_count; ++index) {
+                editor_core_destroy(state->buffers[index]->core);
+                free(state->buffers[index]);
+            }
+            free(state->buffers);
+        }
         free(state);
         SetWindowLongPtrA(hWnd, GWLP_USERDATA, 0);
         break;
@@ -906,22 +1122,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!RegisterClassA(&main_cls))
         return 1;
 
-    EditorCore *core = editor_core_create("");
-    if (!core)
-        return 1;
-
     HWND g_hwnd = CreateWindowA("PARAPAD_CLASS", "parapad",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, hInstance, core);
-    if (!g_hwnd) {
-        editor_core_destroy(core);
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 480, NULL, NULL, hInstance, NULL);
+    if (!g_hwnd)
         return 1;
-    }
 
     ACCEL shortcuts[] = {
         { FVIRTKEY | FCONTROL, 'N', ID_FILE_NEW },
         { FVIRTKEY | FCONTROL, 'O', ID_FILE_OPEN },
-        { FVIRTKEY | FCONTROL, 'S', ID_FILE_SAVE }
+        { FVIRTKEY | FCONTROL, 'S', ID_FILE_SAVE },
+        { FVIRTKEY | FCONTROL, 'W', ID_FILE_CLOSE }
     };
     HACCEL accelerators = CreateAcceleratorTableA(shortcuts, sizeof(shortcuts) / sizeof(shortcuts[0]));
     ShowWindow(g_hwnd, nCmdShow);
@@ -939,6 +1150,5 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     if (accelerators)
         DestroyAcceleratorTable(accelerators);
-    editor_core_destroy(core);
     return result == -1 ? 1 : (int)msg.wParam;
 }
