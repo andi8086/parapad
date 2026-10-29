@@ -13,7 +13,8 @@ ordinary window exposure copies the cached pixels. Resizing, horizontal scrollin
 buffer replacement, and large jumps fall back to a full redraw.
 
 In insert mode, typing inserts text, Enter splits the line, Backspace deletes the
-previous character, and Tab inserts four spaces. Arrow keys, Home, End, Delete,
+previous character, and Tab advances to the next eight-column tab stop by default.
+Arrow keys, Home, End, Delete,
 and mouse caret positioning work in all modes. The viewport follows the caret.
 This is a Vim-style command subset, not a full Vim engine.
 
@@ -30,7 +31,8 @@ Ctrl+Z. Unedited files round-trip byte for byte, including arbitrary non-UTF-8 d
 Paths use ANSI dialogs and the system code page, consistent with the Win95 GUI.
 
 The current text view uses LF as its line separator. Valid UTF-8 is displayed as
-characters; malformed bytes show replacement glyphs and control bytes show dots,
+characters; malformed bytes show replacement glyphs and control bytes other than
+Tab show dots,
 without modifying their stored bytes. Navigation treats each malformed byte as a
 single unit. CR bytes in CRLF files are retained and displayed as control bytes;
 text typed through the keyboard still inserts LF. This is a raw-buffer foundation
@@ -80,7 +82,8 @@ existing line separators. Replacement does not overwrite the yank register.
 
 In `R` mode, typed characters overwrite complete UTF-8 characters and append at
 the end of a line without consuming its newline. Enter inserts a line break;
-Tab overwrites up to four characters with four spaces. Backspace restores the
+Tab uses the core settings: expanded tabs overwrite characters with enough spaces
+to reach the next virtual tab stop, and literal tabs replace one character. Backspace restores the
 previous overwritten character (or removes text appended beyond the line end).
 One Backspace restores an entire Tab operation. Arrow keys, Home, End, Delete,
 mouse positioning, and direct edit/navigation messages clear restoration history;
@@ -108,6 +111,31 @@ pressing Delete, or inserting a newline ends repetition and continues ordinary
 editing on the first line. An empty insert followed by Esc changes nothing.
 Block yank/delete stores newline-separated row slices in the ordinary register;
 blockwise paste is not implemented, and `p`/`P` while selecting a block is a no-op.
+
+## Settings
+
+Each core owns an `EditorSettings` value, queried with `EDITOR_GET_SETTINGS` and
+updated with `EDITOR_SET_SETTINGS`.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `maxcol` | `80` | Draw a thin gray vertical guide after this many character cells; `0` hides it |
+| `tabwidth` | `8` | Spacing between virtual tab stops for both expanded and literal tabs |
+| `expandtabs` | `1` (true) | Insert spaces for Tab; when false, insert one real `\t` byte |
+
+Expanded Tab inserts enough spaces to reach the next virtual tab stop. With
+`tabwidth = 8`, column 0 inserts eight spaces and column 3 inserts five. Existing
+tabs and UTF-8 characters are included in the virtual-column calculation.
+Stored tabs are displayed as whitespace extending to the next tab stop, with
+matching caret measurement, selection highlighting, and mouse hit-testing.
+`tabwidth` must be positive and less than `SIZE_MAX`; invalid settings leave the
+previous values intact. `expandtabs` is normalized to zero or one.
+
+Settings survive New/load/buffer replacement and are not document edits or undo
+steps. They do not change existing bytes or mark the document modified. Hosts
+should refresh the view after changing settings. The retained bitmap is rebuilt
+when `maxcol` or `tabwidth` changes. The guide moves with horizontal scrolling;
+it does not wrap text or color overlong lines yet.
 
 ## Undo And Redo
 
@@ -146,6 +174,8 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
 | `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block mode |
 | `EDITOR_GET_STATUS` | `EditorStatus *` receiving `EDITOR_STATUS_NONE` or `EDITOR_STATUS_NO_CHANGE` without clearing it |
+| `EDITOR_GET_SETTINGS` | `EditorSettings *` receiving `maxcol`, `tabwidth`, and `expandtabs` |
+| `EDITOR_SET_SETTINGS` | `const EditorSettings *` supplying all three settings |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
 | `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |

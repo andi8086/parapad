@@ -59,8 +59,16 @@ typedef enum EditorMessage {
     EDITOR_GET_LINE_CARET,
     EDITOR_UNDO,
     EDITOR_REDO,
-    EDITOR_GET_STATUS
+    EDITOR_GET_STATUS,
+    EDITOR_GET_SETTINGS,
+    EDITOR_SET_SETTINGS
 } EditorMessage;
+
+typedef struct EditorSettings {
+    size_t maxcol;
+    size_t tabwidth;
+    int expandtabs;
+} EditorSettings;
 
 typedef struct EditorLine {
     size_t index;

@@ -46,6 +46,7 @@ typedef struct EditorControl {
     size_t painted_first_line;
     int painted_left_pixel;
     int bitmap_valid;
+    EditorSettings painted_settings;
 } EditorControl;
 
 typedef struct MainWindowState {
@@ -121,6 +122,10 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     if (paint)
         editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
     COLORREF normal_color = GetTextColor(dc);
+    EditorSettings settings;
+    editor_core_send(editor->core, EDITOR_GET_SETTINGS, &settings);
+    SIZE space_size = { 0, 0 };
+    GetTextExtentPoint32A(dc, " ", 1, &space_size);
     int width = 0;
     if (hit_column)
         *hit_column = 0;
@@ -130,6 +135,13 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
         int length = character_to_ansi(character.value, text, sizeof(text));
         SIZE extent = { 0, 0 };
         GetTextExtentPoint32A(dc, text, length, &extent);
+        if (character.value == '\t') {
+            if (space_size.cx <= 0 || settings.tabwidth > (size_t)(INT_MAX / space_size.cx))
+                break;
+            int stop = (int)settings.tabwidth * space_size.cx;
+            extent.cx = stop - width % stop;
+            length = 0;
+        }
         if (extent.cx > INT_MAX - width)
             break;
         if (hit_column) {
@@ -214,6 +226,8 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
 {
     EditorCaret primary;
     editor_core_send(editor->core, EDITOR_GET_CARET, &primary);
+    EditorSettings settings;
+    editor_core_send(editor->core, EDITOR_GET_SETTINGS, &settings);
     size_t rows = height > 16 ? (size_t)((height - 17) / editor->line_height + 1) : 0;
     if (editor->line_count != rows) {
         clear_line_cache(editor);
@@ -226,7 +240,9 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
     int reuse = buffered && editor->bitmap_valid && editor->line_count == rows;
     size_t distance = editor->first_line > editor->painted_first_line ?
         editor->first_line - editor->painted_first_line : editor->painted_first_line - editor->first_line;
-    if (reuse && (editor->left_pixel != editor->painted_left_pixel || distance >= rows))
+    if (reuse && (editor->left_pixel != editor->painted_left_pixel || distance >= rows ||
+        settings.maxcol != editor->painted_settings.maxcol ||
+        settings.tabwidth != editor->painted_settings.tabwidth))
         reuse = 0;
     if (reuse && distance) {
         int shift = (int)distance * editor->line_height;
@@ -253,6 +269,16 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
 
     HGDIOBJ old_font = SelectObject(dc, editor->font);
     SetBkMode(dc, TRANSPARENT);
+    SIZE space_size = { 0, 0 };
+    GetTextExtentPoint32A(dc, " ", 1, &space_size);
+    int guide = -1;
+    if (space_size.cx > 0 && settings.maxcol &&
+        settings.maxcol <= (size_t)((INT_MAX - editor->text_left) / space_size.cx)) {
+        int position = editor->text_left + (int)settings.maxcol * space_size.cx - editor->left_pixel;
+        if (position >= editor->text_left && position < width - 8)
+            guide = position;
+    }
+    HBRUSH guide_brush = guide >= 0 ? CreateSolidBrush(RGB(64, 64, 64)) : NULL;
     for (size_t row = 0; row < rows; ++row) {
         size_t index = editor->first_line + row;
         EditorLine line = { index, NULL, 0 };
@@ -278,6 +304,10 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
         if (dirty.bottom > height - 8)
             dirty.bottom = height - 8;
         FillRect(dc, &dirty, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        if (guide_brush) {
+            RECT marker = { guide, dirty.top, guide + 1, dirty.bottom };
+            FillRect(dc, &marker, guide_brush);
+        }
         if (exists) {
             int saved_dc = SaveDC(dc);
             if (saved_dc) {
@@ -324,6 +354,9 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
         }
     }
     SelectObject(dc, old_font);
+    if (guide_brush)
+        DeleteObject(guide_brush);
+    editor->painted_settings = settings;
     editor->painted_first_line = editor->first_line;
     editor->painted_left_pixel = editor->left_pixel;
     editor->bitmap_valid = buffered && editor->line_count == rows;
