@@ -49,6 +49,7 @@ struct EditorCore {
     EditorMode mode;
     EditorStatus status;
     EditorSettings settings;
+    size_t page_lines;
     char command_prefix;
     char *search_text;
     size_t search_length;
@@ -481,6 +482,7 @@ EditorCore *editor_core_create(const char *initial_text)
     core->settings.maxcol = 80;
     core->settings.tabwidth = 8;
     core->settings.expandtabs = 1;
+    core->page_lines = 20;
     core->command_prefix = ':';
     core->document_change.first_line = SIZE_MAX;
     core->line_ending = initial_text && strstr(initial_text, "\r\n")
@@ -1561,11 +1563,31 @@ static int handle_key(EditorCore *core, unsigned long key)
         reset_command(core);
         return 1;
     }
-    if (!key || key > EDITOR_KEY_END ||
+    if (!key || key > EDITOR_KEY_PAGE_DOWN ||
         (key > 0x10FFFF && key < EDITOR_KEY_DELETE) || (key >= 0xD800 && key <= 0xDFFF))
         return 0;
     if (core->mode == EDITOR_MODE_COMMAND_LINE)
         return 1;
+    if (key == EDITOR_KEY_PAGE_UP || key == EDITOR_KEY_PAGE_DOWN ||
+        ((core->mode == EDITOR_MODE_COMMAND || is_visual(core)) &&
+            (key == 2 || key == 6 || key == 4 || key == 21))) {
+        EditorCaret caret;
+        size_t lines;
+        editor_core_send(core, EDITOR_GET_CARET, &caret);
+        editor_core_send(core, EDITOR_GET_LINE_COUNT, &lines);
+        size_t rows = key == 4 || key == 21 ? core->page_lines / 2 :
+            core->page_lines > 2 ? core->page_lines - 2 : 1;
+        if (!rows)
+            rows = 1;
+        size_t count = core->count ? core->count : 1;
+        size_t distance = count > SIZE_MAX / rows ? SIZE_MAX : rows * count;
+        if (key == EDITOR_KEY_PAGE_UP || key == 2 || key == 21)
+            caret.line = distance > caret.line ? 0 : caret.line - distance;
+        else
+            caret.line += distance > lines - 1 - caret.line ? lines - 1 - caret.line : distance;
+        reset_command(core);
+        return editor_core_send(core, EDITOR_SET_CARET, &caret);
+    }
     if (core->mode == EDITOR_MODE_REPLACE) {
         if (key == '\b') {
             if (!core->replace_count)
@@ -2019,8 +2041,9 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
                 return activate_directory_entry(core);
             if (key == '-' || key == 8)
                 return open_directory(core, "..");
-            if (key < EDITOR_KEY_LEFT || key > EDITOR_KEY_END) {
+                if (key < EDITOR_KEY_LEFT || key > EDITOR_KEY_PAGE_DOWN) {
                 if (key != 27 && key != ':' && key != '/' &&
+                    key != 2 && key != 6 && key != 4 && key != 21 &&
                     !(key > 0 && key < 128 && strchr("0123456789hjklwbeWBE^$gGtTnN*", (int)key)))
                     return 0;
             }
@@ -2287,6 +2310,11 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
         *(size_t *)data = count;
         return 1;
     }
+    case EDITOR_SET_PAGE_SIZE:
+        if (!data || !*(const size_t *)data)
+            return 0;
+        core->page_lines = *(const size_t *)data;
+        return 1;
     case EDITOR_GET_POSITION: {
         if (!data)
             return 0;
@@ -2386,7 +2414,7 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
             (message >= EDITOR_MOVE_LEFT && message <= EDITOR_MOVE_END) ||
             (message == EDITOR_HANDLE_KEY && data &&
                 *(const unsigned long *)data >= EDITOR_KEY_LEFT &&
-                *(const unsigned long *)data <= EDITOR_KEY_END);
+                *(const unsigned long *)data <= EDITOR_KEY_PAGE_DOWN);
         int session_navigation = navigation &&
             (core->mode == EDITOR_MODE_INSERT || core->mode == EDITOR_MODE_REPLACE);
         if (session_navigation && core->change_length) {
@@ -2420,7 +2448,7 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
             break;
         case EDITOR_HANDLE_KEY:
             if (data && *(const unsigned long *)data >= EDITOR_KEY_LEFT &&
-                *(const unsigned long *)data <= EDITOR_KEY_END)
+                *(const unsigned long *)data <= EDITOR_KEY_PAGE_DOWN)
                 core->history_open = 0;
             break;
         default: break;

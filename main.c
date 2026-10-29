@@ -10,6 +10,8 @@
 #include "editor_core.h"
 #include "lexer.h"
 
+static UINT legacy_wheel_message;
+
 typedef struct SyntaxLine {
     LexerLine parsed;
     size_t version;
@@ -59,10 +61,12 @@ typedef struct EditorControl {
     int back_width;
     int back_height;
     HFONT font;
+    int font_points;
     int line_height;
     int text_left;
     size_t first_line;
     int left_pixel;
+    int wheel_delta;
     char pending_lead;
     CachedLine *lines;
     size_t line_count;
@@ -373,6 +377,8 @@ static void update_editor_caret(HWND window, EditorControl *editor)
     int visible_lines = (rect.bottom - 16) / editor->line_height;
     if (visible_lines < 1)
         visible_lines = 1;
+    size_t page_lines = (size_t)visible_lines;
+    editor_core_send(editor->core, EDITOR_SET_PAGE_SIZE, &page_lines);
     if (caret.line < editor->first_line)
         editor->first_line = caret.line;
     else if (caret.line - editor->first_line >= (size_t)visible_lines)
@@ -502,7 +508,7 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
                     wsprintfA(number, "%5lu", (unsigned long)(index + 1));
                 TextOutA(dc, 8, top, number, 5);
                 IntersectClipRect(dc, editor->text_left, top, width - 8, dirty.bottom);
-                SetTextColor(dc, RGB(255, 0, 0));
+                SetTextColor(dc, RGB(225, 225, 225));
                 layout_editor_line(dc, editor, index, line.length, top, 1, 0, NULL);
                 if (caret.active) {
                     int offset = layout_editor_line(dc, editor, index, caret.column, 0, 0, 0, NULL);
@@ -547,33 +553,89 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
     editor->bitmap_valid = buffered && editor->line_count == rows;
 }
 
+static int send_editor_key(EditorControl *editor, unsigned long key)
+{
+    EditorMode mode;
+    editor_core_send(editor->core, EDITOR_GET_MODE, &mode);
+    int paging = key == EDITOR_KEY_PAGE_UP || key == EDITOR_KEY_PAGE_DOWN ||
+        ((mode == EDITOR_MODE_COMMAND || mode == EDITOR_MODE_VISUAL ||
+            mode == EDITOR_MODE_VISUAL_LINE || mode == EDITOR_MODE_VISUAL_BLOCK) &&
+            (key == 2 || key == 6 || key == 4 || key == 21));
+    EditorCaret before;
+    if (paging)
+        editor_core_send(editor->core, EDITOR_GET_CARET, &before);
+    int success = editor_core_send(editor->core, EDITOR_HANDLE_KEY, &key);
+    if (success && paging) {
+        EditorCaret after;
+        editor_core_send(editor->core, EDITOR_GET_CARET, &after);
+        if (after.line >= before.line) {
+            editor->first_line += after.line - before.line;
+        } else {
+            size_t distance = before.line - after.line;
+            editor->first_line = distance > editor->first_line ? 0 : editor->first_line - distance;
+        }
+    }
+    return success;
+}
+
+static int set_editor_font(HWND window, EditorControl *editor, int points)
+{
+    HDC dc = GetDC(window);
+    HFONT font = CreateFontA(-MulDiv(points, GetDeviceCaps(dc, LOGPIXELSY), 72),
+        0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, FIXED_PITCH, "Courier New");
+    if (!font && editor->font) {
+        ReleaseDC(window, dc);
+        return 0;
+    }
+    if (!font)
+        font = (HFONT)GetStockObject(SYSTEM_FIXED_FONT);
+    HGDIOBJ old_font = SelectObject(dc, font);
+    TEXTMETRICA metrics;
+    GetTextMetricsA(dc, &metrics);
+    SIZE number_size = { 0, 0 };
+    GetTextExtentPoint32A(dc, "00000", 5, &number_size);
+    SelectObject(dc, old_font);
+    ReleaseDC(window, dc);
+    HFONT previous = editor->font;
+    editor->font = font;
+    editor->font_points = points;
+    editor->line_height = metrics.tmHeight + metrics.tmExternalLeading;
+    if (editor->line_height < 1)
+        editor->line_height = 1;
+    editor->text_left = 8 + number_size.cx + 16;
+    editor->bitmap_valid = 0;
+    editor->pending_lead = 0;
+    SendMessageA(GetDlgItem(GetParent(window), ID_COMMAND_LINE), WM_SETFONT, (WPARAM)font, TRUE);
+    if (previous && previous != (HFONT)GetStockObject(SYSTEM_FIXED_FONT))
+        DeleteObject(previous);
+    if (GetFocus() == window) {
+        DestroyCaret();
+        CreateCaret(window, NULL, 2, editor->line_height);
+        ShowCaret(window);
+    }
+    return 1;
+}
+
 LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     EditorControl *editor = (EditorControl *)GetWindowLongPtrA(hWnd, GWLP_USERDATA);
+    if (legacy_wheel_message && msg == legacy_wheel_message) {
+        msg = WM_MOUSEWHEEL;
+        wp = MAKEWPARAM(0, (WORD)(short)wp);
+    }
 
     switch (msg) {
     case WM_CREATE: {
+        if (!legacy_wheel_message)
+            legacy_wheel_message = RegisterWindowMessageA("MSWHEEL_ROLLMSG");
         editor = calloc(1, sizeof(*editor));
         if (!editor)
             return -1;
         editor->core = ((LPCREATESTRUCTA)lp)->lpCreateParams;
         SetWindowLongPtrA(hWnd, GWLP_USERDATA, (LONG_PTR)editor);
-        HDC dc = GetDC(hWnd);
-        editor->font = CreateFontA(-MulDiv(18, GetDeviceCaps(dc, LOGPIXELSY), 72),
-            0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY, FIXED_PITCH, "Courier New");
-        if (!editor->font)
-            editor->font = (HFONT)GetStockObject(SYSTEM_FIXED_FONT);
-        HGDIOBJ old_font = SelectObject(dc, editor->font);
-        TEXTMETRICA metrics;
-        GetTextMetricsA(dc, &metrics);
-        editor->line_height = metrics.tmHeight + metrics.tmExternalLeading;
-        SIZE number_size = { 0, 0 };
-        GetTextExtentPoint32A(dc, "00000", 5, &number_size);
-        editor->text_left = 8 + number_size.cx + 16;
-        SelectObject(dc, old_font);
-        ReleaseDC(hWnd, dc);
+        set_editor_font(hWnd, editor, 18);
         return 0;
     }
     case WM_GETDLGCODE:
@@ -602,6 +664,55 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (editor)
             update_editor_caret(hWnd, editor);
         return 0;
+    case WM_MOUSEWHEEL: {
+        if (!editor)
+            return 0;
+        editor->wheel_delta += (short)HIWORD(wp);
+        int notches = editor->wheel_delta / WHEEL_DELTA;
+        editor->wheel_delta %= WHEEL_DELTA;
+        if (!notches)
+            return 0;
+        UINT scroll_lines = 3;
+        if (!SystemParametersInfoA(SPI_GETWHEELSCROLLLINES, 0, &scroll_lines, 0))
+            scroll_lines = 3;
+        if (!scroll_lines)
+            return 0;
+        RECT rect;
+        GetClientRect(hWnd, &rect);
+        int visible_lines = (rect.bottom - 16) / editor->line_height;
+        size_t page_lines = visible_lines > 0 ? (size_t)visible_lines : 1;
+        size_t rows = scroll_lines == WHEEL_PAGESCROLL ? page_lines : (size_t)scroll_lines;
+        size_t steps = (size_t)(notches < 0 ? -notches : notches);
+        size_t distance = steps > (size_t)-1 / rows ? (size_t)-1 : steps * rows;
+        size_t count;
+        editor_core_send(editor->core, EDITOR_GET_LINE_COUNT, &count);
+        size_t last = count > page_lines ? count - page_lines : 0;
+        size_t first = editor->first_line > last ? last : editor->first_line;
+        if (notches > 0)
+            first = distance > first ? 0 : first - distance;
+        else
+            first += distance > last - first ? last - first : distance;
+        if (first == editor->first_line)
+            return 0;
+        editor->first_line = first;
+        if (GetFocus() == hWnd) {
+            EditorCaret caret;
+            editor_core_send(editor->core, EDITOR_GET_CARET, &caret);
+            if (caret.line < first || caret.line - first >= page_lines) {
+                SetCaretPos(-2, -editor->line_height);
+            } else {
+                HDC dc = GetDC(hWnd);
+                HGDIOBJ old_font = SelectObject(dc, editor->font);
+                int width = layout_editor_line(dc, editor, caret.line, caret.column, 0, 0, 0, NULL);
+                SelectObject(dc, old_font);
+                ReleaseDC(hWnd, dc);
+                SetCaretPos(editor->text_left + width - editor->left_pixel,
+                    8 + (int)(caret.line - first) * editor->line_height);
+            }
+        }
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+    }
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         editor->pending_lead = 0;
@@ -637,6 +748,20 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_KEYDOWN: {
+        if (GetKeyState(VK_CONTROL) < 0 &&
+            (wp == VK_OEM_PLUS || wp == VK_ADD || wp == VK_OEM_MINUS || wp == VK_SUBTRACT)) {
+            int direction = wp == VK_OEM_PLUS || wp == VK_ADD ? 1 : -1;
+            int points = editor->font_points + direction * (int)LOWORD(lp);
+            if (points < 6)
+                points = 6;
+            if (points > 72)
+                points = 72;
+            if (points != editor->font_points && !set_editor_font(hWnd, editor, points))
+                MessageBeep(MB_ICONWARNING);
+            SendMessageA(GetParent(hWnd), WM_SIZE, 0, 0);
+            update_editor_caret(hWnd, editor);
+            return 0;
+        }
         unsigned long key;
         switch (wp) {
         case VK_ESCAPE: key = 27; break;
@@ -647,15 +772,20 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case VK_DOWN: key = EDITOR_KEY_DOWN; break;
         case VK_HOME: key = EDITOR_KEY_HOME; break;
         case VK_END: key = EDITOR_KEY_END; break;
+        case VK_PRIOR: key = EDITOR_KEY_PAGE_UP; break;
+        case VK_NEXT: key = EDITOR_KEY_PAGE_DOWN; break;
         default: return DefWindowProcA(hWnd, msg, wp, lp);
         }
         editor->pending_lead = 0;
         for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat)
-            editor_core_send(editor->core, EDITOR_HANDLE_KEY, &key);
+            send_editor_key(editor, key);
         update_editor_caret(hWnd, editor);
         return 0;
     }
     case WM_CHAR: {
+        if (GetKeyState(VK_CONTROL) < 0 &&
+            (wp == '+' || wp == '=' || wp == '-' || wp == '_' || wp == 0 || wp == 29 || wp == 31))
+            return 0;
         if (wp >= ' ' && wp != 127) {
             if (!dispatch_ansi_key(editor, wp, LOWORD(lp)))
                 MessageBeep(MB_ICONWARNING);
@@ -665,7 +795,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         editor->pending_lead = 0;
         unsigned long key = (unsigned long)wp;
         for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat) {
-            if (!editor_core_send(editor->core, EDITOR_HANDLE_KEY, &key)) {
+            if (!send_editor_key(editor, key)) {
                 MessageBeep(MB_ICONWARNING);
                 break;
             }
@@ -1383,6 +1513,8 @@ static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM 
 
 LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (legacy_wheel_message && msg == legacy_wheel_message)
+        return SendMessageA(GetDlgItem(hWnd, ID_EDITOR), msg, wp, lp);
     MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(hWnd, GWLP_USERDATA);
     switch (msg) {
     case WM_CREATE: {
@@ -1585,6 +1717,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_MOUSEWHEEL:
+        return SendMessageA(GetDlgItem(hWnd, ID_EDITOR), msg, wp, lp);
     case WM_SETFOCUS:
         SetFocus(GetDlgItem(hWnd, state && state->command_active ? ID_COMMAND_LINE : ID_EDITOR));
         return 0;

@@ -36,7 +36,9 @@ typedef enum EditorKey {
     EDITOR_KEY_UP,
     EDITOR_KEY_DOWN,
     EDITOR_KEY_HOME,
-    EDITOR_KEY_END
+    EDITOR_KEY_END,
+    EDITOR_KEY_PAGE_UP,
+    EDITOR_KEY_PAGE_DOWN
 } EditorKey;
 
 typedef enum EditorMessage {
@@ -86,7 +88,8 @@ typedef enum EditorMessage {
     EDITOR_TAKE_DIRECTORY_CHANGE,
     EDITOR_GET_LINE_ENDING,
     EDITOR_GET_TEXT_BUFFER,
-    EDITOR_GET_POSITION
+    EDITOR_GET_POSITION,
+    EDITOR_SET_PAGE_SIZE
 } EditorMessage;
 
 typedef struct EditorPosition {

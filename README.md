@@ -177,6 +177,11 @@ the system selection colors.
 | Keys | Action |
 | --- | --- |
 | `h/j/k/l`, arrow keys | Move left/down/up/right |
+| Mouse wheel | Scroll the viewport up/down without moving the caret; uses the Windows wheel-scroll setting |
+| Page Up, Page Down | Move and scroll one page up/down; also works in insert/replace mode |
+| Ctrl+B, Ctrl+F in command/visual mode | Move and scroll one full page backward/forward |
+| Ctrl+U, Ctrl+D in command/visual mode | Move and scroll half a page up/down |
+| Ctrl+plus, Ctrl+minus | Increase/decrease displayed font size by one point; numpad plus/minus also work |
 | `a` in command mode | Enter insert mode after the current character, staying on the same line |
 | `A` (Shift+A) in command mode | Enter insert mode at the end of the current line |
 | `w`, `b` | Move to the next/previous word; ASCII punctuation forms separate words |
@@ -217,6 +222,26 @@ nonzero digit extends a count, e.g. `10j`. Counts are overflow-checked, and moti
 at document boundaries stops without looping through the remaining count.
 `d` and `y` wait for a motion or a second matching key; unsupported continuations
 cancel the pending operator. Counts do not repeat insert/replace-mode sessions.
+
+Paging uses the current visible text height. Full-page moves retain two lines
+of overlap when possible; half-page moves advance at least one line. Counts
+multiply the paging distance, and movement stops at the buffer boundaries.
+Visual selections extend with paging, and read-only directory listings support
+the same paging keys. Page Up/Down in insert or replace mode keeps that mode.
+
+Font zoom starts at 18 points and is limited to 6 through 72 points. Ctrl+= also
+zooms in without requiring Shift on keyboards where plus shares the equals key.
+Zoom updates text, the line-number gutter, caret, command-input font, and page
+height. It affects the shared editor view across buffers, not document bytes,
+modified state, or undo history.
+
+Mouse-wheel scrolling respects Windows' lines-per-notch or one-page setting
+and accumulates partial wheel deltas for high-resolution wheels. It stops at
+the first/last page and leaves the caret, selection, editing mode, and document
+unchanged. If the caret scrolls offscreen, it is not drawn until visible again;
+keyboard navigation brings it back into view. Win95 wheel drivers using the
+registered `MSWHEEL_ROLLMSG` message are supported, with a three-line fallback
+when Windows does not provide a wheel-scroll setting.
 
 `.` repeats keyboard changes such as `x`, `dw`, `dd`, `r`, paste, and completed
 insert/replace sessions. Motions, searches, yanks, undo/redo, and empty insert
@@ -390,6 +415,7 @@ allocation failure. Failed edits leave the document unchanged.
 | Message | Data |
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
+| `EDITOR_SET_PAGE_SIZE` | `const size_t *` containing the positive number of fully visible text rows; hosts update it after resizing/zooming, default 20 |
 | `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/replace/visual/visual-line/visual-block/command-line mode |
 | `EDITOR_GET_STATUS` | `EditorStatus *` receiving the current no-change, invalid-command, pattern-not-found, or no-previous-search status, or `EDITOR_STATUS_NONE`, without clearing it |
 | `EDITOR_GET_COMMAND_PREFIX` | `char *` receiving `:` for settings/commands or `/` for search input |
