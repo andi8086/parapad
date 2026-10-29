@@ -21,6 +21,7 @@
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
 #define WM_EDITOR_REFRESH (WM_APP + 3)
+#define WM_EDITOR_SWITCH_BUFFER (WM_APP + 4)
 
 typedef struct CachedLine {
     char *text;
@@ -67,6 +68,7 @@ typedef struct MainWindowState {
     size_t active_buffer;
     WNDPROC command_proc;
     int command_active;
+    const char *command_error;
 } MainWindowState;
 
 static int character_to_ansi(unsigned long value, char *text, int capacity)
@@ -192,6 +194,11 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
 
 static void update_editor_caret(HWND window, EditorControl *editor)
 {
+    EditorBufferSwitch request;
+    if (editor_core_send(editor->core, EDITOR_TAKE_BUFFER_SWITCH, &request) && request.count) {
+        SendMessageA(GetParent(window), WM_EDITOR_SWITCH_BUFFER, 0, (LPARAM)&request);
+        return;
+    }
     EditorMode mode;
     editor_core_send(editor->core, EDITOR_GET_MODE, &mode);
     EditorStatus status;
@@ -688,14 +695,10 @@ static int choose_file(HWND window, char *path, int save)
     return result != FALSE;
 }
 
-static int save_document(HWND window, MainWindowState *state, int save_as)
+static int write_document(HWND window, MainWindowState *state, const char *path)
 {
-    char path[MAX_PATH];
     TextBuffer *buffer = state->buffers[state->active_buffer];
-    lstrcpynA(path, buffer->path, MAX_PATH);
-    if ((save_as || !path[0]) && !choose_file(window, path, 1))
-        return 0;
-    if (!editor_core_send(state->core, EDITOR_SAVE_FILE, path)) {
+    if (!editor_core_send(state->core, EDITOR_SAVE_FILE, (void *)path)) {
         MessageBoxA(window, "The file could not be saved. Check the path, permissions, and available disk space.",
             "parapad", MB_OK | MB_ICONERROR);
         return 0;
@@ -710,6 +713,15 @@ static int save_document(HWND window, MainWindowState *state, int save_as)
     InvalidateRect(list, NULL, FALSE);
     update_document_title(window, state);
     return 1;
+}
+
+static int save_document(HWND window, MainWindowState *state, int save_as)
+{
+    char path[MAX_PATH];
+    lstrcpynA(path, state->buffers[state->active_buffer]->path, MAX_PATH);
+    if ((save_as || !path[0]) && !choose_file(window, path, 1))
+        return 0;
+    return write_document(window, state, path);
 }
 
 static int confirm_document_close(HWND window, MainWindowState *state)
@@ -727,14 +739,16 @@ static int confirm_document_close(HWND window, MainWindowState *state)
     return answer != IDYES || save_document(window, state, 0);
 }
 
-static void close_document(HWND window, MainWindowState *state)
+static int remove_document(HWND window, MainWindowState *state, int quit_last)
 {
-    if (!confirm_document_close(window, state))
-        return;
+    if (quit_last && state->buffer_count == 1) {
+        DestroyWindow(window);
+        return 1;
+    }
     size_t closing = state->active_buffer;
     if (state->buffer_count == 1) {
         if (!open_document(window, state, NULL))
-            return;
+            return 0;
     } else {
         activate_document(window, state, closing + 1 < state->buffer_count ? closing + 1 : closing - 1);
     }
@@ -749,6 +763,13 @@ static void close_document(HWND window, MainWindowState *state)
     free(buffer);
     SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
     InvalidateRect(GetDlgItem(window, ID_BUFFER_LIST), NULL, FALSE);
+    return 1;
+}
+
+static void close_document(HWND window, MainWindowState *state)
+{
+    if (confirm_document_close(window, state))
+        remove_document(window, state, 0);
 }
 
 static void layout_main_children(HWND window)
@@ -816,6 +837,119 @@ static int execute_ansi_command(EditorCore *core, const char *text)
     return editor_core_send(core, EDITOR_EXECUTE_COMMAND, utf8);
 }
 
+static int window_command_error(MainWindowState *state, const char *message)
+{
+    state->command_error = message;
+    return 0;
+}
+
+static int execute_window_command(HWND window, MainWindowState *state, const char *text)
+{
+    state->command_error = NULL;
+    char prefix;
+    editor_core_send(state->core, EDITOR_GET_COMMAND_PREFIX, &prefix);
+    if (prefix != ':')
+        return execute_ansi_command(state->core, text);
+    const char *position = text;
+    while (*position == ' ' || *position == '\t')
+        ++position;
+    if (*position == ':')
+        ++position;
+    while (*position == ' ' || *position == '\t')
+        ++position;
+    const char *start = position;
+    while (*position && *position != ' ' && *position != '\t')
+        ++position;
+    size_t length = (size_t)(position - start);
+    char name[8];
+    if (!length || length >= sizeof(name))
+        return execute_ansi_command(state->core, text);
+    memcpy(name, start, length);
+    name[length] = 0;
+    if (strcmp(name, "tabe") && strcmp(name, "n") && strcmp(name, "w") &&
+        strcmp(name, "q") && strcmp(name, "q!") && strcmp(name, "qa") && strcmp(name, "qa!"))
+        return execute_ansi_command(state->core, text);
+    while (*position == ' ' || *position == '\t')
+        ++position;
+    const char *end = position + strlen(position);
+    while (end > position && (end[-1] == ' ' || end[-1] == '\t'))
+        --end;
+    int has_argument = end != position;
+    char path[MAX_PATH] = "";
+    if (has_argument) {
+        if (strcmp(name, "tabe") && strcmp(name, "w"))
+            return window_command_error(state, "invalid command arguments");
+        if (*position == '"') {
+            if (end - position < 2 || end[-1] != '"')
+                return window_command_error(state, "invalid file name");
+            ++position;
+            --end;
+        }
+        length = (size_t)(end - position);
+        if (!length || length >= MAX_PATH)
+            return window_command_error(state, "invalid file name");
+        char argument[MAX_PATH];
+        memcpy(argument, position, length);
+        argument[length] = 0;
+        DWORD copied = GetFullPathNameA(argument, MAX_PATH, path, NULL);
+        if (!copied || copied >= MAX_PATH)
+            return window_command_error(state, "invalid file name");
+    }
+    if (!strcmp(name, "tabe")) {
+        if (has_argument && GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES &&
+            GetLastError() == ERROR_FILE_NOT_FOUND) {
+            TextBuffer *buffer = create_document(NULL);
+            if (!buffer)
+                return window_command_error(state, "not enough memory");
+            lstrcpynA(buffer->path, path, MAX_PATH);
+            if (add_document(window, state, buffer))
+                return 1;
+            editor_core_destroy(buffer->core);
+            free(buffer);
+            return window_command_error(state, "not enough memory");
+        }
+        if (!open_document(window, state, has_argument ? path : NULL))
+            return window_command_error(state, "file could not be opened");
+        return 1;
+    }
+    if (!strcmp(name, "n")) {
+        activate_document(window, state, (state->active_buffer + 1) % state->buffer_count);
+        return 1;
+    }
+    if (!strcmp(name, "w")) {
+        const char *current = state->buffers[state->active_buffer]->path;
+        if (!has_argument) {
+            if (!*current)
+                return window_command_error(state, "no file name; use :w <file>");
+            lstrcpynA(path, current, MAX_PATH);
+        } else if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES && lstrcmpiA(path, current)) {
+            return window_command_error(state, "file already exists");
+        }
+        if (!write_document(window, state, path))
+            return window_command_error(state, "file could not be saved");
+        unsigned long escape = 27;
+        return editor_core_send(state->core, EDITOR_HANDLE_KEY, &escape);
+    }
+    int all = name[1] == 'a';
+    int force = name[strlen(name) - 1] == '!';
+    if (!force) {
+        size_t first = all ? 0 : state->active_buffer;
+        size_t limit = all ? state->buffer_count : first + 1;
+        for (size_t index = first; index < limit; ++index) {
+            int modified = 0;
+            editor_core_send(state->buffers[index]->core, EDITOR_GET_MODIFIED, &modified);
+            if (modified)
+                return window_command_error(state, all ?
+                    "unsaved changes; use :qa! to discard" : "unsaved changes; use :q! to discard");
+        }
+    }
+    if (all) {
+        DestroyWindow(window);
+        return 1;
+    }
+    return remove_document(window, state, 1);
+}
+
 static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 {
     HWND parent = GetParent(window);
@@ -844,8 +978,10 @@ static LRESULT CALLBACK command_line_wnd_proc(HWND window, UINT message, WPARAM 
                 success = editor_core_send(state->core, EDITOR_EXECUTE_COMMAND, NULL);
             } else {
                 GetWindowTextA(window, text, sizeof(text));
-                success = execute_ansi_command(state->core, text);
+                success = execute_window_command(parent, state, text);
             }
+            if (!IsWindow(parent))
+                return 0;
             if (!success)
                 MessageBeep(MB_ICONWARNING);
         }
@@ -929,6 +1065,23 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         layout_main_children(hWnd);
         return 0;
+    case WM_EDITOR_SWITCH_BUFFER: {
+        const EditorBufferSwitch *request = (const EditorBufferSwitch *)lp;
+        if (!state || !request || !request->count || !state->buffer_count)
+            return 0;
+        size_t index;
+        if (request->absolute) {
+            if (request->count > state->buffer_count)
+                return 0;
+            index = request->count - 1;
+        } else {
+            size_t offset = request->count % state->buffer_count;
+            index = (state->active_buffer + (request->backwards ? state->buffer_count - offset : offset)) %
+                state->buffer_count;
+        }
+        activate_document(hWnd, state, index);
+        return 0;
+    }
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT *item = (MEASUREITEMSTRUCT *)lp;
         if (item->CtlID != ID_BUFFER_LIST)
@@ -977,6 +1130,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     }
     case WM_EDITOR_MODE_CHANGED: {
+        if ((EditorMode)wp != EDITOR_MODE_COMMAND_LINE)
+            state->command_error = NULL;
         RECT item_rect;
         HWND list = GetDlgItem(hWnd, ID_BUFFER_LIST);
         if (SendMessageA(list, LB_GETITEMRECT, (WPARAM)state->active_buffer, (LPARAM)&item_rect) != LB_ERR)
@@ -1004,6 +1159,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             mode_text = "pattern not found";
         else if ((EditorStatus)lp == EDITOR_STATUS_NO_PREVIOUS_SEARCH)
             mode_text = "no previous search";
+        if (state->command_error)
+            mode_text = state->command_error;
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
             (LPARAM)mode_text);
         HWND command = GetDlgItem(hWnd, ID_COMMAND_LINE);

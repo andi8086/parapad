@@ -1275,8 +1275,36 @@ static void test_repeat_change(void)
     editor_core_destroy(core);
 }
 
+static void test_buffer_switch_commands(void)
+{
+    EditorCore *core = editor_core_create("one\ntwo");
+    assert(core);
+    EditorBufferSwitch request;
+    assert(editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, &request) && !request.count);
+    send_keys(core, "gt");
+    assert(!editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, NULL));
+    assert(editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, &request));
+    assert(request.count == 1 && !request.backwards && !request.absolute);
+    assert(editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, &request) && !request.count);
+    send_keys(core, "3gT");
+    assert(editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, &request));
+    assert(request.count == 3 && request.backwards && !request.absolute);
+    send_keys(core, "2gt");
+    assert(editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, &request));
+    assert(request.count == 2 && !request.backwards && request.absolute);
+    send_keys(core, "Ggg");
+    expect_caret(core, 0, 0);
+    send_keys(core, "igtgT\033");
+    expect_line(core, 0, "gtgTone");
+    assert(editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, &request) && !request.count);
+    send_keys(core, "vgT\033");
+    assert(editor_core_send(core, EDITOR_TAKE_BUFFER_SWITCH, &request) && !request.count);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_buffer_switch_commands();
     test_repeat_change();
     test_first_nonblank_and_word_search();
     test_search_backwards();

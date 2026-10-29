@@ -36,6 +36,7 @@ struct EditorCore {
     char *search_text;
     size_t search_length;
     int search_whole_word;
+    EditorBufferSwitch buffer_switch;
     unsigned long *change_keys;
     size_t change_length;
     size_t change_capacity;
@@ -579,6 +580,7 @@ static void reset_document(EditorCore *core)
     core->history_open = core->history_changed = 0;
     core->change_length = 0;
     core->change_dirty = 0;
+    core->buffer_switch.count = 0;
     clear_replace_history(core);
     core->block_insert = 0;
     core->cursor = 0;
@@ -1298,6 +1300,11 @@ static int handle_key(EditorCore *core, unsigned long key)
         count *= core->operator_count ? core->operator_count : 1;
         reset_command(core);
         if (pending == 'g') {
+            if ((key == 't' || key == 'T') && core->mode == EDITOR_MODE_COMMAND) {
+                core->buffer_switch.count = count;
+                core->buffer_switch.backwards = key == 'T';
+                core->buffer_switch.absolute = key == 't' && motion_counted;
+            }
             if (key == 'g')
                 goto_line(core, count);
             if (core->mode == EDITOR_MODE_VISUAL_BLOCK) {
@@ -1646,6 +1653,12 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     default: break;
     }
     switch (message) {
+    case EDITOR_TAKE_BUFFER_SWITCH:
+        if (!data)
+            return 0;
+        *(EditorBufferSwitch *)data = core->buffer_switch;
+        core->buffer_switch.count = 0;
+        return 1;
     case EDITOR_GET_COMMAND_PREFIX:
         if (!data)
             return 0;

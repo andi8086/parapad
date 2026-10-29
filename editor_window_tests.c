@@ -96,8 +96,172 @@ static void expect_active_border(HWND window, MainWindowState *state)
     DeleteDC(dc);
 }
 
+static void window_command(HWND window, const char *text)
+{
+    MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(window, GWLP_USERDATA);
+    if (!state->command_active)
+        window_keys(window, ":");
+    assert(state->command_active);
+    char input[1024];
+    wsprintfA(input, ":%s", text);
+    HWND command = GetDlgItem(window, ID_COMMAND_LINE);
+    assert(SetWindowTextA(command, input));
+    SendMessageA(command, WM_CHAR, '\r', 1);
+}
+
+static void expect_command_error(HWND window, const char *text)
+{
+    MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(window, GWLP_USERDATA);
+    assert(state->command_active);
+    char actual[256];
+    SendMessageA(GetDlgItem(window, ID_STATUS), SB_GETTEXTA, 0, (LPARAM)actual);
+    assert(strcmp(actual, text) == 0);
+}
+
+static HWND create_command_test_window(const char *class_name)
+{
+    HWND window = CreateWindowA(class_name, "", WS_OVERLAPPEDWINDOW,
+        0, 0, 800, 480, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    assert(window);
+    return window;
+}
+
+static void test_window_commands(const char *class_name)
+{
+    HWND window = create_command_test_window(class_name);
+    MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(window, GWLP_USERDATA);
+    int before_dialogs = dialog_count;
+    window_keys(window, "iA\033");
+    window_command(window, "tabe");
+    assert(state->buffer_count == 2 && state->active_buffer == 1 && !state->command_active);
+    window_keys(window, "iB\033");
+    window_command(window, "tabe");
+    window_keys(window, "iC\033gt");
+    assert(state->buffer_count == 3 && state->active_buffer == 0);
+    window_keys(window, "gT");
+    assert(state->active_buffer == 2);
+    window_keys(window, "2gt");
+    assert(state->active_buffer == 1);
+    window_keys(window, "2gT");
+    assert(state->active_buffer == 2);
+    window_keys(window, "gt3gt99gt999999999gT");
+    assert(state->active_buffer == 2);
+    window_command(window, "n");
+    assert(state->active_buffer == 0 && !state->command_active);
+    window_keys(window, "n");
+    assert(state->active_buffer == 0);
+    window_command(window, "n");
+    assert(state->active_buffer == 1);
+    window_command(window, "n extra");
+    expect_command_error(window, "invalid command arguments");
+    window_command(window, "tabe \"unterminated");
+    expect_command_error(window, "invalid file name");
+
+    char directory[MAX_PATH];
+    char paths[3][MAX_PATH];
+    assert(GetTempPathA(MAX_PATH, directory));
+    for (int index = 0; index < 3; ++index)
+        assert(GetTempFileNameA(directory, "ppc", 0, paths[index]));
+    char spaced[MAX_PATH + 16];
+    wsprintfA(spaced, "%s spaced.txt", paths[0]);
+    assert(strlen(spaced) < MAX_PATH && MoveFileA(paths[0], spaced));
+    lstrcpynA(paths[0], spaced, MAX_PATH);
+    assert(DeleteFileA(paths[1]) && DeleteFileA(paths[2]));
+    const unsigned char raw[] = { 'A', 0, 0xFF, '\r', '\n', 'B' };
+    HANDLE file = CreateFileA(paths[0], GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    assert(file != INVALID_HANDLE_VALUE);
+    DWORD written;
+    assert(WriteFile(file, raw, sizeof(raw), &written, NULL) && written == sizeof(raw));
+    assert(CloseHandle(file));
+    char command[MAX_PATH + 16];
+    wsprintfA(command, "tabe \"%s\"", paths[0]);
+    window_command(window, command);
+    assert(state->buffer_count == 4 && state->active_buffer == 3 && !state->command_active);
+    expect_window_buffer(state->core, raw, sizeof(raw));
+    window_keys(window, "iX\033");
+    window_command(window, "w");
+    assert(!state->command_active);
+    const unsigned char changed[] = { 'X', 'A', 0, 0xFF, '\r', '\n', 'B' };
+    expect_saved_file(paths[0], changed, sizeof(changed));
+    window_command(window, "q");
+    assert(state->buffer_count == 3 && state->active_buffer == 2);
+    expect_window_buffer(state->core, "C", 1);
+    window_command(window, "q");
+    expect_command_error(window, "unsaved changes; use :q! to discard");
+    window_command(window, "qa");
+    expect_command_error(window, "unsaved changes; use :qa! to discard");
+    assert(state->buffer_count == 3 && state->active_buffer == 2);
+    window_command(window, "w");
+    expect_command_error(window, "no file name; use :w <file>");
+    window_command(window, "q! extra");
+    expect_command_error(window, "invalid command arguments");
+    window_command(window, "qa! extra");
+    expect_command_error(window, "invalid command arguments");
+    window_command(window, "tabe \"\"");
+    expect_command_error(window, "invalid file name");
+    wsprintfA(command, "w \"%s\"", paths[1]);
+    window_command(window, command);
+    assert(!state->command_active);
+    expect_saved_file(paths[1], "C", 1);
+    assert(lstrcmpA(state->buffers[state->active_buffer]->path, paths[1]) == 0);
+    wsprintfA(command, "w \"%s\"", paths[0]);
+    window_command(window, command);
+    expect_command_error(window, "file already exists");
+    expect_saved_file(paths[0], changed, sizeof(changed));
+    window_command(window, "qa");
+    expect_command_error(window, "unsaved changes; use :qa! to discard");
+    window_command(window, "q");
+    assert(state->buffer_count == 2);
+    wsprintfA(command, "tabe \"%s\"", paths[2]);
+    window_command(window, command);
+    assert(state->buffer_count == 3 && !state->command_active);
+    expect_window_buffer(state->core, "", 0);
+    window_command(window, "w");
+    expect_saved_file(paths[2], "", 0);
+    window_keys(window, "iunsaved\033");
+    window_command(window, "q!");
+    assert(state->buffer_count == 2);
+    expect_saved_file(paths[2], "", 0);
+    window_command(window, "qa!");
+    assert(!IsWindow(window));
+
+    window = create_command_test_window(class_name);
+    window_command(window, "q");
+    assert(!IsWindow(window));
+    window = create_command_test_window(class_name);
+    window_keys(window, "ifoo n n\033" "0");
+    window_command(window, "set tabwidth=4");
+    state = (MainWindowState *)GetWindowLongPtrA(window, GWLP_USERDATA);
+    EditorSettings settings;
+    assert(editor_core_send(state->core, EDITOR_GET_SETTINGS, &settings) && settings.tabwidth == 4);
+    window_keys(window, "/");
+    HWND input = GetDlgItem(window, ID_COMMAND_LINE);
+    assert(SetWindowTextA(input, "n"));
+    SendMessageA(input, WM_CHAR, '\r', 1);
+    EditorCaret caret;
+    assert(editor_core_send(state->core, EDITOR_GET_CARET, &caret) && caret.column == 4);
+    window_keys(window, "n");
+    assert(editor_core_send(state->core, EDITOR_GET_CARET, &caret) && caret.column == 6);
+    window_command(window, "n");
+    assert(state->buffer_count == 1);
+    window_command(window, "q!");
+    assert(!IsWindow(window));
+    window = create_command_test_window(class_name);
+    window_command(window, "tabe");
+    window_command(window, "qa");
+    assert(!IsWindow(window));
+    assert(dialog_count == before_dialogs);
+    for (int index = 0; index < 3; ++index)
+        assert(DeleteFileA(paths[index]));
+    MSG message;
+    while (PeekMessageA(&message, NULL, WM_QUIT, WM_QUIT, PM_REMOVE)) {
+    }
+}
+
 int main(void)
 {
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
     HINSTANCE instance = GetModuleHandleA(NULL);
     InitCommonControls();
     WNDCLASSA editor_class = { 0 };
@@ -112,6 +276,7 @@ int main(void)
     assert(RegisterClassA(&main_class));
     dialog_hook = SetWindowsHookExA(WH_CBT, answer_dialog, NULL, GetCurrentThreadId());
     assert(dialog_hook);
+    test_window_commands(main_class.lpszClassName);
     HWND window = CreateWindowA(main_class.lpszClassName, "", WS_OVERLAPPEDWINDOW,
         0, 0, 800, 480, NULL, NULL, instance, NULL);
     assert(window);

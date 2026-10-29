@@ -67,8 +67,15 @@ typedef enum EditorMessage {
     EDITOR_GET_SETTINGS,
     EDITOR_SET_SETTINGS,
     EDITOR_EXECUTE_COMMAND,
-    EDITOR_GET_COMMAND_PREFIX
+    EDITOR_GET_COMMAND_PREFIX,
+    EDITOR_TAKE_BUFFER_SWITCH
 } EditorMessage;
+
+typedef struct EditorBufferSwitch {
+    size_t count;
+    int backwards;
+    int absolute;
+} EditorBufferSwitch;
 
 typedef struct EditorSettings {
     size_t maxcol;
