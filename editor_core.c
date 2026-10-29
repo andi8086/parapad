@@ -127,7 +127,7 @@ static int register_lexer(EditorCore *core, const Lexer *lexer)
     }
     if (core->lexer_count >= SIZE_MAX / sizeof(*core->lexers))
         return 0;
-    const Lexer **lexers = realloc(core->lexers, (core->lexer_count + 1) * sizeof(*lexers));
+    const Lexer **lexers = realloc((void *)core->lexers, (core->lexer_count + 1) * sizeof(*lexers));
     if (!lexers)
         return 0;
     core->lexers = lexers;
@@ -490,20 +490,21 @@ EditorCore *editor_core_create(const char *initial_text)
 
 void editor_core_destroy(EditorCore *core)
 {
-    if (core) {
-    clear_directory(core);
-    free(core->lexers);
-        clear_replace_history(core);
-        free(core->search_text);
-        free(core->change_keys);
-        free(core->last_change);
-        free_history(core->undo);
-        free_history(core->redo);
-        free(core->replace_edits);
-        free(core->register_text);
-        free(core->text);
-        free(core);
+    if (!core) {
+        return;
     }
+    clear_directory(core);
+    free((void *)core->lexers);
+    clear_replace_history(core);
+    free(core->search_text);
+    free(core->change_keys);
+    free(core->last_change);
+    free_history(core->undo);
+    free_history(core->redo);
+    free(core->replace_edits);
+    free(core->register_text);
+    free(core->text);
+    free(core);
 }
 
 typedef struct TextRange {

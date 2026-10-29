@@ -104,7 +104,7 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
     if (!cache)
         return 1;
     const Lexer *lexer = NULL;
-    editor_core_send(core, EDITOR_GET_LEXER, &lexer);
+    editor_core_send(core, EDITOR_GET_LEXER, (void *)&lexer);
     if (cache->lexer != lexer) {
         size_t serial = cache->serial;
         clear_syntax_cache(cache);
