@@ -30,6 +30,7 @@ typedef struct Lexer {
     int (*lex_line)(const char *text, size_t length, const void *state, LexerLine *result);
     int (*states_equal)(const void *left, const void *right);
     void (*free_line)(LexerLine *line);
+    int (*supports_filename)(const char *basename);
 } Lexer;
 
 #endif

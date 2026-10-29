@@ -341,5 +341,5 @@ static int states_equal(const void *left, const void *right)
 }
 
 const Lexer lexer_intel_asm = {
-    "Intel Assembly (Pentium MMX)", supports_extension, lex_line, states_equal, free_line
+    "Intel Assembly (Pentium MMX)", supports_extension, lex_line, states_equal, free_line, NULL
 };

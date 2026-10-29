@@ -54,6 +54,10 @@ for a future hex view, not an implemented hex editor.
 
 Files whose names end in `.c`, `.h`, or `.hpp` (case-insensitive) automatically
 use the C/C++ lexer. `.asm`, `.inc`, and `.s` select the Intel assembly lexer.
+Only `.mk` (case-sensitive) or an exact extensionless basename `Makefile` selects
+the Makefile lexer. Directory names are ignored, including dots in directories;
+`Makefile.txt`, `GNUmakefile`, and unrelated extensionless files do not match.
+`.bat` and `.cmd` (case-insensitive) select the DOS batch lexer.
 Save As switches lexers or disables highlighting when the extension changes;
 unnamed buffers and other extensions keep the existing plain-text colors.
 Keywords are cyan, comments green, strings and character literals yellow,
@@ -63,9 +67,10 @@ light gray on black. Selection colors take precedence.
 `lexer.h` defines a language-neutral descriptor: extension matching, line lexing,
 state comparison, and line cleanup callbacks. Each core registers all built-in
 lexers at creation. `EDITOR_SELECT_LEXER` asks the registered lexers whether they
-support a filename's extension, and `EDITOR_GET_LEXER` returns the selected
-descriptor, or NULL for plain text. Each lexer owns its case-insensitive extension
-checks; the window and renderer contain no language list.
+support a filename's extension or basename, and `EDITOR_GET_LEXER` returns the
+selected descriptor, or NULL for plain text. The optional `supports_filename`
+callback receives only the basename, not its directory. Each lexer owns its
+matching rules; the window and renderer contain no language list.
 
 To add a built-in language, implement a `Lexer` descriptor, add its source to the
 project and its descriptor to `available_lexers` in the core. Hosts can also use
@@ -101,6 +106,21 @@ and MASM delimiter-based multiline `COMMENT` blocks. Labels and other symbols
 retain the ordinary text color. This is highlighting, not operand validation,
 macro expansion, or CPU-feature checking. `.s` is interpreted as Intel syntax,
 not AT&T syntax. Like C/C++, this lexer has no Windows dependency.
+
+`lexer_makefile.c` highlights rule targets, assignment names/operators,
+Make directives, nested `$(...)`/`${...}` and automatic variable expansions,
+comments, and quoted recipe strings. It tracks backslash continuations,
+continued recipes/comments, and `define`/`endef` nesting across lines.
+Recipe recognition uses the standard leading tab. This is a lexical
+highlighter, not a Make evaluator or shell parser; custom `.RECIPEPREFIX`
+settings and variable-generated syntax are not evaluated.
+
+`lexer_batch.c` highlights DOS/Windows command keywords, control words,
+labels, `REM`/`::` comments, redirection and command separators, quoted text,
+numbers, `%NAME%`, positional parameters, FOR variables, `%~` parameter
+modifiers, and delayed `!NAME!` expansions. Caret continuations preserve
+command context. Commands and extensions are case-insensitive. This lexer
+does not execute commands or expand variables.
 
 Each buffer owns its selected lexer and token/state cache. The renderer uses only
 the generic callbacks and token kinds; switching lexers clears the previous
@@ -338,7 +358,7 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
 | `EDITOR_TAKE_CHANGE` | `EditorChange *` receiving the change revision and accumulated inclusive changed-line range; consumes the range without affecting undo groups |
 | `EDITOR_REGISTER_LEXER` | `const Lexer *`; register an additional lexer descriptor on this core; registering the same pointer again is a no-op |
-| `EDITOR_SELECT_LEXER` | NUL-terminated filename; select the first registered lexer that supports its extension, or plain text when none matches |
+| `EDITOR_SELECT_LEXER` | NUL-terminated filename; select the first registered lexer matching its basename or extension, or plain text when none matches |
 | `EDITOR_GET_LEXER` | `const Lexer **` receiving the selected descriptor, or NULL for plain text |
 | `EDITOR_UNDO`, `EDITOR_REDO` | NULL; restore one history step, returning to command mode |
 | `EDITOR_GET_SELECTION` | `EditorSelection *`; supply `line`, receive byte `start`/exclusive `end`, `active`, and `includes_newline` |
@@ -441,7 +461,7 @@ From a Visual Studio Developer Command Prompt in the repository directory:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c editor_core_tests.c
+cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c editor_core_tests.c
 Debug\core-tests\editor_core_tests.exe
 ```
 
@@ -451,7 +471,7 @@ From a Visual Studio Developer Command Prompt, run:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
 Debug\core-tests\editor_window_tests.exe
 ```
 

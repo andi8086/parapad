@@ -322,5 +322,5 @@ static void free_line(LexerLine *line)
 }
 
 const Lexer lexer_c_cpp = {
-    "C/C++", supports_extension, lex_line, states_equal, free_line
+    "C/C++", supports_extension, lex_line, states_equal, free_line, NULL
 };

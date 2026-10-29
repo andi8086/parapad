@@ -5,6 +5,8 @@
 #include "editor_core.h"
 #include "lexer_c_cpp.h"
 #include "lexer_intel_asm.h"
+#include "lexer_makefile.h"
+#include "lexer_batch.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -107,20 +109,23 @@ static int select_lexer(EditorCore *core, const char *filename)
 {
     if (!filename)
         return 0;
+    const char *basename = filename;
     const char *extension = NULL;
     for (const char *position = filename; *position; ++position) {
-        if (*position == '/' || *position == '\\')
+        if (*position == '/' || *position == '\\') {
+            basename = position + 1;
             extension = NULL;
+        }
         else if (*position == '.')
             extension = position;
     }
     core->lexer = NULL;
-    if (extension) {
-        for (size_t index = 0; index < core->lexer_count; ++index) {
-            if (core->lexers[index]->supports_extension(extension)) {
-                core->lexer = core->lexers[index];
-                break;
-            }
+    for (size_t index = 0; index < core->lexer_count; ++index) {
+        const Lexer *lexer = core->lexers[index];
+        if ((lexer->supports_filename && lexer->supports_filename(basename)) ||
+            (extension && lexer->supports_extension(extension))) {
+            core->lexer = lexer;
+            break;
         }
     }
     return 1;
@@ -429,7 +434,9 @@ EditorCore *editor_core_create(const char *initial_text)
     EditorCore *core = calloc(1, sizeof(*core));
     if (!core)
         return NULL;
-    static const Lexer *const available_lexers[] = { &lexer_c_cpp, &lexer_intel_asm };
+    static const Lexer *const available_lexers[] = {
+        &lexer_c_cpp, &lexer_intel_asm, &lexer_makefile, &lexer_batch
+    };
     for (size_t index = 0; index < sizeof(available_lexers) / sizeof(available_lexers[0]); ++index) {
         if (!register_lexer(core, available_lexers[index])) {
             editor_core_destroy(core);
