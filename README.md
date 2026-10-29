@@ -136,6 +136,8 @@ Only `.mk` (case-sensitive) or an exact extensionless basename `Makefile` select
 the Makefile lexer. Directory names are ignored, including dots in directories;
 `Makefile.txt`, `GNUmakefile`, and unrelated extensionless files do not match.
 `.bat` and `.cmd` (case-insensitive) select the DOS batch lexer.
+`.pas` and `.dpr` select Pascal/Delphi, and `.bas` selects BASIC, also
+case-insensitively.
 Save As switches lexers or disables highlighting when the extension changes;
 unnamed buffers and other extensions keep the existing plain-text colors.
 Keywords are cyan, comments green, strings and character literals yellow,
@@ -199,6 +201,28 @@ numbers, `%NAME%`, positional parameters, FOR variables, `%~` parameter
 modifiers, and delayed `!NAME!` expansions. Caret continuations preserve
 command context. Commands and extensions are case-insensitive. This lexer
 does not execute commands or expand variables.
+
+[lexer_pascal.c](lexer_pascal.c) highlights Pascal/Delphi keywords and built-in
+types, single-quoted strings with doubled quotes, `#13`/`#$0A` character codes,
+decimal and scientific numbers, and `$` hexadecimal literals. Binary `%` and
+octal `&` literals are also recognized. The decimal scanner keeps `1..10` as
+two numbers separated by the range operator. `//`, `{ ... }`, and `(* ... *)`
+comments are green; `{$ ... }` and `(*$ ... *)` compiler directives are orange.
+Block comments and directives carry their delimiter state across lines.
+Keywords and file extensions are case-insensitive; escaped `&Identifier`
+names remain plain text. Same-delimiter nested comments and compiler-specific
+syntax modes are not evaluated.
+
+[lexer_basic.c](lexer_basic.c) covers common QBasic, VB/VBA, and FreeBASIC
+keywords, types, and built-in functions. It recognizes double-quoted strings
+with doubled quotes, FreeBASIC `!"..."` escaped strings, BASIC type suffixes,
+date literals, decimal/scientific numbers, and `&H`/`&O`/`&B` radix literals.
+Apostrophe comments and statement-leading `REM` are green, including after
+line numbers, colons, `THEN`, or `ELSE`. FreeBASIC `/' ... '/` block comments
+support nesting and carry state across lines. Leading `#` directives are
+orange. This is a shared lexical highlighter, not a dialect-specific parser
+or conditional-compilation evaluator. Both new lexers preserve raw bytes and
+return spans covering the entire input line, including uncolored text.
 
 Each buffer owns its selected lexer and token/state cache. The renderer uses only
 the generic callbacks and token kinds; switching lexers clears the previous
@@ -739,7 +763,7 @@ cl /nologo /W3 /std:c11 /c /DHAVE_CONFIG_H /DPCRE2_CODE_UNIT_WIDTH=8 /DPCRE2_STA
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c editor_core_tests.c Debug\pcre2\*.obj
+cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c editor_core_tests.c Debug\pcre2\*.obj
 Debug\core-tests\editor_core_tests.exe
 ```
 
@@ -750,7 +774,7 @@ objects above for the same architecture, run:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c Debug\pcre2\*.obj user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c Debug\pcre2\*.obj user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
 Debug\core-tests\editor_window_tests.exe
 ```
 

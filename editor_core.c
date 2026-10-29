@@ -7,6 +7,8 @@
 #include "lexer_intel_asm.h"
 #include "lexer_makefile.h"
 #include "lexer_batch.h"
+#include "lexer_pascal.h"
+#include "lexer_basic.h"
 
 #define PCRE2_CODE_UNIT_WIDTH 8
 #define PCRE2_STATIC
@@ -479,7 +481,8 @@ EditorCore *editor_core_create(const char *initial_text)
     if (!core)
         return NULL;
     static const Lexer *const available_lexers[] = {
-        &lexer_c_cpp, &lexer_intel_asm, &lexer_makefile, &lexer_batch
+        &lexer_c_cpp, &lexer_intel_asm, &lexer_makefile, &lexer_batch, &lexer_pascal,
+        &lexer_basic
     };
     for (size_t index = 0; index < sizeof(available_lexers) / sizeof(available_lexers[0]); ++index) {
         if (!register_lexer(core, available_lexers[index])) {
