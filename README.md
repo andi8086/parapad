@@ -4,13 +4,32 @@ Build `parapad.sln` in Visual Studio with the v142 C++ toolset and Windows SDK.
 The application starts with an empty text buffer in command mode. Press `i` to
 enter insert mode and Esc to return to command mode. The main window's status bar
 shows `COMMAND`, `INSERT`, `VISUAL`, or `VISUAL LINE` directly from the core's state.
-The fixed left gutter displays one-based line numbers in a five-character field,
+The fixed black left gutter displays cyan one-based line numbers in a five-character field,
 right-aligned and padded with spaces. Lines above 99999 display `#####`.
 
 In insert mode, typing inserts text, Enter splits the line, Backspace deletes the
 previous character, and Tab inserts four spaces. Arrow keys, Home, End, Delete,
 and mouse caret positioning work in all modes. The viewport follows the caret.
 This is a Vim-style command subset, not a full Vim engine.
+
+## Files
+
+Use File > Open (`Ctrl+O`), Save (`Ctrl+S`), or Save As. File > New (`Ctrl+N`)
+starts an empty document. The title shows the current path. New, Open, and Exit
+prompt to save modified documents; cancelling or failing a save keeps the current
+document open. Failed loads leave the current buffer, path, and viewport intact.
+
+File I/O uses binary `rb`/`wb` streams and explicit byte lengths. Loading and saving
+do not decode, transcode, normalize newlines, remove a BOM, or stop at NUL or
+Ctrl+Z. Unedited files round-trip byte for byte, including arbitrary non-UTF-8 data.
+Paths use ANSI dialogs and the system code page, consistent with the Win95 GUI.
+
+The current text view uses LF as its line separator. Valid UTF-8 is displayed as
+characters; malformed bytes show replacement glyphs and control bytes show dots,
+without modifying their stored bytes. Navigation treats each malformed byte as a
+single unit. CR bytes in CRLF files are retained and displayed as control bytes;
+text typed through the keyboard still inserts LF. This is a raw-buffer foundation
+for a future hex view, not an implemented hex editor.
 
 ## Commands
 
@@ -65,6 +84,11 @@ allocation failure. Failed edits leave the document unchanged.
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
 | `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/visual/visual-line mode |
+| `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
+| `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |
+| `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; load the file verbatim in binary mode |
+| `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save exactly the current buffer's byte length |
+| `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
 | `EDITOR_GET_SELECTION` | `EditorSelection *`; supply `line`, receive byte `start`/exclusive `end`, `active`, and `includes_newline` |
 | `EDITOR_GET_REGISTER` | `EditorRegister *` receiving borrowed UTF-8 `text`, byte `length`, and `linewise` |
 | `EDITOR_ADD_CHAR` | NUL-terminated UTF-8 `char *` containing exactly one Unicode scalar |
@@ -91,14 +115,27 @@ The GUI sends key messages without interpreting commands or deciding transitions
 Direct buffer-edit and navigation messages remain mode-independent for loading
 text, programmatic edits, and other non-keyboard clients.
 
-All stored text and string payloads are UTF-8 `char` strings, independent of the
-system locale. Line and column indices are zero-based. Columns and lengths count
-bytes; navigation and deletion operate on complete Unicode scalars, never partial
-UTF-8 sequences. Setting a column inside a sequence clamps to its start.
-Malformed UTF-8, surrogate values, and values above U+10FFFF are rejected without
-changing the document. Embedded NUL is not supported. Combining sequences are not
-treated as single grapheme clusters.
-CRLF and CR are normalized to LF during insertion. Empty documents have one
+The document is a length-based byte buffer, independent of the system locale.
+`EDITOR_SET_BUFFER` and `EDITOR_LOAD_FILE` accept arbitrary bytes, including NUL
+and invalid UTF-8. Replacing or loading the buffer resets the caret, command state,
+selection, and modified flag, while preserving the yank register. The buffer API
+can therefore be reused by a future hex editor without a text conversion step.
+`EDITOR_GET_BUFFER` returns a borrowed pointer valid until mutation or destruction;
+always use its length rather than `strlen`. An empty buffer may be supplied as
+`{ NULL, 0 }`. Replacement copies the input and also supports a slice of the old
+buffer. File-load failures leave the original document unchanged. Save reports
+write/close failures and clears the modified flag only after successful completion.
+
+Text insertion APIs still accept validated UTF-8 `char` strings. They reject
+malformed sequences, surrogate values, and values above U+10FFFF. Those string
+APIs cannot insert embedded NUL; use the raw buffer API for binary content.
+Line and column indices are zero-based byte offsets. Navigation and deletion
+preserve valid Unicode scalars and advance one byte over malformed data. Setting
+a column inside a valid UTF-8 sequence clamps to its start. Character queries
+return U+FFFD with length 1 for an invalid byte. Combining sequences are not treated
+as single grapheme clusters.
+CRLF and CR are normalized to LF only during text insertion, never raw loading.
+Empty documents have one
 empty line, and a trailing LF creates a final empty line. Deleting a line removes
 its following newline, or the preceding newline when deleting the final line.
 Backspace and Delete join adjacent lines when removing a newline.

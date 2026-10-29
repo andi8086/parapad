@@ -43,7 +43,12 @@ typedef enum EditorMessage {
     EDITOR_HANDLE_KEY,
     EDITOR_GET_MODE,
     EDITOR_GET_SELECTION,
-    EDITOR_GET_REGISTER
+    EDITOR_GET_REGISTER,
+    EDITOR_SET_BUFFER,
+    EDITOR_GET_BUFFER,
+    EDITOR_LOAD_FILE,
+    EDITOR_SAVE_FILE,
+    EDITOR_GET_MODIFIED
 } EditorMessage;
 
 typedef struct EditorLine {
@@ -77,6 +82,11 @@ typedef struct EditorRegister {
     size_t length;
     int linewise;
 } EditorRegister;
+
+typedef struct EditorBuffer {
+    const unsigned char *data;
+    size_t length;
+} EditorBuffer;
 
 EditorCore *editor_core_create(const char *initial_text);
 void editor_core_destroy(EditorCore *core);

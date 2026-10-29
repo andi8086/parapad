@@ -1,6 +1,11 @@
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include "editor_core.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +23,7 @@ struct EditorCore {
     char *register_text;
     size_t register_length;
     int register_linewise;
+    int modified;
 };
 
 static size_t decode_character(const char *text, size_t length, unsigned long *value)
@@ -112,6 +118,8 @@ static int insert_text(EditorCore *core, const char *text)
     memcpy(core->text + core->cursor, normalized, count);
     core->length += count;
     core->cursor += count;
+    if (count)
+        core->modified = 1;
     if (core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE)
         core->mode = EDITOR_MODE_COMMAND;
     free(normalized);
@@ -150,10 +158,13 @@ static size_t previous_character(const EditorCore *core, size_t position)
 {
     if (position == 0)
         return 0;
-    --position;
-    while (position > 0 && ((unsigned char)core->text[position] & 0xC0) == 0x80)
-        --position;
-    return position;
+    size_t start = position - 1;
+    while (start > 0 && position - start < 4 &&
+        ((unsigned char)core->text[start] & 0xC0) == 0x80)
+        --start;
+    unsigned long value;
+    size_t length = decode_character(core->text + start, position - start, &value);
+    return length && start + length == position ? start : position - 1;
 }
 
 static size_t next_character(const EditorCore *core, size_t position)
@@ -161,11 +172,14 @@ static size_t next_character(const EditorCore *core, size_t position)
     if (position == core->length)
         return position;
     unsigned long value;
-    return position + decode_character(core->text + position, core->length - position, &value);
+    size_t length = decode_character(core->text + position, core->length - position, &value);
+    return position + (length ? length : 1);
 }
 
 static void erase_text(EditorCore *core, size_t start, size_t end)
 {
+    if (start != end)
+        core->modified = 1;
     memmove(core->text + start, core->text + end,
         core->length - end + 1);
     core->length -= end - start;
@@ -180,9 +194,14 @@ static void erase_text(EditorCore *core, size_t start, size_t end)
 static size_t clamp_column(const EditorCore *core, size_t start, size_t end, size_t column)
 {
     size_t position = start + (column < end - start ? column : end - start);
-    while (position > start && position < end &&
-        ((unsigned char)core->text[position] & 0xC0) == 0x80)
-        --position;
+    size_t candidate = position;
+    while (candidate > start && position - candidate < 3 && candidate < end &&
+        ((unsigned char)core->text[candidate] & 0xC0) == 0x80)
+        --candidate;
+    unsigned long value;
+    size_t length = decode_character(core->text + candidate, end - candidate, &value);
+    if (length && candidate + length > position)
+        position = candidate;
     return position;
 }
 
@@ -196,6 +215,7 @@ EditorCore *editor_core_create(const char *initial_text)
         return NULL;
     }
     core->cursor = 0;
+    core->modified = 0;
     return core;
 }
 
@@ -225,6 +245,86 @@ static void reset_command(EditorCore *core)
     core->operator_count = 0;
     core->operator_has_count = 0;
     core->pending = 0;
+}
+
+static void reset_document(EditorCore *core)
+{
+    core->cursor = 0;
+    core->anchor = 0;
+    core->mode = EDITOR_MODE_COMMAND;
+    core->modified = 0;
+    reset_command(core);
+}
+
+static int set_buffer(EditorCore *core, const EditorBuffer *buffer)
+{
+    if (!buffer || (buffer->length && !buffer->data) || buffer->length == SIZE_MAX)
+        return 0;
+    char *text = malloc(buffer->length + 1);
+    if (!text)
+        return 0;
+    if (buffer->length)
+        memcpy(text, buffer->data, buffer->length);
+    text[buffer->length] = 0;
+    free(core->text);
+    core->text = text;
+    core->length = buffer->length;
+    core->capacity = buffer->length + 1;
+    reset_document(core);
+    return 1;
+}
+
+static int load_file(EditorCore *core, const char *path)
+{
+    if (!path || !*path)
+        return 0;
+    FILE *file = fopen(path, "rb");
+    if (!file)
+        return 0;
+    EditorCore loaded = { 0 };
+    int success = reserve_text(&loaded, 0);
+    char chunk[4096];
+    while (success) {
+        size_t count = fread(chunk, 1, sizeof(chunk), file);
+        if (count > SIZE_MAX - loaded.length || !reserve_text(&loaded, loaded.length + count)) {
+            success = 0;
+            break;
+        }
+        memcpy(loaded.text + loaded.length, chunk, count);
+        loaded.length += count;
+        if (count < sizeof(chunk)) {
+            success = !ferror(file);
+            break;
+        }
+    }
+    if (fclose(file) != 0)
+        success = 0;
+    if (!success) {
+        free(loaded.text);
+        return 0;
+    }
+    loaded.text[loaded.length] = 0;
+    free(core->text);
+    core->text = loaded.text;
+    core->length = loaded.length;
+    core->capacity = loaded.capacity;
+    reset_document(core);
+    return 1;
+}
+
+static int save_file(EditorCore *core, const char *path)
+{
+    if (!path || !*path)
+        return 0;
+    FILE *file = fopen(path, "wb");
+    if (!file)
+        return 0;
+    int success = fwrite(core->text, 1, core->length, file) == core->length;
+    if (fclose(file) != 0)
+        success = 0;
+    if (success)
+        core->modified = 0;
+    return success;
 }
 
 static TextRange selected_range(const EditorCore *core)
@@ -424,6 +524,8 @@ static int paste_register(EditorCore *core, size_t count, int before)
         core->length - range.end + 1);
     memcpy(core->text + range.start, text, length);
     core->length = new_length;
+    if (length || range.start != range.end)
+        core->modified = 1;
     core->cursor = core->register_linewise || range.linewise ? range.start + prefix :
         previous_character(core, range.start + length);
     core->mode = EDITOR_MODE_COMMAND;
@@ -539,6 +641,25 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
     if (!core)
         return 0;
     switch (message) {
+    case EDITOR_SET_BUFFER:
+        return set_buffer(core, data);
+    case EDITOR_GET_BUFFER: {
+        EditorBuffer *buffer = data;
+        if (!buffer)
+            return 0;
+        buffer->data = (const unsigned char *)core->text;
+        buffer->length = core->length;
+        return 1;
+    }
+    case EDITOR_LOAD_FILE:
+        return load_file(core, data);
+    case EDITOR_SAVE_FILE:
+        return save_file(core, data);
+    case EDITOR_GET_MODIFIED:
+        if (!data)
+            return 0;
+        *(int *)data = core->modified;
+        return 1;
     case EDITOR_GET_REGISTER: {
         EditorRegister *value = data;
         if (!value)
@@ -634,7 +755,11 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
             return 0;
         character->length = decode_character(core->text + start + character->column,
             end - start - character->column, &character->value);
-        return character->length != 0;
+        if (!character->length) {
+            character->value = 0xFFFD;
+            character->length = 1;
+        }
+        return 1;
     }
     case EDITOR_DELETE_LINE: {
         size_t start, end;

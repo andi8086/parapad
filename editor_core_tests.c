@@ -332,8 +332,90 @@ static void test_modes(void)
     editor_core_destroy(core);
 }
 
+static void test_raw_files(void)
+{
+    unsigned char bytes[8453];
+    for (size_t index = 0; index < sizeof(bytes); ++index)
+        bytes[index] = (unsigned char)index;
+    bytes[0] = 0xEF;
+    bytes[1] = 0xBB;
+    bytes[2] = 0xBF;
+    bytes[3] = '\r';
+    bytes[4] = '\n';
+    bytes[5] = 0;
+    EditorCore *core = editor_core_create("");
+    assert(core);
+    EditorBuffer input = { bytes, sizeof(bytes) };
+    assert(editor_core_send(core, EDITOR_SET_BUFFER, &input));
+    EditorBuffer output;
+    assert(editor_core_send(core, EDITOR_GET_BUFFER, &output));
+    assert(output.length == sizeof(bytes) && memcmp(output.data, bytes, sizeof(bytes)) == 0);
+    int modified = 1;
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    char path[] = "Debug/core-tests/editor_core_raw_roundtrip.bin";
+    assert(editor_core_send(core, EDITOR_SAVE_FILE, path));
+    FILE *file = fopen(path, "rb");
+    assert(file);
+    unsigned char actual[sizeof(bytes)];
+    assert(fread(actual, 1, sizeof(actual), file) == sizeof(bytes));
+    assert(memcmp(actual, bytes, sizeof(bytes)) == 0);
+    assert(fgetc(file) == EOF);
+    assert(fclose(file) == 0);
+    send_keys(core, "iX");
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && modified);
+    assert(!editor_core_send(core, EDITOR_LOAD_FILE, "Debug/core-tests/missing-directory/no-file"));
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && modified);
+    assert(!editor_core_send(core, EDITOR_SAVE_FILE, "Debug/core-tests"));
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && modified);
+    assert(editor_core_send(core, EDITOR_LOAD_FILE, path));
+    assert(editor_core_send(core, EDITOR_GET_BUFFER, &output));
+    assert(output.length == sizeof(bytes) && memcmp(output.data, bytes, sizeof(bytes)) == 0);
+    expect_caret(core, 0, 0);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    assert(editor_core_send(core, EDITOR_GET_MODIFIED, &modified) && !modified);
+    assert(editor_core_send(core, EDITOR_SET_BUFFER, &output));
+    assert(editor_core_send(core, EDITOR_GET_BUFFER, &output));
+    assert(memcmp(output.data, bytes, sizeof(bytes)) == 0);
+    EditorBuffer invalid = { NULL, 1 };
+    assert(!editor_core_send(core, EDITOR_SET_BUFFER, &invalid));
+    EditorBuffer empty = { NULL, 0 };
+    assert(editor_core_send(core, EDITOR_SET_BUFFER, &empty));
+    assert(editor_core_send(core, EDITOR_SAVE_FILE, path));
+    assert(editor_core_send(core, EDITOR_LOAD_FILE, path));
+    assert(editor_core_send(core, EDITOR_GET_BUFFER, &output) && !output.length);
+    assert(remove(path) == 0);
+
+    unsigned char malformed[] = { 0x80, 0xFF, 0, 0xC3, 0xA4, 0xE2, 0x82 };
+    input.data = malformed;
+    input.length = sizeof(malformed);
+    assert(editor_core_send(core, EDITOR_SET_BUFFER, &input));
+    EditorCharacter character = { 0, 0, 0, 0 };
+    assert(editor_core_send(core, EDITOR_GET_CHARACTER, &character));
+    assert(character.value == 0xFFFD && character.length == 1);
+    send_key(core, EDITOR_KEY_RIGHT);
+    expect_caret(core, 0, 1);
+    send_key(core, EDITOR_KEY_RIGHT);
+    expect_caret(core, 0, 2);
+    send_key(core, EDITOR_KEY_RIGHT);
+    expect_caret(core, 0, 3);
+    send_key(core, EDITOR_KEY_RIGHT);
+    expect_caret(core, 0, 5);
+    send_key(core, EDITOR_KEY_RIGHT);
+    expect_caret(core, 0, 6);
+    send_key(core, EDITOR_KEY_RIGHT);
+    expect_caret(core, 0, 7);
+    send_key(core, EDITOR_KEY_LEFT);
+    expect_caret(core, 0, 6);
+    send_key(core, EDITOR_KEY_LEFT);
+    expect_caret(core, 0, 5);
+    send_key(core, EDITOR_KEY_LEFT);
+    expect_caret(core, 0, 3);
+    editor_core_destroy(core);
+}
+
 int main(void)
 {
+    test_raw_files();
     test_visual_commands();
     test_counted_commands();
     test_command_edges();
@@ -420,7 +502,8 @@ int main(void)
     assert(editor_core_send(core, EDITOR_GET_CHARACTER, &character));
     assert(character.value == 0x1F600 && character.length == 4);
     character.column = 7;
-    assert(!editor_core_send(core, EDITOR_GET_CHARACTER, &character));
+    assert(editor_core_send(core, EDITOR_GET_CHARACTER, &character));
+    assert(character.value == 0xFFFD && character.length == 1);
     assert(editor_core_send(core, EDITOR_MOVE_LEFT, NULL));
     expect_caret(core, 0, 3);
     assert(editor_core_send(core, EDITOR_DELETE_CHAR, NULL));

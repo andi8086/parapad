@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <limits.h>
 #include <stdlib.h>
 
@@ -9,7 +10,12 @@
 #define ID_EDITOR 100
 #define ID_FILE_EXIT 101
 #define ID_STATUS 102
+#define ID_FILE_NEW 103
+#define ID_FILE_OPEN 104
+#define ID_FILE_SAVE 105
+#define ID_FILE_SAVE_AS 106
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
+#define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
 
 typedef struct EditorControl {
     EditorCore *core;
@@ -26,8 +32,15 @@ typedef struct EditorControl {
     char pending_lead;
 } EditorControl;
 
+typedef struct MainWindowState {
+    EditorCore *core;
+    char path[MAX_PATH];
+} MainWindowState;
+
 static int character_to_ansi(unsigned long value, char *text, int capacity)
 {
+    if (value < 32 || value == 127)
+        value = '.';
     WCHAR units[2];
     int count = 1;
     if (value <= 0xFFFF) {
@@ -200,6 +213,12 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_GETDLGCODE:
         return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB;
+    case WM_EDITOR_BUFFER_CHANGED:
+        editor->first_line = 0;
+        editor->left_pixel = 0;
+        editor->pending_lead = 0;
+        update_editor_caret(hWnd, editor);
+        return 0;
     case WM_SETFOCUS:
         CreateCaret(hWnd, NULL, 2, editor->line_height);
         update_editor_caret(hWnd, editor);
@@ -314,14 +333,12 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             HDC draw_dc = editor->back_bitmap && editor->back_width == width &&
                 editor->back_height == height ? editor->memdc : dc;
             FillRect(draw_dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
-            RECT gutter = { 0, 0, editor->text_left - 8, height };
-            FillRect(draw_dc, &gutter, (HBRUSH)(COLOR_BTNFACE + 1));
             SetBkMode(draw_dc, TRANSPARENT);
 
             HGDIOBJ old_font = SelectObject(draw_dc, editor->font);
             int saved_dc = SaveDC(draw_dc);
             IntersectClipRect(draw_dc, 8, 8, width - 8, height - 8);
-            SetTextColor(draw_dc, GetSysColor(COLOR_BTNTEXT));
+            SetTextColor(draw_dc, RGB(0, 255, 255));
             size_t index = editor->first_line;
             for (int top = 8; top < height - 8; top += editor->line_height, ++index) {
                 EditorLine line = { index, NULL, 0 };
@@ -375,13 +392,76 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hWnd, msg, wp, lp);
 }
 
+static void update_document_title(HWND window, const MainWindowState *state)
+{
+    char title[MAX_PATH + 16];
+    wsprintfA(title, "parapad - %s", state->path[0] ? state->path : "Untitled");
+    SetWindowTextA(window, title);
+}
+
+static int choose_file(HWND window, char *path, int save)
+{
+    OPENFILENAMEA dialog = { 0 };
+    dialog.lStructSize = OPENFILENAME_SIZE_VERSION_400A;
+    dialog.hwndOwner = window;
+    dialog.lpstrFilter = "All Files (*.*)\0*.*\0\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = MAX_PATH;
+    dialog.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST |
+        OFN_HIDEREADONLY | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    BOOL result = save ? GetSaveFileNameA(&dialog) : GetOpenFileNameA(&dialog);
+    if (!result && CommDlgExtendedError())
+        MessageBoxA(window, "The file dialog could not be opened.", "parapad", MB_OK | MB_ICONERROR);
+    return result != FALSE;
+}
+
+static int save_document(HWND window, MainWindowState *state, int save_as)
+{
+    char path[MAX_PATH];
+    lstrcpynA(path, state->path, MAX_PATH);
+    if ((save_as || !path[0]) && !choose_file(window, path, 1))
+        return 0;
+    if (!editor_core_send(state->core, EDITOR_SAVE_FILE, path)) {
+        MessageBoxA(window, "The file could not be saved. Check the path, permissions, and available disk space.",
+            "parapad", MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    lstrcpynA(state->path, path, MAX_PATH);
+    update_document_title(window, state);
+    return 1;
+}
+
+static int confirm_document_close(HWND window, MainWindowState *state)
+{
+    int modified = 0;
+    editor_core_send(state->core, EDITOR_GET_MODIFIED, &modified);
+    if (!modified)
+        return 1;
+    int answer = MessageBoxA(window, "Save changes before continuing?", "parapad",
+        MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (answer == IDCANCEL)
+        return 0;
+    return answer != IDYES || save_document(window, state, 0);
+}
+
 LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    MainWindowState *state = (MainWindowState *)GetWindowLongPtrA(hWnd, GWLP_USERDATA);
     switch (msg) {
     case WM_CREATE: {
+        state = calloc(1, sizeof(*state));
+        if (!state)
+            return -1;
+        state->core = ((LPCREATESTRUCTA)lp)->lpCreateParams;
+        SetWindowLongPtrA(hWnd, GWLP_USERDATA, (LONG_PTR)state);
         HMENU menu = CreateMenu();
         HMENU file_menu = CreatePopupMenu();
         if (!menu || !file_menu ||
+            !AppendMenuA(file_menu, MF_STRING, ID_FILE_NEW, "&New\tCtrl+N") ||
+            !AppendMenuA(file_menu, MF_STRING, ID_FILE_OPEN, "&Open...\tCtrl+O") ||
+            !AppendMenuA(file_menu, MF_STRING, ID_FILE_SAVE, "&Save\tCtrl+S") ||
+            !AppendMenuA(file_menu, MF_STRING, ID_FILE_SAVE_AS, "Save &As...") ||
+            !AppendMenuA(file_menu, MF_SEPARATOR, 0, NULL) ||
             !AppendMenu(file_menu, MF_STRING, ID_FILE_EXIT, "E&xit") ||
             !AppendMenu(menu, MF_POPUP, (UINT_PTR)file_menu, "&File")) {
             if (file_menu)
@@ -409,6 +489,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             ((LPCREATESTRUCTA)lp)->hInstance, ((LPCREATESTRUCTA)lp)->lpCreateParams);
         if (!editor)
             return -1;
+        update_document_title(hWnd, state);
         return 0;
     }
     case WM_SIZE: {
@@ -439,15 +520,58 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SETFOCUS:
         SetFocus(GetDlgItem(hWnd, ID_EDITOR));
         return 0;
-    case WM_COMMAND:
-        if (LOWORD(wp) == ID_FILE_EXIT) {
+    case WM_COMMAND: {
+        switch (LOWORD(wp)) {
+        case ID_FILE_NEW: {
+            EditorBuffer empty = { NULL, 0 };
+            if (!confirm_document_close(hWnd, state))
+                return 0;
+            if (!editor_core_send(state->core, EDITOR_SET_BUFFER, &empty)) {
+                MessageBoxA(hWnd, "The new document could not be created.", "parapad", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            state->path[0] = 0;
+            update_document_title(hWnd, state);
+            SendMessageA(GetDlgItem(hWnd, ID_EDITOR), WM_EDITOR_BUFFER_CHANGED, 0, 0);
+            SetFocus(GetDlgItem(hWnd, ID_EDITOR));
+            return 0;
+        }
+        case ID_FILE_OPEN: {
+            char path[MAX_PATH] = "";
+            if (!choose_file(hWnd, path, 0) || !confirm_document_close(hWnd, state))
+                return 0;
+            if (!editor_core_send(state->core, EDITOR_LOAD_FILE, path)) {
+                MessageBoxA(hWnd, "The file could not be loaded. Check access permissions and available memory.",
+                    "parapad", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            lstrcpynA(state->path, path, MAX_PATH);
+            update_document_title(hWnd, state);
+            SendMessageA(GetDlgItem(hWnd, ID_EDITOR), WM_EDITOR_BUFFER_CHANGED, 0, 0);
+            SetFocus(GetDlgItem(hWnd, ID_EDITOR));
+            return 0;
+        }
+        case ID_FILE_SAVE:
+        case ID_FILE_SAVE_AS:
+            save_document(hWnd, state, LOWORD(wp) == ID_FILE_SAVE_AS);
+            return 0;
+        case ID_FILE_EXIT:
             SendMessage(hWnd, WM_CLOSE, 0, 0);
             return 0;
         }
         break;
+    }
+    case WM_CLOSE:
+        if (!state || confirm_document_close(hWnd, state))
+            DestroyWindow(hWnd);
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+    case WM_NCDESTROY:
+        free(state);
+        SetWindowLongPtrA(hWnd, GWLP_USERDATA, 0);
+        break;
     }
 
     return DefWindowProcA(hWnd, msg, wp, lp);
@@ -493,6 +617,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    ACCEL shortcuts[] = {
+        { FVIRTKEY | FCONTROL, 'N', ID_FILE_NEW },
+        { FVIRTKEY | FCONTROL, 'O', ID_FILE_OPEN },
+        { FVIRTKEY | FCONTROL, 'S', ID_FILE_SAVE }
+    };
+    HACCEL accelerators = CreateAcceleratorTableA(shortcuts, sizeof(shortcuts) / sizeof(shortcuts[0]));
     ShowWindow(g_hwnd, nCmdShow);
     UpdateWindow(g_hwnd);
     SetFocus(GetDlgItem(g_hwnd, ID_EDITOR));
@@ -500,10 +630,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     MSG msg;
     int result;
     while ((result = GetMessageA(&msg, NULL, 0, 0)) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        if (!accelerators || !TranslateAcceleratorA(g_hwnd, accelerators, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
     }
 
+    if (accelerators)
+        DestroyAcceleratorTable(accelerators);
     editor_core_destroy(core);
     return result == -1 ? 1 : (int)msg.wParam;
 }
