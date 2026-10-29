@@ -3,14 +3,52 @@
 Build `parapad.sln` in Visual Studio with the v142 C++ toolset and Windows SDK.
 The application starts with an empty text buffer in command mode. Press `i` to
 enter insert mode and Esc to return to command mode. The main window's status bar
-shows `COMMAND` or `INSERT` directly from the core's state.
+shows `COMMAND`, `INSERT`, `VISUAL`, or `VISUAL LINE` directly from the core's state.
+The fixed left gutter displays one-based line numbers in a five-character field,
+right-aligned and padded with spaces. Lines above 99999 display `#####`.
 
 In insert mode, typing inserts text, Enter splits the line, Backspace deletes the
-previous character, and Tab inserts four spaces. In command mode, `h/j/k/l` move
-left/down/up/right, `x` deletes the current character, `0` moves to the start of
-the line, and `$` moves to its end. Other character keys are ignored. Arrow keys,
-Home, End, Delete, and mouse caret positioning work in either mode. The viewport
-follows the caret. This is a small Vim-style command subset, not a full Vim engine.
+previous character, and Tab inserts four spaces. Arrow keys, Home, End, Delete,
+and mouse caret positioning work in all modes. The viewport follows the caret.
+This is a Vim-style command subset, not a full Vim engine.
+
+## Commands
+
+| Keys | Action |
+| --- | --- |
+| `h/j/k/l`, arrow keys | Move left/down/up/right |
+| `w`, `b` | Move to the next/previous word; ASCII punctuation forms separate words |
+| `0`, `$`, Home, End | Move to the start/end of the line |
+| `v` | Toggle inclusive character selection |
+| `V` (Shift+V) | Toggle whole-line selection |
+| `y` in visual mode | Copy the selection to the core's register and return to command mode |
+| `yy` | Copy the current line |
+| `p` | Paste after the caret, or below the current line for a linewise register |
+| `P` (Shift+P) | Paste before the caret, or above the current line for a linewise register |
+| `p`, `P` in visual mode | Replace the selection with the register contents |
+| `x`, Delete | Delete selected text, or characters on the current line, saving them to the register |
+| `d` plus a motion | Delete the motion's range, e.g. `dw`, `d$`, `d0`, `dj`, `dG` |
+| `dd` | Delete the current line, saving it to the register |
+| `y` plus a motion | Copy the motion's range, e.g. `yw`, `y$`, `yj`, `yG` |
+| `gg`, `G` | Go to the first/last line |
+| `12G`, `12gg` | Go to line 12 (one-based; clamped to existing lines) |
+| Esc | Cancel selection, a pending operator/count, or insert mode |
+
+Prefix motions, delete/yank operators, and paste with a decimal count: `3j`,
+`4w`, `3x`, `2dd`, `2yy`, `3p`, `3P`. Counts before and after operators multiply:
+`2d3w` deletes six word motions. A leading `0` is a motion, while zero after a
+nonzero digit extends a count, e.g. `10j`. Counts are overflow-checked, and motion
+at document boundaries stops without looping through the remaining count.
+`d` and `y` wait for a motion or a second matching key; unsupported continuations
+cancel the pending operator. Counts do not repeat insert-mode sessions.
+
+Selections include both endpoint characters, preserve UTF-8 boundaries, and may
+span lines in either direction. `v` and `V` switch between selection styles while
+keeping the anchor; pressing the active selection key again cancels selection.
+Yank/delete return to command mode. Linewise registers include a terminating LF,
+even for the document's final unterminated line. Visual paste preserves the
+register; subsequent paste can reuse it. Copy/paste uses a per-core internal UTF-8
+register, not the Windows system clipboard, so no code-page conversion loses text.
 
 ## Editor Core
 
@@ -26,7 +64,9 @@ allocation failure. Failed edits leave the document unchanged.
 | Message | Data |
 | --- | --- |
 | `EDITOR_HANDLE_KEY` | `unsigned long *` containing a Unicode scalar or an `EditorKey` special-key value |
-| `EDITOR_GET_MODE` | `EditorMode *` receiving `EDITOR_MODE_COMMAND` or `EDITOR_MODE_INSERT` |
+| `EDITOR_GET_MODE` | `EditorMode *` receiving the current command/insert/visual/visual-line mode |
+| `EDITOR_GET_SELECTION` | `EditorSelection *`; supply `line`, receive byte `start`/exclusive `end`, `active`, and `includes_newline` |
+| `EDITOR_GET_REGISTER` | `EditorRegister *` receiving borrowed UTF-8 `text`, byte `length`, and `linewise` |
 | `EDITOR_ADD_CHAR` | NUL-terminated UTF-8 `char *` containing exactly one Unicode scalar |
 | `EDITOR_ADD_CODEPOINT` | `unsigned long *` containing a nonzero Unicode scalar, encoded by the core |
 | `EDITOR_INSERT_TEXT` | NUL-terminated UTF-8 `char *` to insert at the caret |
@@ -63,10 +103,17 @@ empty line, and a trailing LF creates a final empty line. Deleting a line remove
 its following newline, or the preceding newline when deleting the final line.
 Backspace and Delete join adjacent lines when removing a newline.
 
+`EDITOR_GET_SELECTION` exposes the selected span on a requested line without
+requiring the GUI to implement command logic. An empty selected line or a selected
+newline can have equal start/end offsets; `includes_newline` lets a renderer show
+that selection. Direct buffer mutations cancel visual mode to avoid stale anchors.
+
 `EDITOR_GET_LINE` returns a borrowed slice, not a NUL-terminated line. Use its
 length, do not modify it, and query it again after any text mutation. The pointer
 is invalid after a mutation or destruction. Dispatch is synchronous and instances
 must not be accessed concurrently without external synchronization.
+Register text is NUL-terminated and remains valid until the next successful
+yank/delete or core destruction; clients must not modify it.
 
 ## ANSI Frontend
 

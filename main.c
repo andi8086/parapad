@@ -20,6 +20,7 @@ typedef struct EditorControl {
     int back_height;
     HFONT font;
     int line_height;
+    int text_left;
     size_t first_line;
     int left_pixel;
     char pending_lead;
@@ -87,6 +88,10 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     size_t byte_limit, int top, int paint, int hit_x, size_t *hit_column)
 {
     EditorCharacter character = { index, 0, 0, 0 };
+    EditorSelection selection = { index, 0, 0, 0, 0 };
+    if (paint)
+        editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
+    COLORREF normal_color = GetTextColor(dc);
     int width = 0;
     if (hit_column)
         *hit_column = 0;
@@ -103,10 +108,28 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
                 break;
             *hit_column = character.column + character.length;
         }
-        if (paint)
-            TextOutA(dc, 8 - editor->left_pixel + width, top, text, length);
+        if (paint) {
+            int left = editor->text_left - editor->left_pixel + width;
+            if (selection.active && character.column >= selection.start && character.column < selection.end) {
+                RECT highlight = { left, top, left + extent.cx, top + editor->line_height };
+                SetTextColor(dc, GetSysColor(COLOR_HIGHLIGHTTEXT));
+                SetBkColor(dc, GetSysColor(COLOR_HIGHLIGHT));
+                ExtTextOutA(dc, left, top, ETO_OPAQUE, &highlight, text, length, NULL);
+                SetTextColor(dc, normal_color);
+            } else {
+                TextOutA(dc, left, top, text, length);
+            }
+        }
         width += extent.cx;
         character.column += character.length;
+    }
+    if (paint && selection.active && selection.includes_newline) {
+        SIZE space = { 0, 0 };
+        GetTextExtentPoint32A(dc, " ", 1, &space);
+        int left = editor->text_left - editor->left_pixel + width;
+        RECT highlight = { left, top, left + space.cx, top + editor->line_height };
+        SetBkColor(dc, GetSysColor(COLOR_HIGHLIGHT));
+        ExtTextOutA(dc, left, top, ETO_OPAQUE, &highlight, "", 0, NULL);
     }
     return width;
 }
@@ -135,13 +158,13 @@ static void update_editor_caret(HWND window, EditorControl *editor)
     else if (caret.line - editor->first_line >= (size_t)visible_lines)
         editor->first_line = caret.line - visible_lines + 1;
 
-    int visible_width = rect.right > 18 ? rect.right - 18 : 1;
+    int visible_width = rect.right > editor->text_left + 10 ? rect.right - editor->text_left - 10 : 1;
     if (caret_width < editor->left_pixel)
         editor->left_pixel = caret_width;
     else if (caret_width - editor->left_pixel > visible_width)
         editor->left_pixel = caret_width - visible_width;
     if (GetFocus() == window)
-        SetCaretPos(8 + caret_width - editor->left_pixel,
+        SetCaretPos(editor->text_left + caret_width - editor->left_pixel,
             8 + (int)(caret.line - editor->first_line) * editor->line_height);
     InvalidateRect(window, NULL, FALSE);
 }
@@ -168,6 +191,9 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         TEXTMETRICA metrics;
         GetTextMetricsA(dc, &metrics);
         editor->line_height = metrics.tmHeight + metrics.tmExternalLeading;
+        SIZE number_size = { 0, 0 };
+        GetTextExtentPoint32A(dc, "00000", 5, &number_size);
+        editor->text_left = 8 + number_size.cx + 16;
         SelectObject(dc, old_font);
         ReleaseDC(hWnd, dc);
         return 0;
@@ -201,7 +227,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             caret.line = count - 1;
         EditorLine line = { caret.line, NULL, 0 };
         editor_core_send(editor->core, EDITOR_GET_LINE, &line);
-        int target = mouse_x - 8 + editor->left_pixel;
+        int target = mouse_x >= editor->text_left ? mouse_x - editor->text_left + editor->left_pixel : 0;
         if (target > 0) {
             HDC dc = GetDC(hWnd);
             HGDIOBJ old_font = SelectObject(dc, editor->font);
@@ -288,13 +314,27 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             HDC draw_dc = editor->back_bitmap && editor->back_width == width &&
                 editor->back_height == height ? editor->memdc : dc;
             FillRect(draw_dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            RECT gutter = { 0, 0, editor->text_left - 8, height };
+            FillRect(draw_dc, &gutter, (HBRUSH)(COLOR_BTNFACE + 1));
             SetBkMode(draw_dc, TRANSPARENT);
-            SetTextColor(draw_dc, RGB(255, 0, 0));
 
             HGDIOBJ old_font = SelectObject(draw_dc, editor->font);
             int saved_dc = SaveDC(draw_dc);
             IntersectClipRect(draw_dc, 8, 8, width - 8, height - 8);
+            SetTextColor(draw_dc, GetSysColor(COLOR_BTNTEXT));
             size_t index = editor->first_line;
+            for (int top = 8; top < height - 8; top += editor->line_height, ++index) {
+                EditorLine line = { index, NULL, 0 };
+                if (!editor_core_send(editor->core, EDITOR_GET_LINE, &line))
+                    break;
+                char number[6] = "#####";
+                if (index < 99999)
+                    wsprintfA(number, "%5lu", (unsigned long)(index + 1));
+                TextOutA(draw_dc, 8, top, number, 5);
+            }
+            IntersectClipRect(draw_dc, editor->text_left, 8, width - 8, height - 8);
+            SetTextColor(draw_dc, RGB(255, 0, 0));
+            index = editor->first_line;
             for (int top = 8; top < height - 8; top += editor->line_height, ++index) {
                 EditorLine line = { index, NULL, 0 };
                 if (!editor_core_send(editor->core, EDITOR_GET_LINE, &line))
@@ -384,10 +424,18 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         MoveWindow(GetDlgItem(hWnd, ID_EDITOR), 12, 12, width, height, TRUE);
         return 0;
     }
-    case WM_EDITOR_MODE_CHANGED:
+    case WM_EDITOR_MODE_CHANGED: {
+        const char *mode_text;
+        switch ((EditorMode)wp) {
+        case EDITOR_MODE_INSERT: mode_text = "INSERT"; break;
+        case EDITOR_MODE_VISUAL: mode_text = "VISUAL"; break;
+        case EDITOR_MODE_VISUAL_LINE: mode_text = "VISUAL LINE"; break;
+        default: mode_text = "COMMAND"; break;
+        }
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
-            (LPARAM)(wp == EDITOR_MODE_INSERT ? "INSERT" : "COMMAND"));
+            (LPARAM)mode_text);
         return 0;
+    }
     case WM_SETFOCUS:
         SetFocus(GetDlgItem(hWnd, ID_EDITOR));
         return 0;

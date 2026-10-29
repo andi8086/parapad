@@ -7,7 +7,9 @@ typedef struct EditorCore EditorCore;
 
 typedef enum EditorMode {
     EDITOR_MODE_COMMAND,
-    EDITOR_MODE_INSERT
+    EDITOR_MODE_INSERT,
+    EDITOR_MODE_VISUAL,
+    EDITOR_MODE_VISUAL_LINE
 } EditorMode;
 
 typedef enum EditorKey {
@@ -39,7 +41,9 @@ typedef enum EditorMessage {
     EDITOR_MOVE_HOME,
     EDITOR_MOVE_END,
     EDITOR_HANDLE_KEY,
-    EDITOR_GET_MODE
+    EDITOR_GET_MODE,
+    EDITOR_GET_SELECTION,
+    EDITOR_GET_REGISTER
 } EditorMessage;
 
 typedef struct EditorLine {
@@ -59,6 +63,20 @@ typedef struct EditorCharacter {
     unsigned long value;
     size_t length;
 } EditorCharacter;
+
+typedef struct EditorSelection {
+    size_t line;
+    size_t start;
+    size_t end;
+    int active;
+    int includes_newline;
+} EditorSelection;
+
+typedef struct EditorRegister {
+    const char *text;
+    size_t length;
+    int linewise;
+} EditorRegister;
 
 EditorCore *editor_core_create(const char *initial_text);
 void editor_core_destroy(EditorCore *core);

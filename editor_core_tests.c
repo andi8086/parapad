@@ -8,6 +8,9 @@ static void expect_line(EditorCore *core, size_t index, const char *expected)
 {
     EditorLine line = { index, NULL, 0 };
     assert(editor_core_send(core, EDITOR_GET_LINE, &line));
+    if (line.length != strlen(expected) || memcmp(line.text, expected, line.length) != 0)
+        fprintf(stderr, "line %lu: expected [%s], got [%.*s]\n",
+            (unsigned long)index, expected, (int)line.length, line.text);
     assert(line.length == strlen(expected));
     assert(memcmp(line.text, expected, line.length) == 0);
 }
@@ -29,6 +32,240 @@ static void expect_mode(EditorCore *core, EditorMode expected)
     EditorMode mode;
     assert(editor_core_send(core, EDITOR_GET_MODE, &mode));
     assert(mode == expected);
+}
+
+static void send_keys(EditorCore *core, const char *keys)
+{
+    while (*keys)
+        send_key(core, (unsigned char)*keys++);
+}
+
+static void expect_register(EditorCore *core, const char *text, int linewise)
+{
+    EditorRegister value;
+    assert(editor_core_send(core, EDITOR_GET_REGISTER, &value));
+    assert(value.length == strlen(text));
+    assert(memcmp(value.text, text, value.length) == 0);
+    assert(value.linewise == linewise);
+}
+
+static void test_visual_commands(void)
+{
+    EditorCore *core = editor_core_create("A\xC3\xA4\xF0\x9F\x98\x80Z\nsecond\nthird");
+    assert(core);
+    send_keys(core, "lvly");
+    expect_register(core, "\xC3\xA4\xF0\x9F\x98\x80", 0);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    send_key(core, 'p');
+    expect_line(core, 0, "A\xC3\xA4\xC3\xA4\xF0\x9F\x98\x80\xF0\x9F\x98\x80Z");
+    send_keys(core, "0v2ld");
+    expect_register(core, "A\xC3\xA4\xC3\xA4", 0);
+    expect_line(core, 0, "\xF0\x9F\x98\x80\xF0\x9F\x98\x80Z");
+    send_keys(core, "Vjy");
+    expect_register(core, "\xF0\x9F\x98\x80\xF0\x9F\x98\x80Z\nsecond\n", 1);
+    send_keys(core, "Gp");
+    expect_line(core, 3, "\xF0\x9F\x98\x80\xF0\x9F\x98\x80Z");
+    expect_line(core, 4, "second");
+    send_keys(core, "Vd");
+    expect_line(core, 3, "second");
+    expect_register(core, "\xF0\x9F\x98\x80\xF0\x9F\x98\x80Z\n", 1);
+    editor_core_destroy(core);
+
+    core = editor_core_create("abcd\nef\n");
+    assert(core);
+    send_keys(core, "2lvh");
+    EditorSelection selection = { 0 };
+    assert(editor_core_send(core, EDITOR_GET_SELECTION, &selection));
+    assert(selection.active && selection.start == 1 && selection.end == 3);
+    send_keys(core, "y");
+    expect_register(core, "bc", 0);
+    send_keys(core, "Vj");
+    selection.line = 1;
+    assert(editor_core_send(core, EDITOR_GET_SELECTION, &selection));
+    assert(selection.active && selection.start == 0 && selection.end == 2 && selection.includes_newline);
+    selection.line = 2;
+    assert(editor_core_send(core, EDITOR_GET_SELECTION, &selection));
+    assert(!selection.active);
+    send_key(core, 27);
+    send_keys(core, "G V");
+    selection.line = 2;
+    assert(editor_core_send(core, EDITOR_GET_SELECTION, &selection));
+    assert(selection.active && selection.end == 0 && selection.includes_newline);
+    send_key(core, 'y');
+    expect_register(core, "\n", 1);
+    editor_core_destroy(core);
+}
+
+static void test_counted_commands(void)
+{
+    EditorCore *core = editor_core_create("one two three four\nline2\nline3\nline4\nline5\nline6\nline7");
+    assert(core);
+    send_keys(core, "2d2w");
+    expect_line(core, 0, "line2");
+    expect_line(core, 1, "line3");
+    expect_register(core, "one two three four\n", 0);
+    editor_core_destroy(core);
+
+    core = editor_core_create("one\ntwo\nthree\nfour\nfive\nsix\nseven");
+    assert(core);
+    send_keys(core, "3G");
+    expect_caret(core, 2, 0);
+    send_keys(core, "gg2dd");
+    expect_line(core, 0, "three");
+    expect_register(core, "one\ntwo\n", 1);
+    send_key(core, 'p');
+    expect_line(core, 1, "one");
+    expect_line(core, 2, "two");
+    send_keys(core, "99gg");
+    expect_caret(core, 6, 0);
+    send_keys(core, "dd");
+    expect_register(core, "seven\n", 1);
+    expect_line(core, 5, "six");
+    send_keys(core, "gg2d2d");
+    expect_line(core, 0, "five");
+    send_keys(core, "yy2p");
+    expect_line(core, 1, "five");
+    expect_line(core, 2, "five");
+    send_keys(core, "gg2x");
+    expect_line(core, 0, "ve");
+    expect_register(core, "fi", 0);
+    send_keys(core, "d$");
+    expect_line(core, 0, "");
+    send_keys(core, "3");
+    send_key(core, 27);
+    send_key(core, 'j');
+    expect_caret(core, 1, 0);
+    send_key(core, 'd');
+    send_key(core, 27);
+    send_key(core, 'j');
+    expect_line(core, 1, "five");
+    expect_caret(core, 2, 0);
+    editor_core_destroy(core);
+}
+
+static void test_command_edges(void)
+{
+    EditorCore *core = editor_core_create("a\nb\nc");
+    assert(core);
+    send_keys(core, "2GdG");
+    expect_line(core, 0, "a");
+    expect_register(core, "b\nc\n", 1);
+    send_keys(core, "p");
+    expect_line(core, 2, "c");
+    send_keys(core, "2GyG");
+    expect_register(core, "b\nc\n", 1);
+    editor_core_destroy(core);
+
+    core = editor_core_create("ab\ncd");
+    assert(core);
+    send_keys(core, "vjy");
+    expect_register(core, "ab\nc", 0);
+    send_keys(core, "2G0vky");
+    expect_register(core, "ab\nc", 0);
+    send_keys(core, "0vl");
+    send_key(core, 27);
+    expect_register(core, "ab\nc", 0);
+    send_keys(core, "0xy");
+    send_key(core, 27);
+    expect_register(core, "a", 0);
+    send_keys(core, "jVp");
+    expect_line(core, 0, "b");
+    expect_line(core, 1, "a");
+    send_keys(core, "ggvp");
+    expect_line(core, 0, "a");
+    editor_core_destroy(core);
+
+    core = editor_core_create("abc");
+    assert(core);
+    send_keys(core, "vly");
+    send_keys(core, "$v0p");
+    expect_line(core, 0, "ab");
+    expect_register(core, "ab", 0);
+    send_keys(core, "0d");
+    send_key(core, 'q');
+    send_key(core, 'x');
+    expect_line(core, 0, "b");
+    unsigned long nine = '9';
+    int overflow = 0;
+    for (size_t digit = 0; digit < 3 * sizeof(size_t); ++digit) {
+        if (!editor_core_send(core, EDITOR_HANDLE_KEY, &nine)) {
+            overflow = 1;
+            break;
+        }
+    }
+    assert(overflow);
+    send_key(core, 27);
+    expect_line(core, 0, "b");
+    editor_core_destroy(core);
+
+    core = editor_core_create("");
+    assert(core);
+    send_keys(core, "ddp");
+    expect_line(core, 0, "");
+    expect_register(core, "\n", 1);
+    send_keys(core, "Vx");
+    expect_line(core, 0, "");
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    assert(!editor_core_send(core, EDITOR_GET_SELECTION, NULL));
+    assert(!editor_core_send(core, EDITOR_GET_REGISTER, NULL));
+    editor_core_destroy(core);
+}
+
+static void test_paste_before(void)
+{
+    EditorCore *core = editor_core_create("A\xC3\xA4Z");
+    assert(core);
+    send_keys(core, "lvy0P");
+    expect_line(core, 0, "\xC3\xA4" "A\xC3\xA4Z");
+    expect_caret(core, 0, 0);
+    send_keys(core, "l2P");
+    expect_line(core, 0, "\xC3\xA4\xC3\xA4\xC3\xA4" "A\xC3\xA4Z");
+    expect_caret(core, 0, 4);
+    expect_register(core, "\xC3\xA4", 0);
+    editor_core_destroy(core);
+
+    core = editor_core_create("one\ntwo\nthree");
+    assert(core);
+    send_keys(core, "yy2G2P");
+    expect_line(core, 0, "one");
+    expect_line(core, 1, "one");
+    expect_line(core, 2, "one");
+    expect_line(core, 3, "two");
+    expect_line(core, 4, "three");
+    expect_caret(core, 1, 0);
+    send_keys(core, "GP");
+    expect_line(core, 4, "one");
+    expect_line(core, 5, "three");
+    expect_caret(core, 4, 0);
+    editor_core_destroy(core);
+
+    core = editor_core_create("a\n");
+    assert(core);
+    send_keys(core, "yyGP");
+    expect_line(core, 0, "a");
+    expect_line(core, 1, "a");
+    expect_line(core, 2, "");
+    expect_caret(core, 1, 0);
+    editor_core_destroy(core);
+
+    core = editor_core_create("");
+    assert(core);
+    send_keys(core, "PddP");
+    expect_line(core, 0, "");
+    expect_caret(core, 0, 0);
+    send_keys(core, "iP");
+    expect_line(core, 0, "P");
+    expect_mode(core, EDITOR_MODE_INSERT);
+    editor_core_destroy(core);
+
+    core = editor_core_create("abc");
+    assert(core);
+    send_keys(core, "vylvP");
+    expect_line(core, 0, "aac");
+    expect_caret(core, 0, 1);
+    expect_register(core, "a", 0);
+    expect_mode(core, EDITOR_MODE_COMMAND);
+    editor_core_destroy(core);
 }
 
 static void test_modes(void)
@@ -97,6 +334,10 @@ static void test_modes(void)
 
 int main(void)
 {
+    test_visual_commands();
+    test_counted_commands();
+    test_command_edges();
+    test_paste_before();
     test_modes();
     EditorCore *core = editor_core_create("ab\r\ncd\ref\n");
     assert(core);
