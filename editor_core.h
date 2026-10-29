@@ -85,8 +85,17 @@ typedef enum EditorMessage {
     EDITOR_GET_DIRECTORY,
     EDITOR_TAKE_DIRECTORY_CHANGE,
     EDITOR_GET_LINE_ENDING,
-    EDITOR_GET_TEXT_BUFFER
+    EDITOR_GET_TEXT_BUFFER,
+    EDITOR_GET_POSITION
 } EditorMessage;
+
+typedef struct EditorPosition {
+    size_t line;
+    size_t column;
+    size_t offset;
+    size_t length;
+    size_t line_count;
+} EditorPosition;
 
 typedef struct EditorDirectoryEntry {
     const char *name;

@@ -2287,6 +2287,28 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
         *(size_t *)data = count;
         return 1;
     }
+    case EDITOR_GET_POSITION: {
+        if (!data)
+            return 0;
+        EditorPosition position = { 0, 0, core->cursor, core->length, 1 };
+        position.column = advance_columns(core, 0, line_start(core, core->cursor), core->cursor);
+        for (size_t index = 0; index < core->length; ++index) {
+            if (core->text[index] != '\n')
+                continue;
+            ++position.line_count;
+            if (index < core->cursor)
+                ++position.line;
+            if (core->line_ending == EDITOR_LINE_ENDING_CRLF) {
+                if (position.length == SIZE_MAX)
+                    return 0;
+                ++position.length;
+                if (index < core->cursor)
+                    ++position.offset;
+            }
+        }
+        *(EditorPosition *)data = position;
+        return 1;
+    }
     case EDITOR_GET_CARET: {
         EditorCaret *caret = data;
         if (!caret)

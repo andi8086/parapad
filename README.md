@@ -31,6 +31,14 @@ Each buffer retains its own text, caret, scroll position, mode, selection,
 settings, undo/redo history, search pattern, repeat command, and yank register.
 Switching buffers cancels any open search/colon input without submitting it.
 
+The status bar shows the current one-based row and total lines (`LN 35/2102`),
+then the display column, followed by
+the caret's byte-position percentage of the whole file and the LF/CRLF format.
+Columns include tab expansion and count each Unicode scalar as one cell.
+The percentage uses serialized file bytes, including CRLF pairs, rather than
+line count or scroll position. An empty buffer shows `LN 1/1, Col 1`, `100%`, and
+`LF`; the end-of-file position in a nonempty buffer shows `100%`.
+
 File > Close (`Ctrl+W`) closes only the active buffer, asking whether to save
 unsaved changes. Cancel or a failed save keeps it open. Closing the final buffer
 creates a fresh untitled buffer. Exit checks every modified buffer, including
@@ -392,6 +400,7 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed file-format `data` and byte `length`, serialized in the selected LF/CRLF mode |
 | `EDITOR_GET_TEXT_BUFFER` | `EditorBuffer *` receiving borrowed normalized editing text and byte length; uses the same offsets as caret/line queries |
 | `EDITOR_GET_LINE_ENDING` | `EditorLineEnding *` receiving `EDITOR_LINE_ENDING_LF` or `EDITOR_LINE_ENDING_CRLF` |
+| `EDITOR_GET_POSITION` | `EditorPosition *` receiving zero-based `line` and display `column`, total `line_count`, plus caret byte `offset` and total byte `length` in the selected serialized file format; read-only |
 | `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; read in binary mode and detect/normalize line endings for editing |
 | `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save arbitrary bytes with line breaks in the selected format |
 | `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
