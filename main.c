@@ -149,7 +149,7 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
     if (first)
         state = cache->lines[first - 1].parsed.end_state;
     EditorBuffer buffer;
-    editor_core_send(core, EDITOR_GET_BUFFER, &buffer);
+    editor_core_send(core, EDITOR_GET_TEXT_BUFFER, &buffer);
     size_t offset = 0;
     for (size_t index = 0; index < first; ++index) {
         const unsigned char *newline = memchr(buffer.data + offset, '\n', buffer.length - offset);
@@ -947,6 +947,14 @@ static void synchronize_directory_path(HWND window, MainWindowState *state)
     }
 }
 
+static void update_line_ending_status(HWND window, EditorCore *core)
+{
+    EditorLineEnding line_ending = EDITOR_LINE_ENDING_LF;
+    editor_core_send(core, EDITOR_GET_LINE_ENDING, &line_ending);
+    SendMessageA(GetDlgItem(window, ID_STATUS), SB_SETTEXTA, 1,
+        (LPARAM)(line_ending == EDITOR_LINE_ENDING_CRLF ? "CRLF" : "LF"));
+}
+
 static void activate_document(HWND window, MainWindowState *state, size_t index)
 {
     if (index >= state->buffer_count)
@@ -970,6 +978,7 @@ static void activate_document(HWND window, MainWindowState *state, size_t index)
     state->active_buffer = index;
     TextBuffer *buffer = state->buffers[index];
     state->core = buffer->core;
+    update_line_ending_status(window, state->core);
     SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)index, 0);
     InvalidateRect(GetDlgItem(window, ID_BUFFER_LIST), NULL, FALSE);
     update_document_title(window, state);
@@ -1137,6 +1146,13 @@ static void layout_main_children(HWND window)
     GetClientRect(window, &rect);
     HWND status = GetDlgItem(window, ID_STATUS);
     SendMessageA(status, WM_SIZE, 0, 0);
+    RECT status_client;
+    GetClientRect(status, &status_client);
+    int grip_width = GetSystemMetrics(SM_CXVSCROLL) + 4;
+    int text_right = status_client.right > grip_width ? status_client.right - grip_width : 0;
+    int status_parts[2] = { text_right > 64 ? text_right - 64 : 0, text_right };
+    SendMessageA(status, SB_SETPARTS, 2, (LPARAM)status_parts);
+    update_line_ending_status(window, state->core);
     RECT status_rect = { 0 };
     GetWindowRect(status, &status_rect);
     int available_height = rect.bottom - (status_rect.bottom - status_rect.top);
@@ -1389,7 +1405,10 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             ((LPCREATESTRUCTA)lp)->hInstance, NULL);
         if (!status)
             return -1;
+        int status_parts[2] = { 0, -1 };
+        SendMessageA(status, SB_SETPARTS, 2, (LPARAM)status_parts);
         SendMessageA(status, SB_SETTEXTA, 0, (LPARAM)"COMMAND");
+        SendMessageA(status, SB_SETTEXTA, 1, (LPARAM)"LF");
 
         HWND list = CreateWindowExA(0, "LISTBOX", NULL,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
@@ -1531,6 +1550,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             mode_text = state->command_error;
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
             (LPARAM)mode_text);
+        update_line_ending_status(hWnd, state->core);
         HWND command = GetDlgItem(hWnd, ID_COMMAND_LINE);
         if ((EditorMode)wp == EDITOR_MODE_COMMAND_LINE && !state->command_active) {
             state->command_active = 1;

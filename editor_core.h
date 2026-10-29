@@ -6,6 +6,11 @@
 
 typedef struct EditorCore EditorCore;
 
+typedef enum EditorLineEnding {
+    EDITOR_LINE_ENDING_LF,
+    EDITOR_LINE_ENDING_CRLF
+} EditorLineEnding;
+
 typedef enum EditorMode {
     EDITOR_MODE_COMMAND,
     EDITOR_MODE_INSERT,
@@ -78,7 +83,9 @@ typedef enum EditorMessage {
     EDITOR_OPEN_DIRECTORY,
     EDITOR_ACTIVATE_DIRECTORY_ENTRY,
     EDITOR_GET_DIRECTORY,
-    EDITOR_TAKE_DIRECTORY_CHANGE
+    EDITOR_TAKE_DIRECTORY_CHANGE,
+    EDITOR_GET_LINE_ENDING,
+    EDITOR_GET_TEXT_BUFFER
 } EditorMessage;
 
 typedef struct EditorDirectoryEntry {

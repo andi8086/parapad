@@ -38,8 +38,9 @@ inactive ones; cancelling keeps the application open with that buffer selected.
 Failed loads leave existing buffers and the selected buffer's state intact.
 
 File I/O uses binary `rb`/`wb` streams and explicit byte lengths. Loading and saving
-do not decode, transcode, normalize newlines, remove a BOM, or stop at NUL or
-Ctrl+Z. Unedited files round-trip byte for byte, including arbitrary non-UTF-8 data.
+do not decode, transcode, remove a BOM, or stop at NUL or Ctrl+Z. LF and CRLF files
+retain their line-ending format; other bytes, including arbitrary non-UTF-8 data,
+are preserved. Mixed LF/CRLF input selects CRLF and is saved consistently as CRLF.
 Paths use ANSI dialogs and the system code page, consistent with the Win95 GUI.
 
 ### Directory Buffers
@@ -70,9 +71,9 @@ The current text view uses LF as its line separator. Valid UTF-8 is displayed as
 characters; malformed bytes show replacement glyphs and control bytes other than
 Tab show dots,
 without modifying their stored bytes. Navigation treats each malformed byte as a
-single unit. CR bytes in CRLF files are retained and displayed as control bytes;
-text typed through the keyboard still inserts LF. This is a raw-buffer foundation
-for a future hex view, not an implemented hex editor.
+single unit. CRLF pairs are displayed as one line break, without a dot for CR.
+Standalone CR bytes remain control bytes. Editing uses normalized LF boundaries
+internally and transparently exports the buffer's selected LF or CRLF format.
 
 ## Syntax Highlighting
 
@@ -287,6 +288,8 @@ status bar. For example:
 :set tabwidth=4
 :set expandtabs=0
 :set expandtabs=1
+:set lf
+:set crlf
 :retab
 ```
 
@@ -295,11 +298,21 @@ Esc closes it without applying the pending command. The input is hidden and
 disabled when inactive, and does not open for colons typed in insert/replace
 mode or as the character following `r`. Commands are limited to 1023 input bytes.
 
-Values are unsigned decimal integers; `expandtabs` accepts only numeric 0 or 1.
+Numeric setting values are unsigned decimal integers; `expandtabs` accepts only 0 or 1.
 Whitespace around `=` is allowed. Unknown commands/settings, negative values,
 invalid booleans, trailing text, integer overflow, and zero `tabwidth` are
 rejected without changing settings. The input stays open for correction and the
 status bar shows `invalid command`.
+
+`:set lf` and `:set crlf` convert every line ending in the current buffer to the
+requested format. The rightmost status-bar field displays `LF` or `CRLF` for the
+active buffer. Loading detects CRLF if any CRLF pair is present; otherwise it
+selects LF, including for empty files. New buffers default to LF. Insert, replace,
+paste, line joins, and save consistently use that buffer's format. Changing the
+format marks the buffer modified and is one undo/redo step; selecting the current
+format is a no-op. Conversions preserve the caret, selection, BOM, NULs, malformed
+UTF-8, and standalone CR bytes, and never add or remove a final line break.
+Directory listings reject these conversions.
 
 `:retab` replaces every real tab in the document with spaces reaching the next
 virtual tab stop, using the current `tabwidth`, but only when `expandtabs=1`.
@@ -373,12 +386,14 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_GET_COMMAND_PREFIX` | `char *` receiving `:` for settings/commands or `/` for search input |
 | `EDITOR_GET_SETTINGS` | `EditorSettings *` receiving `maxcol`, `tabwidth`, and `expandtabs` |
 | `EDITOR_SET_SETTINGS` | `const EditorSettings *` supplying all three settings |
-| `EDITOR_EXECUTE_COMMAND` | NUL-terminated UTF-8 input; execute `set name=value` or `retab` with an optional `:`, or search with `/pattern` |
+| `EDITOR_EXECUTE_COMMAND` | NUL-terminated UTF-8 input; execute `set name=value`, `set lf`, `set crlf`, or `retab` with an optional `:`, or search with `/pattern` |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
-| `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy exactly `length` bytes from `data`, without conversion |
-| `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed raw `data` and byte `length` |
-| `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; load the file verbatim in binary mode |
-| `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save exactly the current buffer's byte length |
+| `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy `length` arbitrary bytes from `data`, detect line endings, and normalize CRLF pairs for editing |
+| `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed file-format `data` and byte `length`, serialized in the selected LF/CRLF mode |
+| `EDITOR_GET_TEXT_BUFFER` | `EditorBuffer *` receiving borrowed normalized editing text and byte length; uses the same offsets as caret/line queries |
+| `EDITOR_GET_LINE_ENDING` | `EditorLineEnding *` receiving `EDITOR_LINE_ENDING_LF` or `EDITOR_LINE_ENDING_CRLF` |
+| `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; read in binary mode and detect/normalize line endings for editing |
+| `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save arbitrary bytes with line breaks in the selected format |
 | `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
 | `EDITOR_TAKE_CHANGE` | `EditorChange *` receiving the change revision and accumulated inclusive changed-line range; consumes the range without affecting undo groups |
 | `EDITOR_REGISTER_LEXER` | `const Lexer *`; register an additional lexer descriptor on this core; registering the same pointer again is a no-op |
@@ -450,7 +465,8 @@ The document is a length-based byte buffer, independent of the system locale.
 `EDITOR_SET_BUFFER` and `EDITOR_LOAD_FILE` accept arbitrary bytes, including NUL
 and invalid UTF-8. Replacing or loading the buffer resets the caret, command state,
 selection, and modified flag, while preserving the yank register. The buffer API
-can therefore be reused by a future hex editor without a text conversion step.
+normalizes CRLF pairs internally while preserving all other bytes. Uniform LF
+or CRLF input round-trips exactly unless edited or explicitly converted.
 `EDITOR_GET_BUFFER` returns a borrowed pointer valid until mutation or destruction;
 always use its length rather than `strlen`. An empty buffer may be supplied as
 `{ NULL, 0 }`. Replacement copies the input and also supports a slice of the old
@@ -465,7 +481,10 @@ preserve valid Unicode scalars and advance one byte over malformed data. Setting
 a column inside a valid UTF-8 sequence clamps to its start. Character queries
 return U+FFFD with length 1 for an invalid byte. Combining sequences are not treated
 as single grapheme clusters.
-CRLF and CR are normalized to LF only during text insertion, never raw loading.
+CRLF and CR are normalized to LF during text insertion. Loading and raw buffer
+replacement normalize only CRLF pairs and retain standalone CR bytes. Line/caret
+offsets refer to normalized editing text, not serialized file-byte offsets;
+`EDITOR_GET_TEXT_BUFFER` exposes that representation for lexers and other views.
 Empty documents have one
 empty line, and a trailing LF creates a final empty line. Deleting a line removes
 its following newline, or the preceding newline when deleting the final line.

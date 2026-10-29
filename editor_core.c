@@ -25,6 +25,7 @@ typedef struct HistoryEntry {
     size_t length;
     size_t cursor;
     size_t revision;
+    EditorLineEnding line_ending;
     struct HistoryEntry *next;
 } HistoryEntry;
 
@@ -41,6 +42,9 @@ struct EditorCore {
     char *text;
     size_t length;
     size_t capacity;
+    EditorLineEnding line_ending;
+    char *serialized_text;
+    size_t serialized_capacity;
     size_t cursor;
     EditorMode mode;
     EditorStatus status;
@@ -222,6 +226,7 @@ static int prepare_edit(EditorCore *core)
         entry->length = core->length;
         entry->cursor = core->cursor;
         entry->revision = core->revision;
+        entry->line_ending = core->line_ending;
         entry->next = core->undo;
         core->undo = entry;
         free_history(core->redo);
@@ -478,6 +483,8 @@ EditorCore *editor_core_create(const char *initial_text)
     core->settings.expandtabs = 1;
     core->command_prefix = ':';
     core->document_change.first_line = SIZE_MAX;
+    core->line_ending = initial_text && strstr(initial_text, "\r\n")
+        ? EDITOR_LINE_ENDING_CRLF : EDITOR_LINE_ENDING_LF;
     if (!insert_text(core, initial_text ? initial_text : "")) {
         editor_core_destroy(core);
         return NULL;
@@ -494,6 +501,7 @@ void editor_core_destroy(EditorCore *core)
         return;
     }
     clear_directory(core);
+    free(core->serialized_text);
     free((void *)core->lexers);
     clear_replace_history(core);
     free(core->search_text);
@@ -676,15 +684,18 @@ static int step_history(EditorCore *core, size_t count, int redo)
         size_t length = core->length;
         size_t cursor = core->revision_cursor;
         size_t revision = core->revision;
+        EditorLineEnding line_ending = core->line_ending;
         core->text = entry->text;
         core->length = entry->length;
         core->capacity = entry->length + 1;
         core->cursor = core->revision_cursor = entry->cursor;
         core->revision = entry->revision;
+        core->line_ending = entry->line_ending;
         entry->text = text;
         entry->length = length;
         entry->cursor = cursor;
         entry->revision = revision;
+        entry->line_ending = line_ending;
         entry->next = *destination;
         *destination = entry;
         core->modified = core->revision != core->saved_revision;
@@ -704,6 +715,17 @@ static int step_history(EditorCore *core, size_t count, int redo)
 
 static void reset_document(EditorCore *core)
 {
+    core->line_ending = EDITOR_LINE_ENDING_LF;
+    size_t length = 0;
+    for (size_t index = 0; index < core->length; ++index) {
+        if (core->text[index] == '\r' && index + 1 < core->length && core->text[index + 1] == '\n') {
+            core->line_ending = EDITOR_LINE_ENDING_CRLF;
+            continue;
+        }
+        core->text[length++] = core->text[index];
+    }
+    core->text[length] = 0;
+    core->length = length;
     note_changed_lines(core, 0, SIZE_MAX);
     free_history(core->undo);
     free_history(core->redo);
@@ -921,14 +943,49 @@ static int activate_directory_entry(EditorCore *core)
     return select_lexer(core, path);
 }
 
+static int serialize_buffer(EditorCore *core, EditorBuffer *buffer)
+{
+    buffer->data = (const unsigned char *)core->text;
+    buffer->length = core->length;
+    if (core->line_ending == EDITOR_LINE_ENDING_LF)
+        return 1;
+    size_t newlines = 0;
+    for (size_t index = 0; index < core->length; ++index)
+        if (core->text[index] == '\n')
+            ++newlines;
+    if (newlines >= SIZE_MAX - core->length)
+        return 0;
+    size_t length = core->length + newlines;
+    if (core->serialized_capacity < length + 1) {
+        char *text = realloc(core->serialized_text, length + 1);
+        if (!text)
+            return 0;
+        core->serialized_text = text;
+        core->serialized_capacity = length + 1;
+    }
+    size_t position = 0;
+    for (size_t index = 0; index < core->length; ++index) {
+        if (core->text[index] == '\n')
+            core->serialized_text[position++] = '\r';
+        core->serialized_text[position++] = core->text[index];
+    }
+    core->serialized_text[position] = 0;
+    buffer->data = (const unsigned char *)core->serialized_text;
+    buffer->length = length;
+    return 1;
+}
+
 static int save_file(EditorCore *core, const char *path)
 {
     if (!path || !*path)
         return 0;
+    EditorBuffer buffer;
+    if (!serialize_buffer(core, &buffer))
+        return 0;
     FILE *file = fopen(path, "wb");
     if (!file)
         return 0;
-    int success = fwrite(core->text, 1, core->length, file) == core->length;
+    int success = fwrite(buffer.data, 1, buffer.length, file) == buffer.length;
     if (fclose(file) != 0)
         success = 0;
     if (success) {
@@ -1879,6 +1936,22 @@ static int execute_command(EditorCore *core, const char *text)
     size_t length = (size_t)(text - name);
     while (*text == ' ' || *text == '\t')
         ++text;
+    if (!*text && ((length == 2 && !memcmp(name, "lf", 2)) ||
+        (length == 4 && !memcmp(name, "crlf", 4)))) {
+        if (core->directory_active)
+            return 0;
+        EditorLineEnding ending = length == 2 ? EDITOR_LINE_ENDING_LF : EDITOR_LINE_ENDING_CRLF;
+        if (ending != core->line_ending) {
+            core->history_open = 0;
+            if (!prepare_edit(core))
+                return 0;
+            core->line_ending = ending;
+            core->modified = 1;
+            core->history_open = 0;
+            note_changed_lines(core, 0, SIZE_MAX);
+        }
+        return complete_command(core);
+    }
     if (*text != '=')
         return 0;
     ++text;
@@ -2045,10 +2118,19 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
         EditorBuffer *buffer = data;
         if (!buffer)
             return 0;
-        buffer->data = (const unsigned char *)core->text;
-        buffer->length = core->length;
-        return 1;
+        return serialize_buffer(core, buffer);
     }
+    case EDITOR_GET_LINE_ENDING:
+        if (!data)
+            return 0;
+        *(EditorLineEnding *)data = core->line_ending;
+        return 1;
+    case EDITOR_GET_TEXT_BUFFER:
+        if (!data)
+            return 0;
+        ((EditorBuffer *)data)->data = (const unsigned char *)core->text;
+        ((EditorBuffer *)data)->length = core->length;
+        return 1;
     case EDITOR_LOAD_FILE:
         return load_file(core, data);
     case EDITOR_SAVE_FILE:
