@@ -50,6 +50,36 @@ single unit. CR bytes in CRLF files are retained and displayed as control bytes;
 text typed through the keyboard still inserts LF. This is a raw-buffer foundation
 for a future hex view, not an implemented hex editor.
 
+## Syntax Highlighting
+
+Files whose names end in `.c`, `.h`, or `.hpp` (case-insensitive) automatically
+use the C/C++ lexer. Save As enables or disables highlighting when the extension changes;
+unnamed buffers and other extensions keep the existing plain-text colors.
+Keywords are cyan, comments green, strings and character literals yellow,
+numbers violet, and preprocessor directives orange. Ordinary C/C++ text is
+light gray on black. Selection colors take precedence.
+
+The standalone `lexer_c_cpp.c` module returns byte-based token spans and ending
+line states, without Windows or editor-core dependencies. It handles multiline
+comments, escaped and continued literals, continued directives and line
+comments, include filenames, and C++ raw strings. It is a lexical highlighter,
+not a preprocessor or a complete C/C++ parser; inactive conditional branches
+are not evaluated. Raw document bytes are never changed.
+
+Each buffer owns its token/state cache. Core change ranges start incremental
+re-lexing at the first affected line; processing continues through the changed
+range until the ending state converges with the cached state. Line insertion
+or deletion, raw replacement, and undo/redo conservatively invalidate the
+remaining affected lines. Token versions also invalidate retained bitmap rows,
+so changing a multiline comment repaints affected lines even if their bytes
+did not change.
+
+In all buffers, displayed text beyond `maxcol` is white on red. The first
+`maxcol` display columns retain their normal colors. Literal tabs use their
+virtual tab stops; only the overflowing part of a tab's width is marked.
+`maxcol=0` disables both this marking and the gray guide. Selected text retains
+the system selection colors.
+
 ## Commands
 
 | Keys | Action |
@@ -218,7 +248,7 @@ settings survive raw load/buffer replacement and are not document edits or undo
 steps. They do not change existing bytes or mark the document modified. Hosts
 should refresh the view after changing settings. The retained bitmap is rebuilt
 when `maxcol` or `tabwidth` changes. The guide moves with horizontal scrolling;
-it does not wrap text or color overlong lines yet.
+it does not wrap text. Text beyond the guide is displayed white on red.
 
 ## Undo And Redo
 
@@ -268,6 +298,7 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; load the file verbatim in binary mode |
 | `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save exactly the current buffer's byte length |
 | `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
+| `EDITOR_TAKE_CHANGE` | `EditorChange *` receiving the change revision and accumulated inclusive changed-line range; consumes the range without affecting undo groups |
 | `EDITOR_UNDO`, `EDITOR_REDO` | NULL; restore one history step, returning to command mode |
 | `EDITOR_GET_SELECTION` | `EditorSelection *`; supply `line`, receive byte `start`/exclusive `end`, `active`, and `includes_newline` |
 | `EDITOR_GET_REGISTER` | `EditorRegister *` receiving borrowed UTF-8 `text`, byte `length`, and `linewise` |
@@ -379,7 +410,7 @@ From a Visual Studio Developer Command Prompt, run:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
 Debug\core-tests\editor_window_tests.exe
 ```
 

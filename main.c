@@ -7,6 +7,22 @@
 #include <string.h>
 
 #include "editor_core.h"
+#include "lexer_c_cpp.h"
+
+typedef struct SyntaxLine {
+    LexerCCppLine parsed;
+    size_t version;
+    int valid;
+} SyntaxLine;
+
+typedef struct SyntaxCache {
+    SyntaxLine *lines;
+    size_t line_count;
+    size_t revision;
+    size_t serial;
+    int valid;
+    int enabled;
+} SyntaxCache;
 
 #define ID_EDITOR 100
 #define ID_FILE_EXIT 101
@@ -29,6 +45,7 @@ typedef struct CachedLine {
     size_t length;
     EditorSelection selection;
     EditorLineCaret caret;
+    size_t syntax_version;
     int exists;
     int valid;
 } CachedLine;
@@ -52,6 +69,8 @@ typedef struct EditorControl {
     int painted_left_pixel;
     int bitmap_valid;
     EditorSettings painted_settings;
+    SyntaxCache *syntax;
+    int syntax_ready;
 } EditorControl;
 
 typedef struct TextBuffer {
@@ -59,6 +78,7 @@ typedef struct TextBuffer {
     char path[MAX_PATH];
     size_t first_line;
     int left_pixel;
+    SyntaxCache syntax;
 } TextBuffer;
 
 typedef struct MainWindowState {
@@ -70,6 +90,103 @@ typedef struct MainWindowState {
     int command_active;
     const char *command_error;
 } MainWindowState;
+
+static void clear_syntax_cache(SyntaxCache *cache)
+{
+    for (size_t index = 0; index < cache->line_count; ++index)
+        lexer_c_cpp_free_line(&cache->lines[index].parsed);
+    free(cache->lines);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
+{
+    if (!cache || !cache->enabled)
+        return 1;
+    EditorChange change;
+    editor_core_send(core, EDITOR_TAKE_CHANGE, &change);
+    if (cache->valid && change.first_line == (size_t)-1 && change.revision == cache->revision)
+        return 1;
+    size_t count;
+    editor_core_send(core, EDITOR_GET_LINE_COUNT, &count);
+    size_t first = cache->valid && change.first_line != (size_t)-1 ? change.first_line : 0;
+    size_t last = cache->valid ? change.last_line : (size_t)-1;
+    if (count != cache->line_count) {
+        if (count > (size_t)-1 / sizeof(*cache->lines)) {
+            cache->valid = 0;
+            return 0;
+        }
+        SyntaxLine *lines = calloc(count, sizeof(*lines));
+        if (!lines) {
+            cache->valid = 0;
+            return 0;
+        }
+        size_t retained = count < cache->line_count ? count : cache->line_count;
+        if (retained)
+            memcpy(lines, cache->lines, retained * sizeof(*lines));
+        for (size_t index = retained; index < cache->line_count; ++index)
+            lexer_c_cpp_free_line(&cache->lines[index].parsed);
+        free(cache->lines);
+        cache->lines = lines;
+        cache->line_count = count;
+        last = (size_t)-1;
+    }
+    if (first >= count)
+        first = count - 1;
+    if (first && !cache->lines[first - 1].valid)
+        first = 0;
+    LexerCCppState state = { 0 };
+    if (first)
+        state = cache->lines[first - 1].parsed.end_state;
+    EditorBuffer buffer;
+    editor_core_send(core, EDITOR_GET_BUFFER, &buffer);
+    size_t offset = 0;
+    for (size_t index = 0; index < first; ++index) {
+        const unsigned char *newline = memchr(buffer.data + offset, '\n', buffer.length - offset);
+        if (!newline) {
+            cache->valid = 0;
+            return 0;
+        }
+        offset = (size_t)(newline - buffer.data) + 1;
+    }
+    for (size_t index = first; index < count; ++index) {
+        const unsigned char *text = buffer.data + offset;
+        const unsigned char *newline = memchr(text, '\n', buffer.length - offset);
+        size_t length = newline ? (size_t)(newline - text) : buffer.length - offset;
+        SyntaxLine *line = &cache->lines[index];
+        LexerCCppLine parsed = { 0 };
+        if (!lexer_c_cpp_line((const char *)text, length, state, &parsed)) {
+            cache->valid = 0;
+            return 0;
+        }
+        int converged = line->valid && lexer_c_cpp_state_equal(&line->parsed.end_state, &parsed.end_state);
+        lexer_c_cpp_free_line(&line->parsed);
+        line->parsed = parsed;
+        line->valid = 1;
+        if (!++cache->serial)
+            ++cache->serial;
+        line->version = cache->serial;
+        state = parsed.end_state;
+        offset += length + (newline != NULL);
+        if (index >= last && converged)
+            break;
+    }
+    cache->revision = change.revision;
+    cache->valid = 1;
+    return 1;
+}
+
+static COLORREF syntax_color(LexerCCppKind kind)
+{
+    switch (kind) {
+    case LEXER_C_CPP_KEYWORD: return RGB(86, 200, 255);
+    case LEXER_C_CPP_NUMBER: return RGB(205, 160, 240);
+    case LEXER_C_CPP_STRING: return RGB(235, 200, 120);
+    case LEXER_C_CPP_COMMENT: return RGB(110, 180, 120);
+    case LEXER_C_CPP_PREPROCESSOR: return RGB(255, 160, 110);
+    default: return RGB(225, 225, 225);
+    }
+}
 
 static int character_to_ansi(unsigned long value, char *text, int capacity)
 {
@@ -139,10 +256,18 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     if (paint)
         editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
     COLORREF normal_color = GetTextColor(dc);
+    COLORREF normal_background = GetBkColor(dc);
+    const LexerCCppLine *syntax = paint && editor->syntax && editor->syntax_ready &&
+        editor->syntax->enabled && index < editor->syntax->line_count ?
+        &editor->syntax->lines[index].parsed : NULL;
+    size_t token_index = 0;
     EditorSettings settings;
     editor_core_send(editor->core, EDITOR_GET_SETTINGS, &settings);
     SIZE space_size = { 0, 0 };
     GetTextExtentPoint32A(dc, " ", 1, &space_size);
+    int column_limit = -1;
+    if (space_size.cx > 0 && settings.maxcol && settings.maxcol <= (size_t)(INT_MAX / space_size.cx))
+        column_limit = (int)settings.maxcol * space_size.cx;
     int width = 0;
     if (hit_column)
         *hit_column = 0;
@@ -168,7 +293,17 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
         }
         if (paint) {
             int left = editor->text_left - editor->left_pixel + width;
-            if (selection.active && character.column >= selection.start && character.column < selection.end) {
+            COLORREF color = normal_color;
+            if (syntax) {
+                while (token_index < syntax->count && character.column >=
+                    syntax->tokens[token_index].start + syntax->tokens[token_index].length)
+                    ++token_index;
+                color = syntax_color(token_index < syntax->count ?
+                    syntax->tokens[token_index].kind : LEXER_C_CPP_TEXT);
+            }
+            SetTextColor(dc, color);
+            int selected = selection.active && character.column >= selection.start && character.column < selection.end;
+            if (selected) {
                 RECT highlight = { left, top, left + extent.cx, top + editor->line_height };
                 SetTextColor(dc, GetSysColor(COLOR_HIGHLIGHTTEXT));
                 SetBkColor(dc, GetSysColor(COLOR_HIGHLIGHT));
@@ -176,6 +311,13 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
                 SetTextColor(dc, normal_color);
             } else {
                 TextOutA(dc, left, top, text, length);
+                if (column_limit >= 0 && width + extent.cx > column_limit) {
+                    int overflow = column_limit > width ? column_limit - width : 0;
+                    RECT highlight = { left + overflow, top, left + extent.cx, top + editor->line_height };
+                    SetTextColor(dc, RGB(255, 255, 255));
+                    SetBkColor(dc, RGB(255, 0, 0));
+                    ExtTextOutA(dc, left, top, ETO_OPAQUE | ETO_CLIPPED, &highlight, text, length, NULL);
+                }
             }
         }
         width += extent.cx;
@@ -189,6 +331,8 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
         SetBkColor(dc, GetSysColor(COLOR_HIGHLIGHT));
         ExtTextOutA(dc, left, top, ETO_OPAQUE, &highlight, "", 0, NULL);
     }
+    SetTextColor(dc, normal_color);
+    SetBkColor(dc, normal_background);
     return width;
 }
 
@@ -246,6 +390,10 @@ static void clear_line_cache(EditorControl *editor)
 
 static void paint_editor(HDC dc, EditorControl *editor, int width, int height, int buffered, int focused)
 {
+    int syntax_ready = update_syntax_cache(editor->syntax, editor->core);
+    if (!syntax_ready || syntax_ready != editor->syntax_ready)
+        editor->bitmap_valid = 0;
+    editor->syntax_ready = syntax_ready;
     EditorCaret primary;
     editor_core_send(editor->core, EDITOR_GET_CARET, &primary);
     EditorSettings settings;
@@ -312,7 +460,10 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
         if (exists && focused && index != primary.line)
             editor_core_send(editor->core, EDITOR_GET_LINE_CARET, &caret);
         CachedLine *cached = editor->lines ? &editor->lines[index % rows] : NULL;
+        size_t syntax_version = syntax_ready && editor->syntax && editor->syntax->enabled &&
+            index < editor->syntax->line_count ? editor->syntax->lines[index].version : 0;
         if (reuse && cached && cached->valid && cached->index == index && cached->exists == exists &&
+            cached->syntax_version == syntax_version &&
             cached->length == line.length && cached->selection.start == selection.start &&
             cached->selection.end == selection.end && cached->selection.active == selection.active &&
             cached->selection.includes_newline == selection.includes_newline &&
@@ -371,6 +522,7 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
                 cached->exists = exists;
                 cached->selection = selection;
                 cached->caret = caret;
+                cached->syntax_version = syntax_version;
                 cached->valid = buffered;
             }
         }
@@ -590,6 +742,17 @@ static const char *buffer_filename(const TextBuffer *buffer)
     return *name ? name : "Untitled";
 }
 
+static void configure_document_syntax(TextBuffer *buffer)
+{
+    const char *extension = strrchr(buffer_filename(buffer), '.');
+    int enabled = extension && (lstrcmpiA(extension, ".c") == 0 ||
+        lstrcmpiA(extension, ".h") == 0 || lstrcmpiA(extension, ".hpp") == 0);
+    if (enabled != buffer->syntax.enabled) {
+        clear_syntax_cache(&buffer->syntax);
+        buffer->syntax.enabled = enabled;
+    }
+}
+
 static TextBuffer *create_document(const char *path)
 {
     TextBuffer *buffer = calloc(1, sizeof(*buffer));
@@ -603,6 +766,7 @@ static TextBuffer *create_document(const char *path)
     }
     if (path)
         lstrcpynA(buffer->path, path, MAX_PATH);
+    configure_document_syntax(buffer);
     return buffer;
 }
 
@@ -636,6 +800,7 @@ static void activate_document(HWND window, MainWindowState *state, size_t index)
     update_document_title(window, state);
     if (control) {
         control->core = buffer->core;
+        control->syntax = &buffer->syntax;
         control->first_line = buffer->first_line;
         control->left_pixel = buffer->left_pixel;
         control->pending_lead = 0;
@@ -704,6 +869,14 @@ static int write_document(HWND window, MainWindowState *state, const char *path)
         return 0;
     }
     lstrcpynA(buffer->path, path, MAX_PATH);
+    configure_document_syntax(buffer);
+    HWND editor = GetDlgItem(window, ID_EDITOR);
+    EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
+    if (control) {
+        control->syntax = &buffer->syntax;
+        control->bitmap_valid = 0;
+        InvalidateRect(editor, NULL, FALSE);
+    }
     HWND list = GetDlgItem(window, ID_BUFFER_LIST);
     LRESULT item = SendMessageA(list, LB_INSERTSTRING, (WPARAM)state->active_buffer,
         (LPARAM)buffer_filename(buffer));
@@ -760,6 +933,7 @@ static int remove_document(HWND window, MainWindowState *state, int quit_last)
     if (state->active_buffer > closing)
         --state->active_buffer;
     editor_core_destroy(buffer->core);
+    clear_syntax_cache(&buffer->syntax);
     free(buffer);
     SendMessageA(GetDlgItem(window, ID_BUFFER_LIST), LB_SETCURSEL, (WPARAM)state->active_buffer, 0);
     InvalidateRect(GetDlgItem(window, ID_BUFFER_LIST), NULL, FALSE);
@@ -902,6 +1076,7 @@ static int execute_window_command(HWND window, MainWindowState *state, const cha
             if (!buffer)
                 return window_command_error(state, "not enough memory");
             lstrcpynA(buffer->path, path, MAX_PATH);
+            configure_document_syntax(buffer);
             if (add_document(window, state, buffer))
                 return 1;
             editor_core_destroy(buffer->core);
@@ -1054,6 +1229,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!command)
             return -1;
         EditorControl *control = (EditorControl *)GetWindowLongPtrA(editor, GWLP_USERDATA);
+        control->syntax = &state->buffers[state->active_buffer]->syntax;
         SendMessageA(command, WM_SETFONT, (WPARAM)control->font, FALSE);
         SendMessageA(command, EM_LIMITTEXT, 1023, 0);
         state->command_proc = (WNDPROC)SetWindowLongPtrA(command, GWLP_WNDPROC, (LONG_PTR)command_line_wnd_proc);
@@ -1239,6 +1415,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (state) {
             for (size_t index = 0; index < state->buffer_count; ++index) {
                 editor_core_destroy(state->buffers[index]->core);
+                clear_syntax_cache(&state->buffers[index]->syntax);
                 free(state->buffers[index]);
             }
             free(state->buffers);

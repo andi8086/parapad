@@ -37,6 +37,7 @@ struct EditorCore {
     size_t search_length;
     int search_whole_word;
     EditorBufferSwitch buffer_switch;
+    EditorChange document_change;
     unsigned long *change_keys;
     size_t change_length;
     size_t change_capacity;
@@ -90,6 +91,32 @@ static void free_history(HistoryEntry *entry)
         free(entry);
         entry = next;
     }
+}
+
+static void note_changed_lines(EditorCore *core, size_t first, size_t last)
+{
+    ++core->document_change.revision;
+    if (first < core->document_change.first_line)
+        core->document_change.first_line = first;
+    if (last > core->document_change.last_line)
+        core->document_change.last_line = last;
+}
+
+static void note_change(EditorCore *core, size_t start, size_t end, const char *text, size_t length)
+{
+    size_t first = 0;
+    size_t removed_lines = 0;
+    size_t added_lines = 0;
+    for (size_t index = 0; index < start; ++index)
+        if (core->text[index] == '\n')
+            ++first;
+    for (size_t index = start; index < end; ++index)
+        if (core->text[index] == '\n')
+            ++removed_lines;
+    for (size_t index = 0; index < length; ++index)
+        if (text[index] == '\n')
+            ++added_lines;
+    note_changed_lines(core, first, removed_lines == added_lines ? first + added_lines : SIZE_MAX);
 }
 
 static int prepare_edit(EditorCore *core)
@@ -243,6 +270,8 @@ static int insert_text(EditorCore *core, const char *text)
         free(normalized);
         return 0;
     }
+    if (count)
+        note_change(core, core->cursor, core->cursor, normalized, count);
     memmove(core->text + core->cursor + count, core->text + core->cursor,
         core->length - core->cursor + 1);
     memcpy(core->text + core->cursor, normalized, count);
@@ -313,6 +342,8 @@ static int erase_text(EditorCore *core, size_t start, size_t end)
 {
     if (start != end && !prepare_edit(core))
         return 0;
+    if (start != end)
+        note_change(core, start, end, NULL, 0);
     if (core->block_insert && (start < core->block_insert_start || end > core->cursor))
         core->block_insert = 0;
     if (start != end)
@@ -353,6 +384,7 @@ EditorCore *editor_core_create(const char *initial_text)
     core->settings.tabwidth = 8;
     core->settings.expandtabs = 1;
     core->command_prefix = ':';
+    core->document_change.first_line = SIZE_MAX;
     if (!insert_text(core, initial_text ? initial_text : "")) {
         editor_core_destroy(core);
         return NULL;
@@ -468,6 +500,7 @@ static int finish_block_insert(EditorCore *core)
                 free(text);
                 return 0;
             }
+            note_change(core, position, position, text, length);
             memmove(core->text + position + length, core->text + position,
                 core->length - position + 1);
             memcpy(core->text + position, text, length);
@@ -561,6 +594,8 @@ static int step_history(EditorCore *core, size_t count, int redo)
         core->modified = core->revision != core->saved_revision;
         changed = 1;
     }
+    if (changed)
+        note_changed_lines(core, 0, SIZE_MAX);
     core->status = changed ? EDITOR_STATUS_NONE : EDITOR_STATUS_NO_CHANGE;
     core->history_open = 0;
     core->block_insert = 0;
@@ -573,6 +608,7 @@ static int step_history(EditorCore *core, size_t count, int redo)
 
 static void reset_document(EditorCore *core)
 {
+    note_changed_lines(core, 0, SIZE_MAX);
     free_history(core->undo);
     free_history(core->redo);
     core->undo = core->redo = NULL;
@@ -1021,6 +1057,8 @@ static int paste_register(EditorCore *core, size_t count, int before)
         free(text);
         return 0;
     }
+    if (changed)
+        note_change(core, range.start, range.end, text, length);
     memmove(core->text + range.start + length, core->text + range.end,
         core->length - range.end + 1);
     memcpy(core->text + range.start, text, length);
@@ -1042,6 +1080,7 @@ static int write_span(EditorCore *core, size_t start, size_t end, const char *te
     if (length != end - start || (length && memcmp(core->text + start, text, length) != 0)) {
         if (!prepare_edit(core))
             return 0;
+        note_change(core, start, end, text, length);
         core->modified = 1;
     }
     memmove(core->text + start + length, core->text + end, core->length - end + 1);
@@ -1653,6 +1692,13 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     default: break;
     }
     switch (message) {
+    case EDITOR_TAKE_CHANGE:
+        if (!data)
+            return 0;
+        *(EditorChange *)data = core->document_change;
+        core->document_change.first_line = SIZE_MAX;
+        core->document_change.last_line = 0;
+        return 1;
     case EDITOR_TAKE_BUFFER_SWITCH:
         if (!data)
             return 0;

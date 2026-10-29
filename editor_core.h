@@ -68,8 +68,15 @@ typedef enum EditorMessage {
     EDITOR_SET_SETTINGS,
     EDITOR_EXECUTE_COMMAND,
     EDITOR_GET_COMMAND_PREFIX,
-    EDITOR_TAKE_BUFFER_SWITCH
+    EDITOR_TAKE_BUFFER_SWITCH,
+    EDITOR_TAKE_CHANGE
 } EditorMessage;
+
+typedef struct EditorChange {
+    size_t revision;
+    size_t first_line;
+    size_t last_line;
+} EditorChange;
 
 typedef struct EditorBufferSwitch {
     size_t count;
