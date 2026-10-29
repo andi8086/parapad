@@ -138,6 +138,10 @@ the Makefile lexer. Directory names are ignored, including dots in directories;
 `.bat` and `.cmd` (case-insensitive) select the DOS batch lexer.
 `.pas` and `.dpr` select Pascal/Delphi, and `.bas` selects BASIC, also
 case-insensitively.
+`.htm` and `.html` select HTML; `.ini` selects INI. An exact basename of
+`config.sys` selects the DOS CONFIG.SYS lexer. These matches are also
+case-insensitive (`CONFIG.SYS` works), but unrelated `.sys` files and names
+such as `config.sys.bak` do not select it.
 Save As switches lexers or disables highlighting when the extension changes;
 unnamed buffers and other extensions keep the existing plain-text colors.
 Keywords are cyan, comments green, strings and character literals yellow,
@@ -221,8 +225,37 @@ Apostrophe comments and statement-leading `REM` are green, including after
 line numbers, colons, `THEN`, or `ELSE`. FreeBASIC `/' ... '/` block comments
 support nesting and carry state across lines. Leading `#` directives are
 orange. This is a shared lexical highlighter, not a dialect-specific parser
-or conditional-compilation evaluator. Both new lexers preserve raw bytes and
+or conditional-compilation evaluator. These lexers preserve raw bytes and
 return spans covering the entire input line, including uncolored text.
+
+[lexer_html.c](lexer_html.c) highlights tag names and delimiters, attribute
+names, quoted and unquoted attribute values, and semicolon-terminated named
+or numeric character references such as `&amp;`, `&#160;`, and `&#xA0;`.
+Comments, tags, quoted attributes, declarations, processing instructions, and
+CDATA sections carry state across lines. Tag matching is case-insensitive.
+Contents of `script` and `style` remain plain text until their matching closing
+tag, so embedded `<` characters do not start HTML tags. `title` and `textarea`
+contents similarly remain text, with entity highlighting. This does not
+include JavaScript/CSS highlighting, evaluate templates, or validate HTML.
+
+[lexer_ini.c](lexer_ini.c) highlights `[section]` headers, assignment keys,
+`=` separators, quoted strings, decimal/scientific/hexadecimal numbers, and
+common boolean values. Full-line `;` and `#` comments are green; a semicolon
+preceded by whitespace also starts an inline comment outside quotes. Hashes
+inside values and semicolons embedded in paths remain literal text.
+Backslashes in quoted values are literal, and doubled quotes are supported.
+INI dialect-specific interpolation and multiline values are not evaluated.
+
+[lexer_config_sys.c](lexer_config_sys.c) highlights DOS startup directives
+such as `DEVICE`, `DEVICEHIGH`, `DOS`, `FILES`, `BUFFERS`, `SHELL`, `SET`, and
+menu directives. `[menu]`, `[common]`, and custom menu section headers,
+command-line switches, `%NAME%` references, quoted paths, numeric parameters,
+and common values such as `HIGH`, `UMB`, `ON`, and `OFF` have distinct colors.
+Leading `REM` and semicolon comments are green. Boot-time `?`/`!` prefixes
+and a trailing directive `?` are recognized. Matching is case-insensitive.
+The lexer does not execute directives or expand variables. Both configuration
+lexers handle lines independently, preserve arbitrary bytes, and accept a
+leading UTF-8 BOM without confusing the first section or directive.
 
 Each buffer owns its selected lexer and token/state cache. The renderer uses only
 the generic callbacks and token kinds; switching lexers clears the previous
@@ -763,7 +796,7 @@ cl /nologo /W3 /std:c11 /c /DHAVE_CONFIG_H /DPCRE2_CODE_UNIT_WIDTH=8 /DPCRE2_STA
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c editor_core_tests.c Debug\pcre2\*.obj
+cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c lexer_html.c lexer_ini.c lexer_config_sys.c editor_core_tests.c Debug\pcre2\*.obj
 Debug\core-tests\editor_core_tests.exe
 ```
 
@@ -774,7 +807,7 @@ objects above for the same architecture, run:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c Debug\pcre2\*.obj user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c lexer_html.c lexer_ini.c lexer_config_sys.c Debug\pcre2\*.obj user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
 Debug\core-tests\editor_window_tests.exe
 ```
 
