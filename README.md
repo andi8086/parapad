@@ -913,6 +913,44 @@ does not produce Windows 95-compatible binaries; an appropriate legacy toolchain
 and actual Windows 95 testing are still required for deployment there. Windows 95
 is 32-bit only.
 
+## Virtual Buffer Regression Tests
+
+Build the standalone Windows console suite without running it:
+
+```bat
+MSBuild virtual_buffer_tests.vcxproj /t:Build /p:Configuration=Debug /p:Platform=Win32
+```
+
+The test project reuses the application's core, backend, lexers, and vendored
+PCRE2 sources, but excludes the GUI entry point. Its executable and objects are
+isolated under `Debug\virtual-tests\Win32`, so compiling the suite does not
+overwrite application objects or a running editor. Use `Platform=x64` for a
+separate 64-bit build. Assertions must remain enabled.
+
+To execute it explicitly after building:
+
+```bat
+Debug\virtual-tests\Win32\virtual_buffer_tests.exe
+```
+
+The suite compares every document byte against an independent byte-array model,
+including NULs, invalid UTF-8 bytes, mixed endings, and edits spanning 64 KiB
+boundaries. It covers empty/exact-chunk-size documents, insert/delete/replace,
+streamed splices, deterministic edit sequences, shared snapshot lifetimes,
+source detachment, save/reload, and editor undo/redo. Failed temporary creation,
+short input streams, and failed regex mappings must not change document bytes;
+failed substitutions must not create undo history or mark the document dirty.
+
+Mapped regex coverage checks lookarounds, backreferences, captured replacements,
+multiple matches crossing chunk boundaries, and preservation of non-text bytes
+and line endings. LF/CRLF conversions are checked byte-for-byte, through history
+and save/reload. C/C++ highlighting compares tokens and end states from virtual
+line reads with contiguous reference input, including a multiline comment across
+a chunk boundary and comment-state changes after editing, undo, and redo.
+This checks lexer integration, not GUI painting or the viewport syntax cache.
+All file fixtures are test-created temporary files; no editor windows are opened
+and no existing processes are terminated.
+
 ## Core Tests
 
 From a Visual Studio Developer Command Prompt in the repository directory:
@@ -946,6 +984,6 @@ the active filename's border, compact/large window layout, close confirmation,
 failed opens, and exit prompts for inactive modified buffers. Test-owned dialogs
 are answered automatically.
 
-The standalone tests do not link the GUI or Windows libraries. Assertions must
+The original core tests do not link the GUI or Windows libraries. Assertions must
 remain enabled (do not define `NDEBUG`). Test objects use a separate directory so
 the command prompt's target architecture cannot overwrite application objects.
