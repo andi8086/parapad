@@ -93,8 +93,16 @@ typedef enum EditorMessage {
     EDITOR_GET_TEXT_BUFFER,
     EDITOR_GET_POSITION,
     EDITOR_SET_PAGE_SIZE,
-    EDITOR_GET_COMMAND_PROMPT
+    EDITOR_GET_COMMAND_PROMPT,
+    EDITOR_REPLACE_BYTES
 } EditorMessage;
+
+typedef struct EditorByteEdit {
+    size_t offset;
+    size_t remove_length;
+    const unsigned char *data;
+    size_t length;
+} EditorByteEdit;
 
 typedef struct EditorPosition {
     size_t line;

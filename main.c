@@ -38,6 +38,8 @@ typedef struct SyntaxCache {
 #define ID_BUFFER_LIST 108
 #define ID_FILE_CLOSE 109
 #define ID_SECOND_EDITOR 110
+#define ID_VIEW_TEXT 111
+#define ID_VIEW_HEX 112
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
 #define WM_EDITOR_REFRESH (WM_APP + 3)
@@ -79,6 +81,15 @@ typedef struct EditorControl {
     EditorSettings painted_settings;
     SyntaxCache *syntax;
     int syntax_ready;
+    int hex_mode;
+    int hex_ascii;
+    int hex_low;
+    int hex_insert;
+    size_t hex_offset;
+    size_t hex_first;
+    int hex_left;
+    int character_width;
+    EditorCore *hex_core;
 } EditorControl;
 
 typedef struct TextBuffer {
@@ -367,6 +378,270 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     return width;
 }
 
+static int hex_buffer(EditorControl *editor, EditorBuffer *buffer)
+{
+    if (!editor_core_send(editor->core, EDITOR_GET_BUFFER, buffer))
+        return 0;
+    if (editor->hex_core != editor->core) {
+        editor->hex_core = editor->core;
+        editor->hex_offset = 0;
+        editor->hex_first = 0;
+        editor->hex_left = 0;
+        editor->hex_low = 0;
+    }
+    if (editor->hex_offset > buffer->length) {
+        editor->hex_offset = buffer->length;
+        editor->hex_low = 0;
+    }
+    size_t last = buffer->length / 16;
+    if (editor->hex_first > last)
+        editor->hex_first = last;
+    return 1;
+}
+
+static int hex_column(const EditorControl *editor)
+{
+    int slot = (int)(editor->hex_offset % 16);
+    return editor->hex_ascii ? 61 + slot : 10 + slot * 3 + (slot >= 8) + editor->hex_low;
+}
+
+static size_t hex_page(HWND window, const EditorControl *editor)
+{
+    RECT rect;
+    GetClientRect(window, &rect);
+    int rows = (rect.bottom - 16) / editor->line_height;
+    return rows > 0 ? (size_t)rows : 1;
+}
+
+static void position_hex_caret(HWND window, EditorControl *editor, int reveal)
+{
+    EditorBuffer buffer;
+    if (!hex_buffer(editor, &buffer))
+        return;
+    size_t row = editor->hex_offset / 16;
+    size_t page = hex_page(window, editor);
+    RECT rect;
+    GetClientRect(window, &rect);
+    int left = hex_column(editor) * editor->character_width;
+    int minimum = 10 * editor->character_width;
+    int available = rect.right > 24 ? rect.right - 24 : 1;
+    if (reveal) {
+        if (row < editor->hex_first)
+            editor->hex_first = row;
+        else if (row - editor->hex_first >= page)
+            editor->hex_first = row - page + 1;
+        if (left - editor->hex_left < minimum)
+            editor->hex_left = left - minimum;
+        else if (left - editor->hex_left >= available)
+            editor->hex_left = left - available + editor->character_width;
+    }
+    int page_width = rect.right - 16 - minimum;
+    if (page_width < 1)
+        page_width = 1;
+    SCROLLINFO scroll = { 0 };
+    scroll.cbSize = sizeof(scroll);
+    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+    scroll.nMax = 68 * editor->character_width - 1;
+    scroll.nPage = (UINT)page_width;
+    int maximum = scroll.nMax + 1 - page_width;
+    if (maximum < 0)
+        maximum = 0;
+    if (editor->hex_left > maximum)
+        editor->hex_left = maximum;
+    if (editor->hex_left < 0)
+        editor->hex_left = 0;
+    scroll.nPos = editor->hex_left;
+    SetScrollInfo(window, SB_HORZ, &scroll, TRUE);
+    if (GetFocus() == window) {
+        if (row < editor->hex_first || row - editor->hex_first >= page ||
+            left - editor->hex_left < minimum || left - editor->hex_left >= rect.right - 8)
+            SetCaretPos(-2, -editor->line_height);
+        else
+            SetCaretPos(8 + left - editor->hex_left,
+                8 + (int)(row - editor->hex_first) * editor->line_height);
+    }
+}
+
+static void paint_hex_editor(HDC dc, EditorControl *editor, int width, int height, int focused)
+{
+    RECT rect = { 0, 0, width, height };
+    FillRect(dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    editor->bitmap_valid = 0;
+    EditorBuffer buffer;
+    if (!hex_buffer(editor, &buffer))
+        return;
+    HGDIOBJ old_font = SelectObject(dc, editor->font);
+    SetBkMode(dc, TRANSPARENT);
+    size_t rows = height > 16 ? (size_t)((height - 17) / editor->line_height + 1) : 0;
+    int saved = SaveDC(dc);
+    if (saved)
+        IntersectClipRect(dc, 8, 8, width - 8, height - 8);
+    for (size_t row = 0; row < rows; ++row) {
+        size_t index = editor->hex_first + row;
+        if (index > buffer.length / 16)
+            break;
+        size_t offset = index * 16;
+        char line[79];
+        memset(line, ' ', 78);
+        line[78] = 0;
+        char address[9];
+        snprintf(address, sizeof(address), "%08lX", (unsigned long)offset);
+        memcpy(line, address, 8);
+        line[60] = '|';
+        line[77] = '|';
+        static const char digits[] = "0123456789ABCDEF";
+        size_t count = buffer.length - offset;
+        if (count > 16)
+            count = 16;
+        for (size_t slot = 0; slot < count; ++slot) {
+            unsigned char byte = buffer.data[offset + slot];
+            size_t column = 10 + slot * 3 + (slot >= 8);
+            line[column] = digits[byte >> 4];
+            line[column + 1] = digits[byte & 15];
+            line[61 + slot] = byte >= 32 && byte <= 126 ? (char)byte : '.';
+        }
+        int top = 8 + (int)row * editor->line_height;
+        int left = 8 - editor->hex_left;
+        int body_left = 8 + 10 * editor->character_width;
+        RECT body = { body_left, top, width - 8, top + editor->line_height };
+        SetTextColor(dc, RGB(225, 225, 225));
+        if (body.right > body.left)
+            ExtTextOutA(dc, left + 10 * editor->character_width, top, ETO_CLIPPED,
+                &body, line + 10, 68, NULL);
+        SetTextColor(dc, RGB(86, 200, 255));
+        TextOutA(dc, 8, top, line, 8);
+        if (focused && editor->hex_offset / 16 == index) {
+            int slot = (int)(editor->hex_offset % 16);
+            for (int field = 0; field < 2; ++field) {
+                int column = field ? 61 + slot : 10 + slot * 3 + (slot >= 8);
+                int length = field ? 1 : 2;
+                RECT highlight = { left + column * editor->character_width, top,
+                    left + (column + length) * editor->character_width, top + editor->line_height };
+                if (highlight.left < body_left)
+                    highlight.left = body_left;
+                if (highlight.right > width - 8)
+                    highlight.right = width - 8;
+                if (highlight.right <= highlight.left)
+                    continue;
+                SetTextColor(dc, RGB(255, 255, 255));
+                SetBkColor(dc, field == editor->hex_ascii ? RGB(40, 85, 130) : RGB(60, 60, 60));
+                ExtTextOutA(dc, left + column * editor->character_width, top,
+                    ETO_OPAQUE | ETO_CLIPPED, &highlight,
+                    line + column, length, NULL);
+            }
+        }
+    }
+    if (saved)
+        RestoreDC(dc, saved);
+    SelectObject(dc, old_font);
+}
+
+static int hex_edit(EditorControl *editor, size_t remove_length, const unsigned char *data, size_t length)
+{
+    EditorByteEdit edit = { editor->hex_offset, remove_length, data, length };
+    return editor_core_send(editor->core, EDITOR_REPLACE_BYTES, &edit);
+}
+
+static int handle_hex_key(HWND window, EditorControl *editor, unsigned long key, int control)
+{
+    EditorBuffer buffer;
+    if (!hex_buffer(editor, &buffer))
+        return 0;
+    size_t length = buffer.length;
+    size_t distance = hex_page(window, editor) * 16;
+    switch (key) {
+    case EDITOR_KEY_LEFT:
+        if (!editor->hex_ascii && editor->hex_low)
+            editor->hex_low = 0;
+        else if (editor->hex_offset) {
+            --editor->hex_offset;
+            editor->hex_low = !editor->hex_ascii;
+        }
+        return 1;
+    case EDITOR_KEY_RIGHT:
+        if (!editor->hex_ascii && !editor->hex_low && editor->hex_offset < length)
+            editor->hex_low = 1;
+        else if (editor->hex_offset < length) {
+            ++editor->hex_offset;
+            editor->hex_low = 0;
+        }
+        return 1;
+    case EDITOR_KEY_UP: distance = 16; break;
+    case EDITOR_KEY_DOWN: distance = 16; break;
+    case EDITOR_KEY_PAGE_UP: case EDITOR_KEY_PAGE_DOWN: break;
+    case EDITOR_KEY_HOME:
+        editor->hex_offset = control ? 0 : editor->hex_offset / 16 * 16;
+        editor->hex_low = 0;
+        return 1;
+    case EDITOR_KEY_END: {
+        size_t end = editor->hex_offset / 16 * 16;
+        end += length - end < 15 ? length - end : 15;
+        editor->hex_offset = control ? length : end;
+        editor->hex_low = 0;
+        return 1;
+    }
+    case EDITOR_KEY_DELETE:
+        editor->hex_low = 0;
+        return editor->hex_offset == length || hex_edit(editor, 1, NULL, 0);
+    case 8:
+        editor->hex_low = 0;
+        if (!editor->hex_offset)
+            return 1;
+        --editor->hex_offset;
+        if (!hex_edit(editor, 1, NULL, 0)) {
+            ++editor->hex_offset;
+            return 0;
+        }
+        return 1;
+    case 9:
+        editor->hex_ascii = !editor->hex_ascii;
+        editor->hex_low = 0;
+        return 1;
+    case 27:
+        editor->hex_low = 0;
+        return 1;
+    case 26: case 25: case 18:
+        editor->hex_low = 0;
+        return editor_core_send(editor->core, key == 26 ? EDITOR_UNDO : EDITOR_REDO, NULL);
+    default: {
+        unsigned char byte;
+        size_t remove_length = editor->hex_offset < length ? 1 : 0;
+        if (editor->hex_ascii) {
+            if (key < 32 || key > 126)
+                return 0;
+            byte = (unsigned char)key;
+            if (editor->hex_insert)
+                remove_length = 0;
+        } else {
+            int nibble = key >= '0' && key <= '9' ? (int)(key - '0') :
+                key >= 'a' && key <= 'f' ? (int)(key - 'a') + 10 :
+                key >= 'A' && key <= 'F' ? (int)(key - 'A') + 10 : -1;
+            if (nibble < 0)
+                return 0;
+            if (editor->hex_insert && !editor->hex_low)
+                remove_length = 0;
+            byte = remove_length ? buffer.data[editor->hex_offset] : 0;
+            byte = editor->hex_low ? (unsigned char)((byte & 0xF0) | nibble) :
+                (unsigned char)((byte & 0x0F) | (nibble << 4));
+        }
+        if (!hex_edit(editor, remove_length, &byte, 1))
+            return 0;
+        if (editor->hex_ascii || editor->hex_low) {
+            ++editor->hex_offset;
+            editor->hex_low = 0;
+        } else {
+            editor->hex_low = 1;
+        }
+        return 1;
+    }
+    }
+    if (key == EDITOR_KEY_UP || key == EDITOR_KEY_PAGE_UP)
+        editor->hex_offset -= distance > editor->hex_offset ? editor->hex_offset : distance;
+    else
+        editor->hex_offset += distance > length - editor->hex_offset ? length - editor->hex_offset : distance;
+    return 1;
+}
+
 static void update_editor_caret(HWND window, EditorControl *editor)
 {
     if (window != active_editor(GetParent(window))) {
@@ -380,9 +655,23 @@ static void update_editor_caret(HWND window, EditorControl *editor)
     }
     EditorMode mode;
     editor_core_send(editor->core, EDITOR_GET_MODE, &mode);
+    if (editor->hex_mode) {
+        EditorDirectory directory;
+        editor_core_send(editor->core, EDITOR_GET_DIRECTORY, &directory);
+        if (directory.active) {
+            editor->hex_mode = 0;
+            ShowScrollBar(window, SB_HORZ, FALSE);
+        }
+    }
     EditorStatus status;
     editor_core_send(editor->core, EDITOR_GET_STATUS, &status);
+    if (editor->hex_mode)
+        position_hex_caret(window, editor, 1);
     SendMessageA(GetParent(window), WM_EDITOR_MODE_CHANGED, (WPARAM)mode, (LPARAM)status);
+    if (editor->hex_mode) {
+        InvalidateRect(window, NULL, FALSE);
+        return;
+    }
     EditorCaret caret;
     editor_core_send(editor->core, EDITOR_GET_CARET, &caret);
     HDC dc = GetDC(window);
@@ -625,6 +914,7 @@ static int set_editor_font(HWND window, EditorControl *editor, int points)
     if (editor->line_height < 1)
         editor->line_height = 1;
     editor->text_left = 8 + number_size.cx + 16;
+    editor->character_width = metrics.tmAveCharWidth > 0 ? metrics.tmAveCharWidth : 1;
     editor->bitmap_valid = 0;
     editor->pending_lead = 0;
     SendMessageA(GetDlgItem(GetParent(window), ID_COMMAND_LINE), WM_SETFONT, (WPARAM)font, TRUE);
@@ -668,6 +958,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         editor->first_line = 0;
         editor->left_pixel = 0;
         editor->pending_lead = 0;
+        editor->hex_core = NULL;
         update_editor_caret(hWnd, editor);
         return 0;
     case WM_SETFOCUS:
@@ -685,6 +976,32 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (editor)
             update_editor_caret(hWnd, editor);
         return 0;
+    case WM_HSCROLL: {
+        if (!editor || !editor->hex_mode)
+            break;
+        SCROLLINFO scroll = { 0 };
+        scroll.cbSize = sizeof(scroll);
+        scroll.fMask = SIF_ALL;
+        GetScrollInfo(hWnd, SB_HORZ, &scroll);
+        int position = editor->hex_left;
+        int maximum = scroll.nMax - (int)scroll.nPage + 1;
+        if (maximum < 0)
+            maximum = 0;
+        switch (LOWORD(wp)) {
+        case SB_LINELEFT: position -= editor->character_width; break;
+        case SB_LINERIGHT: position += editor->character_width; break;
+        case SB_PAGELEFT: position -= (int)scroll.nPage; break;
+        case SB_PAGERIGHT: position += (int)scroll.nPage; break;
+        case SB_THUMBTRACK: case SB_THUMBPOSITION: position = scroll.nTrackPos; break;
+        case SB_LEFT: position = 0; break;
+        case SB_RIGHT: position = maximum; break;
+        default: return 0;
+        }
+        editor->hex_left = position < 0 ? 0 : position > maximum ? maximum : position;
+        position_hex_caret(hWnd, editor, 0);
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+    }
     case WM_MOUSEWHEEL: {
         if (!editor)
             return 0;
@@ -705,6 +1022,22 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         size_t rows = scroll_lines == WHEEL_PAGESCROLL ? page_lines : (size_t)scroll_lines;
         size_t steps = (size_t)(notches < 0 ? -notches : notches);
         size_t distance = steps > (size_t)-1 / rows ? (size_t)-1 : steps * rows;
+        if (editor->hex_mode) {
+            EditorBuffer buffer;
+            if (!hex_buffer(editor, &buffer))
+                return 0;
+            size_t count = buffer.length / 16 + 1;
+            size_t last = count > page_lines ? count - page_lines : 0;
+            size_t first = editor->hex_first > last ? last : editor->hex_first;
+            if (notches > 0)
+                first -= distance > first ? first : distance;
+            else
+                first += distance > last - first ? last - first : distance;
+            editor->hex_first = first;
+            position_hex_caret(hWnd, editor, 0);
+            InvalidateRect(hWnd, NULL, FALSE);
+            return 0;
+        }
         size_t count;
         editor_core_send(editor->core, EDITOR_GET_LINE_COUNT, &count);
         size_t last = count > page_lines ? count - page_lines : 0;
@@ -740,6 +1073,45 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         SetFocus(hWnd);
         int mouse_x = (short)LOWORD(lp);
         int mouse_y = (short)HIWORD(lp);
+        if (editor->hex_mode) {
+            EditorBuffer buffer;
+            if (!hex_buffer(editor, &buffer))
+                return 0;
+            int column = (mouse_x - 8 + editor->hex_left) / editor->character_width;
+            if (mouse_x < 8 + 10 * editor->character_width)
+                column = 10;
+            int slot = 0;
+            editor->hex_ascii = column >= 60;
+            if (editor->hex_ascii) {
+                slot = column - 61;
+                editor->hex_low = 0;
+            } else {
+                int best = INT_MAX;
+                for (int index = 0; index < 16; ++index) {
+                    int start = 10 + index * 3 + (index >= 8);
+                    int delta = column < start ? start - column : column > start + 1 ? column - start - 1 : 0;
+                    if (delta < best) {
+                        best = delta;
+                        slot = index;
+                        editor->hex_low = column > start;
+                    }
+                }
+            }
+            if (slot < 0)
+                slot = 0;
+            if (slot > 15)
+                slot = 15;
+            size_t row = editor->hex_first + (mouse_y > 8 ? (mouse_y - 8) / editor->line_height : 0);
+            size_t last = buffer.length / 16;
+            if (row > last)
+                row = last;
+            size_t offset = row * 16;
+            editor->hex_offset = offset + ((size_t)slot > buffer.length - offset ? buffer.length - offset : (size_t)slot);
+            if (editor->hex_offset == buffer.length)
+                editor->hex_low = 0;
+            update_editor_caret(hWnd, editor);
+            return 0;
+        }
         size_t count;
         editor_core_send(editor->core, EDITOR_GET_LINE_COUNT, &count);
         EditorCaret caret = {
@@ -784,6 +1156,12 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         unsigned long key;
+        if (editor->hex_mode && wp == VK_INSERT) {
+            editor->hex_insert = !editor->hex_insert;
+            editor->hex_low = 0;
+            update_editor_caret(hWnd, editor);
+            return 0;
+        }
         switch (wp) {
         case VK_ESCAPE: key = 27; break;
         case VK_DELETE: key = EDITOR_KEY_DELETE; break;
@@ -800,8 +1178,14 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (SendMessageA(GetParent(hWnd), WM_EDITOR_WINDOW_KEY, (WPARAM)key, 0))
             return 0;
         editor->pending_lead = 0;
-        for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat)
-            send_editor_key(editor, key);
+        for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat) {
+            int success = editor->hex_mode ?
+                handle_hex_key(hWnd, editor, key, GetKeyState(VK_CONTROL) < 0) : send_editor_key(editor, key);
+            if (!success) {
+                MessageBeep(MB_ICONWARNING);
+                break;
+            }
+        }
         update_editor_caret(hWnd, editor);
         return 0;
     }
@@ -811,6 +1195,16 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (GetKeyState(VK_CONTROL) < 0 &&
             (wp == '+' || wp == '=' || wp == '-' || wp == '_' || wp == 0 || wp == 29 || wp == 31))
             return 0;
+        if (editor->hex_mode) {
+            for (unsigned int repeat = 0; repeat < LOWORD(lp); ++repeat) {
+                if (!handle_hex_key(hWnd, editor, (unsigned long)wp, GetKeyState(VK_CONTROL) < 0)) {
+                    MessageBeep(MB_ICONWARNING);
+                    break;
+                }
+            }
+            update_editor_caret(hWnd, editor);
+            return 0;
+        }
         if (wp >= ' ' && wp != 127) {
             if (!dispatch_ansi_key(editor, wp, LOWORD(lp)))
                 MessageBeep(MB_ICONWARNING);
@@ -865,7 +1259,10 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
             HDC draw_dc = editor->back_bitmap && editor->back_width == width &&
                 editor->back_height == height ? editor->memdc : dc;
-            paint_editor(draw_dc, editor, width, height, draw_dc == editor->memdc, GetFocus() == hWnd);
+            if (editor->hex_mode)
+                paint_hex_editor(draw_dc, editor, width, height, GetFocus() == hWnd);
+            else
+                paint_editor(draw_dc, editor, width, height, draw_dc == editor->memdc, GetFocus() == hWnd);
 
             if (draw_dc == editor->memdc)
                 BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
@@ -1105,6 +1502,21 @@ static void synchronize_directory_path(HWND window, MainWindowState *state)
 
 static void update_buffer_status(HWND window, EditorCore *core)
 {
+    HWND view = active_editor(window);
+    EditorControl *control = view ? (EditorControl *)GetWindowLongPtrA(view, GWLP_USERDATA) : NULL;
+    if (control && control->hex_mode && control->core == core) {
+        EditorBuffer buffer;
+        if (hex_buffer(control, &buffer)) {
+            char text[192];
+            snprintf(text, sizeof(text), "OFFSET %08lX    %zu / %zu bytes    %s",
+                (unsigned long)control->hex_offset, control->hex_offset, buffer.length,
+                control->hex_ascii ? "ASCII" : "HEX");
+            HWND status = GetDlgItem(window, ID_STATUS);
+            SendMessageA(status, SB_SETTEXTA, 1, (LPARAM)text);
+            SendMessageA(status, SB_SETTEXTA, 2, (LPARAM)"BYTES");
+            return;
+        }
+    }
     EditorLineEnding line_ending = EDITOR_LINE_ENDING_LF;
     editor_core_send(core, EDITOR_GET_LINE_ENDING, &line_ending);
     EditorPosition position = { 0 };
@@ -1392,6 +1804,60 @@ static void cancel_window_command(HWND window, MainWindowState *state)
     ShowWindow(command, SW_HIDE);
     EnableWindow(command, FALSE);
     SetWindowTextA(command, "");
+}
+
+static int set_editor_view(HWND window, MainWindowState *state, int hex)
+{
+    HWND view = active_editor(window);
+    EditorControl *editor = (EditorControl *)GetWindowLongPtrA(view, GWLP_USERDATA);
+    if (!editor || editor->hex_mode == hex)
+        return 1;
+    EditorDirectory directory;
+    editor_core_send(editor->core, EDITOR_GET_DIRECTORY, &directory);
+    if (hex && directory.active)
+        return 0;
+    EditorBuffer buffer;
+    if (!hex_buffer(editor, &buffer) || buffer.length > 0xFFFFFFFFUL)
+        return 0;
+    cancel_window_command(window, state);
+    state->window_pending = 0;
+    if (hex) {
+        EditorPosition position;
+        editor_core_send(editor->core, EDITOR_GET_POSITION, &position);
+        unsigned long escape = 27;
+        editor_core_send(editor->core, EDITOR_HANDLE_KEY, &escape);
+        editor->hex_offset = position.offset;
+        editor->hex_first = editor->hex_offset / 16;
+        editor->hex_low = 0;
+        editor->hex_left = 0;
+    } else {
+        EditorBuffer text;
+        editor_core_send(editor->core, EDITOR_GET_TEXT_BUFFER, &text);
+        int expanded = buffer.length != text.length;
+        size_t offset = 0;
+        EditorCaret caret = { 0, 0 };
+        for (size_t index = 0; index < text.length; ++index) {
+            size_t width = expanded && text.data[index] == '\n' ? 2 : 1;
+            if (editor->hex_offset - offset < width)
+                break;
+            offset += width;
+            if (text.data[index] == '\n') {
+                ++caret.line;
+                caret.column = 0;
+            } else {
+                ++caret.column;
+            }
+        }
+        editor_core_send(editor->core, EDITOR_SET_CARET, &caret);
+    }
+    editor->hex_mode = hex;
+    ShowScrollBar(view, SB_HORZ, hex ? TRUE : FALSE);
+    editor->pending_lead = 0;
+    editor->bitmap_valid = 0;
+    SetFocus(view);
+    layout_main_children(window);
+    update_editor_caret(view, editor);
+    return 1;
 }
 
 static void select_pane(HWND window, MainWindowState *state, int pane)
@@ -1872,6 +2338,16 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyMenu(menu);
             return -1;
         }
+        HMENU view_menu = CreatePopupMenu();
+        if (!view_menu ||
+            !AppendMenuA(view_menu, MF_STRING | MF_CHECKED, ID_VIEW_TEXT, "&Text Mode") ||
+            !AppendMenuA(view_menu, MF_STRING, ID_VIEW_HEX, "&Hex Mode") ||
+            !AppendMenuA(menu, MF_POPUP, (UINT_PTR)view_menu, "&View")) {
+            if (view_menu)
+                DestroyMenu(view_menu);
+            DestroyMenu(menu);
+            return -1;
+        }
         if (!SetMenu(hWnd, menu)) {
             DestroyMenu(menu);
             return -1;
@@ -1924,6 +2400,19 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         layout_main_children(hWnd);
         return 0;
+    case WM_INITMENUPOPUP: {
+        HWND view = active_editor(hWnd);
+        EditorControl *editor = view ? (EditorControl *)GetWindowLongPtrA(view, GWLP_USERDATA) : NULL;
+        if (editor && (HMENU)wp == GetSubMenu(GetMenu(hWnd), 1)) {
+            CheckMenuRadioItem((HMENU)wp, ID_VIEW_TEXT, ID_VIEW_HEX,
+                editor->hex_mode ? ID_VIEW_HEX : ID_VIEW_TEXT, MF_BYCOMMAND);
+            EditorDirectory directory;
+            editor_core_send(editor->core, EDITOR_GET_DIRECTORY, &directory);
+            EnableMenuItem((HMENU)wp, ID_VIEW_HEX,
+                MF_BYCOMMAND | (directory.active ? MF_GRAYED : MF_ENABLED));
+        }
+        return 0;
+    }
     case WM_EDITOR_FOCUS:
         if (state)
             select_pane(hWnd, state, (HWND)wp == state->second_editor ? 1 : 0);
@@ -2060,6 +2549,9 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             mode_text = "substitution failed";
         if (state->command_error)
             mode_text = state->command_error;
+        EditorControl *editor = (EditorControl *)GetWindowLongPtrA(active_editor(hWnd), GWLP_USERDATA);
+        if (editor && editor->hex_mode)
+            mode_text = editor->hex_insert ? "HEX INSERT" : "HEX OVERWRITE";
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
             (LPARAM)mode_text);
         update_buffer_status(hWnd, state->core);
@@ -2100,6 +2592,11 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         switch (LOWORD(wp)) {
+        case ID_VIEW_TEXT:
+        case ID_VIEW_HEX:
+            if (!set_editor_view(hWnd, state, LOWORD(wp) == ID_VIEW_HEX))
+                MessageBeep(MB_ICONWARNING);
+            return 0;
         case ID_FILE_NEW: {
             open_document(hWnd, state, NULL);
             return 0;

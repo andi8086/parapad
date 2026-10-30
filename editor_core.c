@@ -36,6 +36,7 @@ typedef struct HistoryEntry {
     size_t cursor;
     size_t revision;
     EditorLineEnding line_ending;
+    int literal_bytes;
     struct HistoryEntry *next;
 } HistoryEntry;
 
@@ -53,6 +54,7 @@ struct EditorCore {
     size_t length;
     size_t capacity;
     EditorLineEnding line_ending;
+    int literal_bytes;
     char *serialized_text;
     size_t serialized_capacity;
     size_t cursor;
@@ -241,6 +243,7 @@ static int prepare_edit(EditorCore *core)
         entry->cursor = core->cursor;
         entry->revision = core->revision;
         entry->line_ending = core->line_ending;
+        entry->literal_bytes = core->literal_bytes;
         entry->next = core->undo;
         core->undo = entry;
         free_history(core->redo);
@@ -702,17 +705,20 @@ static int step_history(EditorCore *core, size_t count, int redo)
         size_t cursor = core->revision_cursor;
         size_t revision = core->revision;
         EditorLineEnding line_ending = core->line_ending;
+        int literal_bytes = core->literal_bytes;
         core->text = entry->text;
         core->length = entry->length;
         core->capacity = entry->length + 1;
         core->cursor = core->revision_cursor = entry->cursor;
         core->revision = entry->revision;
         core->line_ending = entry->line_ending;
+        core->literal_bytes = entry->literal_bytes;
         entry->text = text;
         entry->length = length;
         entry->cursor = cursor;
         entry->revision = revision;
         entry->line_ending = line_ending;
+        entry->literal_bytes = literal_bytes;
         entry->next = *destination;
         *destination = entry;
         core->modified = core->revision != core->saved_revision;
@@ -730,19 +736,46 @@ static int step_history(EditorCore *core, size_t count, int redo)
     return 1;
 }
 
-static void reset_document(EditorCore *core)
+static EditorLineEnding inspect_line_endings(const char *text, size_t length, int *literal)
 {
-    core->line_ending = EDITOR_LINE_ENDING_LF;
-    size_t length = 0;
-    for (size_t index = 0; index < core->length; ++index) {
-        if (core->text[index] == '\r' && index + 1 < core->length && core->text[index + 1] == '\n') {
-            core->line_ending = EDITOR_LINE_ENDING_CRLF;
+    int pairs = 0;
+    int bare = 0;
+    for (size_t index = 0; index < length; ++index) {
+        if (text[index] == '\n') {
+            if (index && text[index - 1] == '\r')
+                pairs = 1;
+            else
+                bare = 1;
+        }
+    }
+    *literal = pairs && bare;
+    return pairs ? EDITOR_LINE_ENDING_CRLF : EDITOR_LINE_ENDING_LF;
+}
+
+static size_t normalize_line_endings(char *text, size_t length, size_t *cursor)
+{
+    size_t count = 0;
+    size_t removed = 0;
+    for (size_t index = 0; index < length; ++index) {
+        if (text[index] == '\r' && index + 1 < length && text[index + 1] == '\n') {
+            if (index < *cursor)
+                ++removed;
             continue;
         }
-        core->text[length++] = core->text[index];
+        text[count++] = text[index];
     }
-    core->text[length] = 0;
-    core->length = length;
+    text[count] = 0;
+    *cursor -= removed;
+    return count;
+}
+
+static void reset_document(EditorCore *core)
+{
+    core->line_ending = inspect_line_endings(core->text, core->length, &core->literal_bytes);
+    if (!core->literal_bytes) {
+        size_t cursor = 0;
+        core->length = normalize_line_endings(core->text, core->length, &cursor);
+    }
     note_changed_lines(core, 0, SIZE_MAX);
     free_history(core->undo);
     free_history(core->redo);
@@ -964,7 +997,7 @@ static int serialize_buffer(EditorCore *core, EditorBuffer *buffer)
 {
     buffer->data = (const unsigned char *)core->text;
     buffer->length = core->length;
-    if (core->line_ending == EDITOR_LINE_ENDING_LF)
+    if (core->literal_bytes || core->line_ending == EDITOR_LINE_ENDING_LF)
         return 1;
     size_t newlines = 0;
     for (size_t index = 0; index < core->length; ++index)
@@ -1399,6 +1432,50 @@ static int write_span(EditorCore *core, size_t start, size_t end, const char *te
     if (length)
         memcpy(core->text + start, text, length);
     core->length = remaining + length;
+    return 1;
+}
+
+static int replace_bytes(EditorCore *core, const EditorByteEdit *edit)
+{
+    EditorBuffer buffer;
+    if (!edit || (edit->length && !edit->data) || !serialize_buffer(core, &buffer) ||
+        edit->offset > buffer.length || edit->remove_length > buffer.length - edit->offset)
+        return 0;
+    size_t remaining = buffer.length - edit->remove_length;
+    if (edit->length > SIZE_MAX - 1 - remaining)
+        return 0;
+    if (edit->length == edit->remove_length &&
+        (!edit->length || !memcmp(buffer.data + edit->offset, edit->data, edit->length)))
+        return 1;
+    size_t length = remaining + edit->length;
+    char *text = malloc(length + 1);
+    if (!text)
+        return 0;
+    memcpy(text, buffer.data, edit->offset);
+    if (edit->length)
+        memcpy(text + edit->offset, edit->data, edit->length);
+    memcpy(text + edit->offset + edit->length, buffer.data + edit->offset + edit->remove_length,
+        buffer.length - edit->offset - edit->remove_length);
+    text[length] = 0;
+    int literal;
+    EditorLineEnding ending = inspect_line_endings(text, length, &literal);
+    size_t cursor = edit->offset;
+    if (!literal)
+        length = normalize_line_endings(text, length, &cursor);
+    int success = reserve_text(core, length) && prepare_edit(core) &&
+        write_span(core, 0, core->length, text, length);
+    free(text);
+    if (!success)
+        return 0;
+    core->literal_bytes = literal;
+    core->line_ending = ending;
+    core->modified = 1;
+    core->cursor = cursor;
+    core->anchor = core->cursor;
+    core->mode = EDITOR_MODE_COMMAND;
+    core->status = EDITOR_STATUS_NONE;
+    clear_replace_history(core);
+    reset_command(core);
     return 1;
 }
 
@@ -2703,10 +2780,15 @@ static int execute_command(EditorCore *core, const char *text)
         if (core->directory_active)
             return 0;
         EditorLineEnding ending = length == 2 ? EDITOR_LINE_ENDING_LF : EDITOR_LINE_ENDING_CRLF;
-        if (ending != core->line_ending) {
+        if (ending != core->line_ending || core->literal_bytes) {
             core->history_open = 0;
             if (!prepare_edit(core))
                 return 0;
+            if (core->literal_bytes) {
+                core->length = normalize_line_endings(core->text, core->length, &core->cursor);
+                core->anchor = core->cursor;
+                core->literal_bytes = 0;
+            }
             core->line_ending = ending;
             core->modified = 1;
             core->history_open = 0;
@@ -2758,7 +2840,7 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
         switch (message) {
         case EDITOR_ADD_CHAR: case EDITOR_ADD_CODEPOINT: case EDITOR_INSERT_TEXT:
         case EDITOR_BACKSPACE: case EDITOR_DELETE_CHAR: case EDITOR_DELETE_LINE:
-        case EDITOR_UNDO: case EDITOR_REDO: case EDITOR_SAVE_FILE:
+        case EDITOR_UNDO: case EDITOR_REDO: case EDITOR_SAVE_FILE: case EDITOR_REPLACE_BYTES:
             return 0;
         case EDITOR_EXECUTE_COMMAND: {
             const char *command = data;
@@ -2883,6 +2965,8 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
         return step_history(core, 1, 1);
     case EDITOR_SET_BUFFER:
         return set_buffer(core, data);
+    case EDITOR_REPLACE_BYTES:
+        return replace_bytes(core, data);
     case EDITOR_GET_BUFFER: {
         EditorBuffer *buffer = data;
         if (!buffer)
@@ -3072,7 +3156,7 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
             ++position.line_count;
             if (index < core->cursor)
                 ++position.line;
-            if (core->line_ending == EDITOR_LINE_ENDING_CRLF) {
+            if (!core->literal_bytes && core->line_ending == EDITOR_LINE_ENDING_CRLF) {
                 if (position.length == SIZE_MAX)
                     return 0;
                 ++position.length;
@@ -3185,6 +3269,7 @@ int editor_core_send(EditorCore *core, EditorMessage message, void *data)
             }
         }
         switch (message) {
+        case EDITOR_REPLACE_BYTES:
         case EDITOR_ADD_CHAR: case EDITOR_ADD_CODEPOINT: case EDITOR_INSERT_TEXT:
         case EDITOR_BACKSPACE: case EDITOR_DELETE_CHAR: case EDITOR_DELETE_LINE:
         case EDITOR_SET_CARET: case EDITOR_MOVE_LEFT: case EDITOR_MOVE_RIGHT:
