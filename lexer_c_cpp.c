@@ -63,7 +63,10 @@ static int add_token(LexerCCppLine *line, size_t start, size_t end, LexerCCppKin
         line->tokens = tokens;
         line->capacity = capacity;
     }
-    LexerCCppToken token = { start, end - start, kind };
+    LexerCCppToken token;
+    token.start = start;
+    token.length = end - start;
+    token.kind = kind;
     line->tokens[line->count++] = token;
     return 1;
 }

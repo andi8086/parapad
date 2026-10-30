@@ -13,6 +13,12 @@
 #include "editor_core.h"
 #include "lexer.h"
 
+#ifndef OPENFILENAME_SIZE_VERSION_400A
+#       define OPENFILENAME_SIZE_VERSION_400A \
+                (sizeof(OPENFILENAMEA) - sizeof(void *) * 3 \
+                - sizeof(DWORD) * 2)
+#endif
+
 static UINT legacy_wheel_message;
 
 typedef struct SyntaxLine {
@@ -171,7 +177,8 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core, size_t firs
     }
     LexerLine carry = { 0 };
     for (size_t index = begin; index < first + count; ++index) {
-        EditorLine text = { index, NULL, 0 };
+        EditorLine text = {0};
+        text.index = index;
         if (!editor_core_send(core, EDITOR_GET_LINE, &text))
             break;
         LexerLine parsed = { 0 };
@@ -285,8 +292,10 @@ static int dispatch_ansi_key(EditorControl *editor, WPARAM value, unsigned int r
 static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     size_t byte_limit, int top, int paint, int hit_x, size_t *hit_column)
 {
-    EditorCharacter character = { index, 0, 0, 0 };
-    EditorSelection selection = { index, 0, 0, 0, 0 };
+    EditorCharacter character = {0};
+    character.line = index;
+    EditorSelection selection = {0};
+    selection.line = index;
     if (paint)
         editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
     COLORREF normal_color = GetTextColor(dc);
@@ -343,7 +352,12 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
             SetTextColor(dc, color);
             int selected = selection.active && character.column >= selection.start && character.column < selection.end;
             if (selected) {
-                RECT highlight = { left, top, left + extent.cx, top + editor->line_height };
+                RECT highlight;
+                highlight.left = left;
+                highlight.top = top;
+                highlight.right = left + extent.cx;
+                highlight.bottom = top + editor->line_height;
+
                 SetTextColor(dc, GetSysColor(COLOR_HIGHLIGHTTEXT));
                 SetBkColor(dc, GetSysColor(COLOR_HIGHLIGHT));
                 ExtTextOutA(dc, left, top, ETO_OPAQUE, &highlight, text, length, NULL);
@@ -352,7 +366,11 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
                 TextOutA(dc, left, top, text, length);
                 if (column_limit >= 0 && width + extent.cx > column_limit) {
                     int overflow = column_limit > width ? column_limit - width : 0;
-                    RECT highlight = { left + overflow, top, left + extent.cx, top + editor->line_height };
+                    RECT highlight;
+                    highlight.left = left + overflow;
+                    highlight.top = top;
+                    highlight.right = left + extent.cx;
+                    highlight.bottom = top + editor->line_height;
                     SetTextColor(dc, RGB(255, 255, 255));
                     SetBkColor(dc, RGB(255, 0, 0));
                     ExtTextOutA(dc, left, top, ETO_OPAQUE | ETO_CLIPPED, &highlight, text, length, NULL);
@@ -366,7 +384,11 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
         SIZE space = { 0, 0 };
         GetTextExtentPoint32A(dc, " ", 1, &space);
         int left = editor->text_left - editor->left_pixel + width;
-        RECT highlight = { left, top, left + space.cx, top + editor->line_height };
+        RECT highlight;
+        highlight.left = left;
+        highlight.top = top;
+        highlight.right = left + space.cx;
+        highlight.bottom = top + editor->line_height;
         SetBkColor(dc, GetSysColor(COLOR_HIGHLIGHT));
         ExtTextOutA(dc, left, top, ETO_OPAQUE, &highlight, "", 0, NULL);
     }
@@ -464,7 +486,11 @@ static void position_hex_caret(HWND window, EditorControl *editor, int reveal)
 
 static void paint_hex_editor(HDC dc, EditorControl *editor, int width, int height, int focused)
 {
-    RECT rect = { 0, 0, width, height };
+    RECT rect;
+    rect.left = 0;
+    rect.top = 0;
+    rect.right = width;
+    rect.bottom = height;
     FillRect(dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
     editor->bitmap_valid = 0;
     EditorBuffer buffer;
@@ -494,7 +520,10 @@ static void paint_hex_editor(HDC dc, EditorControl *editor, int width, int heigh
         if (count > 16)
             count = 16;
         unsigned char bytes[16];
-        EditorReadRange range = { offset, bytes, count };
+        EditorReadRange range;
+        range.offset = offset;
+        range.data = bytes;
+        range.length = count;
         if (!editor_core_send(editor->core, EDITOR_READ_RANGE, &range))
             break;
         for (size_t slot = 0; slot < count; ++slot) {
@@ -507,7 +536,11 @@ static void paint_hex_editor(HDC dc, EditorControl *editor, int width, int heigh
         int top = 8 + (int)row * editor->line_height;
         int left = 8 - editor->hex_left;
         int body_left = 8 + 10 * editor->character_width;
-        RECT body = { body_left, top, width - 8, top + editor->line_height };
+        RECT body;
+        body.left = body_left;
+        body.top = top;
+        body.right = width - 8;
+        body.bottom = top + editor->line_height;
         SetTextColor(dc, RGB(225, 225, 225));
         if (body.right > body.left)
             ExtTextOutA(dc, left + 10 * editor->character_width, top, ETO_CLIPPED,
@@ -519,8 +552,13 @@ static void paint_hex_editor(HDC dc, EditorControl *editor, int width, int heigh
             for (int field = 0; field < 2; ++field) {
                 int column = field ? 61 + slot : 10 + slot * 3 + (slot >= 8);
                 int length = field ? 1 : 2;
-                RECT highlight = { left + column * editor->character_width, top,
-                    left + (column + length) * editor->character_width, top + editor->line_height };
+                RECT highlight;
+                highlight.left = left +
+                        column * editor->character_width;
+                highlight.top = top;
+                highlight.right = left + (column + length) *
+                        editor->character_width;
+                highlight.bottom = top + editor->line_height;
                 if (highlight.left < body_left)
                     highlight.left = body_left;
                 if (highlight.right > width - 8)
@@ -542,7 +580,11 @@ static void paint_hex_editor(HDC dc, EditorControl *editor, int width, int heigh
 
 static int hex_edit(EditorControl *editor, size_t remove_length, const unsigned char *data, size_t length)
 {
-    EditorByteEdit edit = { editor->hex_offset, remove_length, data, length };
+    EditorByteEdit edit;
+    edit.offset = editor->hex_offset;
+    edit.length = remove_length;
+    edit.data = data;
+    edit.length = length;
     return editor_core_send(editor->core, EDITOR_REPLACE_BYTES, &edit);
 }
 
@@ -638,11 +680,12 @@ static int handle_hex_key(HWND window, EditorControl *editor, unsigned long key,
         case 'k': key = EDITOR_KEY_UP; break;
         case '0': key = EDITOR_KEY_HOME; control = 0; break;
         case '$': key = EDITOR_KEY_END; control = 0; break;
-        case 'u': case 21:
+        case 'u': key = 26; break;
+        case 21:
         case 'd': case 4: {
             size_t rows = hex_page(window, editor) / 2;
             distance = (rows ? rows : 1) * 16;
-            key = key == 'u' || key == 21 ? EDITOR_KEY_PAGE_UP : EDITOR_KEY_PAGE_DOWN;
+            key = key == 21 ? EDITOR_KEY_PAGE_UP : EDITOR_KEY_PAGE_DOWN;
             break;
         }
         case 'b': case 2: key = EDITOR_KEY_PAGE_UP; break;
@@ -726,7 +769,10 @@ static int handle_hex_key(HWND window, EditorControl *editor, unsigned long key,
                 remove_length = 0;
             byte = 0;
             if (remove_length) {
-                EditorReadRange range = { editor->hex_offset, &byte, 1 };
+                EditorReadRange range;
+                range.offset = editor->hex_offset;
+                range.data = &byte;
+                range.length = 1;
                 if (!editor_core_send(editor->core, EDITOR_READ_RANGE, &range))
                     return 0;
             }
@@ -867,7 +913,11 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
             reuse = 0;
     }
     if (!reuse) {
-        RECT rect = { 0, 0, width, height };
+        RECT rect;
+        rect.left = 0;
+        rect.top = 0;
+        rect.right = width;
+        rect.bottom = height;
         FillRect(dc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
         for (size_t index = 0; index < editor->line_count; ++index)
             editor->lines[index].valid = 0;
@@ -888,14 +938,17 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
     size_t last_text_line = (size_t)-1;
     for (size_t row = 0; row < rows; ++row) {
         size_t index = editor->first_line + row;
-        EditorLine line = { index, NULL, 0 };
+        EditorLine line = {0};
+        line.index = index;
         int exists = index <= last_text_line && editor_core_send(editor->core, EDITOR_GET_LINE, &line);
         if (exists && line.truncated)
             last_text_line = index;
-        EditorSelection selection = { index, 0, 0, 0, 0 };
+        EditorSelection selection = {0};
+        selection.line = index;
         if (exists)
             editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
-        EditorLineCaret caret = { index, 0, 0, 0 };
+        EditorLineCaret caret = {0};
+        caret.line = index;
         if (exists && focused && index != primary.line)
             editor_core_send(editor->core, EDITOR_GET_LINE_CARET, &caret);
         CachedLine *cached = editor->lines ? &editor->lines[index % rows] : NULL;
@@ -914,12 +967,20 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
             continue;
 
         int top = 8 + (int)row * editor->line_height;
-        RECT dirty = { 0, top, width, top + editor->line_height };
+        RECT dirty;
+        dirty.left = 0;
+        dirty.top = top;
+        dirty.right = width;
+        dirty.bottom = top + editor->line_height;
         if (dirty.bottom > height - 8)
             dirty.bottom = height - 8;
         FillRect(dc, &dirty, (HBRUSH)GetStockObject(BLACK_BRUSH));
         if (guide_brush) {
-            RECT marker = { guide, dirty.top, guide + 1, dirty.bottom };
+            RECT marker;
+            marker.left = guide;
+            marker.top = dirty.top;
+            marker.right = guide + 1;
+            marker.bottom = dirty.bottom;
             FillRect(dc, &marker, guide_brush);
         }
         if (exists) {
@@ -941,7 +1002,11 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
                     int left = editor->text_left - editor->left_pixel + offset;
                     if (space.cx > 0 && caret.advance <= (size_t)((INT_MAX - offset) / space.cx)) {
                         left += (int)caret.advance * space.cx;
-                        RECT cursor = { left, top, left + 2, top + editor->line_height };
+                        RECT cursor;
+                        cursor.left = left;
+                        cursor.top = top;
+                        cursor.right = left + 2;
+                        cursor.bottom = top + editor->line_height;
                         FillRect(dc, &cursor, (HBRUSH)GetStockObject(WHITE_BRUSH));
                     }
                 }
@@ -1237,12 +1302,13 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!editor_core_send(editor->core, EDITOR_GET_KNOWN_LINE_COUNT, &known))
             return 0;
         size_t count = known.count;
-        EditorCaret caret = {
-            editor->first_line + (mouse_y > 8 ? (mouse_y - 8) / editor->line_height : 0), 0
-        };
+        EditorCaret caret = {0};
+        caret.line = editor->first_line +
+                (mouse_y > 8 ? (mouse_y - 8) / editor->line_height : 0);
         if (caret.line >= count)
             caret.line = count - 1;
-        EditorLine line = { caret.line, NULL, 0 };
+        EditorLine line = {0};
+        line.index = caret.line;
         editor_core_send(editor->core, EDITOR_GET_LINE, &line);
         int target = mouse_x >= editor->text_left ? mouse_x - editor->text_left + editor->left_pixel : 0;
         if (target > 0) {
@@ -1536,7 +1602,10 @@ static int list_directory(void *context, const char *path, EditorDirectoryEmit e
         return 0;
     char *parent = NULL;
     if (change_directory(NULL, path, "..", &parent) && lstrcmpiA(path, parent)) {
-        EditorDirectoryEntry entry = { "..", parent, 1 };
+        EditorDirectoryEntry entry;
+        entry.name = "..";
+        entry.path = parent;
+        entry.is_directory = 1;
         if (!emit(emit_context, &entry)) {
             free(parent);
             return 0;
@@ -1558,8 +1627,11 @@ static int list_directory(void *context, const char *path, EditorDirectoryEmit e
             success = 0;
             break;
         }
-        EditorDirectoryEntry entry = { name, entry_path,
-            (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 };
+        EditorDirectoryEntry entry;
+        entry.name = name;
+        entry.path = entry_path;
+        entry.is_directory =
+                (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         success = emit(emit_context, &entry);
         free(name);
         if (!success)
@@ -1807,7 +1879,7 @@ static int open_document(HWND window, MainWindowState *state, const char *path)
 static int choose_file(HWND window, char *path, int save)
 {
     OPENFILENAMEA dialog = { 0 };
-    dialog.lStructSize = OPENFILENAME_SIZE_VERSION_400A;
+    dialog.lStructSize = sizeof(OPENFILENAMEA);// OPENFILENAME_SIZE_VERSION_400A;
     dialog.hwndOwner = window;
     dialog.lpstrFilter = "All Files (*.*)\0*.*\0\0";
     dialog.lpstrFile = path;
@@ -1949,8 +2021,10 @@ static void layout_main_children(HWND window)
     GetClientRect(status, &status_client);
     int grip_width = GetSystemMetrics(SM_CXVSCROLL) + 4;
     int text_right = status_client.right > grip_width ? status_client.right - grip_width : 0;
-    int status_parts[3] = { text_right > 544 ? text_right - 544 : 0,
-        text_right > 64 ? text_right - 64 : 0, text_right };
+    int status_parts[3];
+    status_parts[0] = text_right > 544 ? text_right - 544 : 0;
+    status_parts[1] = text_right > 64 ? text_right - 64 : 0;
+    status_parts[1] = text_right;
     SendMessageA(status, SB_SETPARTS, 3, (LPARAM)status_parts);
     update_buffer_status(window, state->core);
     RECT status_rect = { 0 };

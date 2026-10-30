@@ -15,7 +15,6 @@
 #include "virtual_buffer.h"
 
 #define PCRE2_CODE_UNIT_WIDTH 8
-#define PCRE2_STATIC
 #include "third_party/pcre2/src/pcre2.h"
 
 #include <stdint.h>
@@ -1089,7 +1088,9 @@ static int open_directory(EditorCore *core, const char *path)
         if (separator)
             document.text[document.length++] = '\n';
     }
-    EditorBuffer buffer = { (const unsigned char *)document.text, document.length };
+    EditorBuffer buffer;
+    buffer.data = (const unsigned char *)document.text;
+    buffer.length = document.length;
     if (success)
         success = set_buffer(core, &buffer);
     free(document.text);
@@ -1278,7 +1279,10 @@ static int use_range(EditorCore *core, TextRange range, int remove)
 
 static TextRange counted_lines(const EditorCore *core, size_t count)
 {
-    TextRange range = { line_start(core, core->cursor), core->cursor, 1 };
+    TextRange range;
+    range.start = line_start(core, core->cursor);
+    range.end = core->cursor;
+    range.linewise = 1;
     while (count--) {
         range.end = line_end(core, range.end);
         if (range.end == core->length)
@@ -1568,7 +1572,10 @@ static int paste_register(EditorCore *core, size_t count, int before)
 {
     if (!core->register_length)
         return 1;
-    TextRange range = { core->cursor, core->cursor, 0 };
+    TextRange range;
+    range.start = core->cursor;
+    range.end = core->cursor;
+    range.linewise = 0;
     int visual = is_visual(core);
     if (visual)
         range = selected_range(core);
@@ -1763,7 +1770,10 @@ static TextRange paragraph_lines(const EditorCore *core, size_t count, int aroun
             end = next < core->length ? next + 1 : next;
         }
         if (!around) {
-            TextRange range = { start, end, 1 };
+            TextRange range;
+            range.start = start;
+            range.end = end;
+            range.linewise = 1;
             return range;
         }
     }
@@ -1779,7 +1789,10 @@ static TextRange paragraph_lines(const EditorCore *core, size_t count, int aroun
             }
         }
     }
-    TextRange range = { start, end, 1 };
+    TextRange range;
+    range.start = start;
+    range.end = end;
+    range.linewise = 1;
     return range;
 }
 
@@ -2549,7 +2562,10 @@ static int handle_key(EditorCore *core, unsigned long key)
             size_t last = original > core->cursor ? original : core->cursor;
             int inclusive = pending == 'Q' || key == 'e' || key == 'j' || key == 'k' ||
                 key == 'G' || key == EDITOR_KEY_UP || key == EDITOR_KEY_DOWN;
-            TextRange range = { first, inclusive ? next_character(core, last) : last, 1 };
+            TextRange range;
+            range.start = first;
+            range.end = inclusive ? next_character(core, last) : last;
+            range.linewise = 1;
             core->cursor = original;
             return format_lines(core, range);
         }
@@ -2558,8 +2574,10 @@ static int handle_key(EditorCore *core, unsigned long key)
         size_t original = core->cursor;
         if (!move_command(core, key, count, motion_counted))
             return 1;
-        TextRange range = { original < core->cursor ? original : core->cursor,
-            original > core->cursor ? original : core->cursor, 0 };
+        TextRange range;
+        range.start = original < core->cursor ? original : core->cursor;
+        range.end = original > core->cursor ? original : core->cursor;
+        range.linewise = 0;
         if (key == 'e')
             range.end = next_character(core, range.end);
         if (key == 'j' || key == 'k' || key == 'G' || key == EDITOR_KEY_UP || key == EDITOR_KEY_DOWN) {
@@ -2658,7 +2676,10 @@ static int handle_key(EditorCore *core, unsigned long key)
         return 1;
     }
     if (key == 'x' || key == EDITOR_KEY_DELETE) {
-        TextRange range = { core->cursor, core->cursor, 0 };
+        TextRange range;
+        range.start = core->cursor;
+        range.end = core->cursor;
+        range.linewise = 0;
         size_t end = line_end(core, core->cursor);
         while (count-- && range.end < end)
             range.end = next_character(core, range.end);
@@ -3580,7 +3601,12 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_GET_POSITION: {
         if (!data)
             return 0;
-        EditorPosition position = { 0, 0, core->cursor, core->length, 1 };
+        EditorPosition position;
+        position.line = 0;
+        position.offset = core->cursor;
+        position.length = core->length;
+        position.line_count = 1;
+        position.line_count_complete = 0;
         position.column = advance_columns(core, 0, line_start(core, core->cursor), core->cursor);
         if (core->file) {
             size_t count;
