@@ -65,19 +65,34 @@ groups of eight, followed by an ASCII column. Printable ASCII bytes `20` through
 `7E` display literally; other bytes display as dots. The offset column stays
 fixed while the horizontal scrollbar reveals bytes and ASCII in narrow panes.
 The status bar shows the byte offset, document length, input column, and
-`HEX OVERWRITE` or `HEX INSERT`. Font zoom and mouse-wheel scrolling also work.
+`HEX COMMAND`, `HEX REPLACE`, or `HEX INSERT`. Font zoom and mouse-wheel scrolling also work.
 
 Click a byte or ASCII cell to position the caret. Tab switches between hex
 and ASCII input. In the hex column, type `0`-`9` or `A`-`F` to edit the high
 and low nibble; in the ASCII column, type printable ASCII characters to edit
-whole bytes. Overwrite is the default; Insert toggles byte insertion. Typing
+whole bytes. Hex Mode starts in command mode: press `i` to insert new bytes
+before the caret, shifting existing bytes to the right, or `r` to replace
+existing bytes. Esc returns to command mode. While editing the ASCII column,
+`i` and `r` are literal characters. The Insert key also enters editing and
+toggles between insert and replace. Typing
 at EOF appends bytes, including in an empty document. Delete removes the
 current byte; Backspace removes the previous byte.
 
 Arrow keys move through nibbles/bytes or rows; Home/End go to the row limits,
 Ctrl+Home/Ctrl+End go to the document limits, and Page Up/Page Down move by a
-screenful. Ctrl+Z undoes an edit; Ctrl+Y or Ctrl+R redoes it. Each nibble edit
-is independently undoable. Esc resets the nibble position. Save and Save As
+screenful. In hex command mode, `h`/`l` move left/right by one byte, `j`/`k`
+move down/up one row, and `0`/`$` go to the first/last byte column of the row.
+`u`/`d` (or Ctrl+U/Ctrl+D) move up/down half a page; `b`/`f` (or Ctrl+B/Ctrl+F)
+move up/down a full page. Movement stops at document boundaries. These letter
+bindings do not intercept byte input in insert/replace mode.
+`gg` jumps to offset zero and `G` jumps to EOF. Start an offset command with
+`x`, type up to eight hexadecimal digits, then press `g`: `x1234g` jumps to
+offset `00001234`. A comma before `g` is also accepted (`x1234,g`). Offsets
+are zero-based and clamp to EOF. The status bar shows pending input;
+Backspace edits it, and Esc, another non-offset command, clicking, or changing
+focus cancels it. `0` alone remains first-column navigation.
+Ctrl+Z undoes an edit; Ctrl+Y or Ctrl+R redoes it. Each nibble edit
+is independently undoable. Esc also resets the nibble position. Save and Save As
 use the existing File menu and retain the exact edited bytes, including NUL,
 invalid UTF-8, and individual CR/LF bytes. Returning to Text Mode maps the
 selected byte back to a text caret; UTF-8 caret positions still snap to the

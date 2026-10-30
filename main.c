@@ -85,6 +85,8 @@ typedef struct EditorControl {
     int hex_ascii;
     int hex_low;
     int hex_insert;
+    int hex_editing;
+    char hex_command[11];
     size_t hex_offset;
     size_t hex_first;
     int hex_left;
@@ -388,6 +390,8 @@ static int hex_buffer(EditorControl *editor, EditorBuffer *buffer)
         editor->hex_first = 0;
         editor->hex_left = 0;
         editor->hex_low = 0;
+        editor->hex_editing = 0;
+        editor->hex_command[0] = 0;
     }
     if (editor->hex_offset > buffer->length) {
         editor->hex_offset = buffer->length;
@@ -542,6 +546,64 @@ static int hex_edit(EditorControl *editor, size_t remove_length, const unsigned 
     return editor_core_send(editor->core, EDITOR_REPLACE_BYTES, &edit);
 }
 
+static int handle_hex_jump(EditorControl *editor, size_t length, unsigned long key)
+{
+    size_t pending = strlen(editor->hex_command);
+    if (pending && editor->hex_command[0] == 'g') {
+        editor->hex_command[0] = 0;
+        if (key == 'g') {
+            editor->hex_offset = 0;
+            editor->hex_low = 0;
+            return 1;
+        }
+    } else if (pending && editor->hex_command[0] == 'x') {
+        if (key == 'g') {
+            char *end;
+            unsigned long offset = strtoul(editor->hex_command + 1, &end, 16);
+            int valid = end != editor->hex_command + 1 &&
+                (!*end || (*end == ',' && !end[1]));
+            editor->hex_command[0] = 0;
+            if (!valid)
+                return -1;
+            editor->hex_offset = offset > length ? length : (size_t)offset;
+            editor->hex_low = 0;
+            return 1;
+        }
+        int digit = (key >= '0' && key <= '9') || (key >= 'a' && key <= 'f') ||
+            (key >= 'A' && key <= 'F');
+        if (digit) {
+            if (pending >= 9 || editor->hex_command[pending - 1] == ',') {
+                editor->hex_command[0] = 0;
+                return -1;
+            }
+            editor->hex_command[pending] = (char)key;
+            editor->hex_command[pending + 1] = 0;
+            return 1;
+        }
+        if (key == ',' && pending > 1 && editor->hex_command[pending - 1] != ',') {
+            editor->hex_command[pending] = ',';
+            editor->hex_command[pending + 1] = 0;
+            return 1;
+        }
+        if (key == 8) {
+            editor->hex_command[pending - 1] = 0;
+            return 1;
+        }
+        editor->hex_command[0] = 0;
+    }
+    if (key == 'G') {
+        editor->hex_offset = length;
+        editor->hex_low = 0;
+        return 1;
+    }
+    if (key == 'g' || key == 'x') {
+        editor->hex_command[0] = (char)key;
+        editor->hex_command[1] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static int handle_hex_key(HWND window, EditorControl *editor, unsigned long key, int control)
 {
     EditorBuffer buffer;
@@ -549,6 +611,45 @@ static int handle_hex_key(HWND window, EditorControl *editor, unsigned long key,
         return 0;
     size_t length = buffer.length;
     size_t distance = hex_page(window, editor) * 16;
+    if (!editor->hex_editing) {
+        int jump = handle_hex_jump(editor, length, key);
+        if (jump)
+            return jump > 0;
+    }
+    if (!editor->hex_editing && (key == 'i' || key == 'r')) {
+        editor->hex_insert = key == 'i';
+        editor->hex_editing = 1;
+        editor->hex_low = 0;
+        return 1;
+    }
+    if (!editor->hex_editing) {
+        switch (key) {
+        case 'h':
+            if (editor->hex_offset)
+                --editor->hex_offset;
+            editor->hex_low = 0;
+            return 1;
+        case 'l':
+            if (editor->hex_offset < length)
+                ++editor->hex_offset;
+            editor->hex_low = 0;
+            return 1;
+        case 'j': key = EDITOR_KEY_DOWN; break;
+        case 'k': key = EDITOR_KEY_UP; break;
+        case '0': key = EDITOR_KEY_HOME; control = 0; break;
+        case '$': key = EDITOR_KEY_END; control = 0; break;
+        case 'u': case 21:
+        case 'd': case 4: {
+            size_t rows = hex_page(window, editor) / 2;
+            distance = (rows ? rows : 1) * 16;
+            key = key == 'u' || key == 21 ? EDITOR_KEY_PAGE_UP : EDITOR_KEY_PAGE_DOWN;
+            break;
+        }
+        case 'b': case 2: key = EDITOR_KEY_PAGE_UP; break;
+        case 'f': case 6: key = EDITOR_KEY_PAGE_DOWN; break;
+        default: break;
+        }
+    }
     switch (key) {
     case EDITOR_KEY_LEFT:
         if (!editor->hex_ascii && editor->hex_low)
@@ -599,11 +700,14 @@ static int handle_hex_key(HWND window, EditorControl *editor, unsigned long key,
         return 1;
     case 27:
         editor->hex_low = 0;
+        editor->hex_editing = 0;
         return 1;
     case 26: case 25: case 18:
         editor->hex_low = 0;
         return editor_core_send(editor->core, key == 26 ? EDITOR_UNDO : EDITOR_REDO, NULL);
     default: {
+        if (!editor->hex_editing)
+            return 0;
         unsigned char byte;
         size_t remove_length = editor->hex_offset < length ? 1 : 0;
         if (editor->hex_ascii) {
@@ -969,6 +1073,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_KILLFOCUS:
         editor->pending_lead = 0;
+        editor->hex_command[0] = 0;
         DestroyCaret();
         InvalidateRect(hWnd, NULL, FALSE);
         return 0;
@@ -1070,6 +1175,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         editor->pending_lead = 0;
+        editor->hex_command[0] = 0;
         SetFocus(hWnd);
         int mouse_x = (short)LOWORD(lp);
         int mouse_y = (short)HIWORD(lp);
@@ -1157,7 +1263,9 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         unsigned long key;
         if (editor->hex_mode && wp == VK_INSERT) {
+            editor->hex_command[0] = 0;
             editor->hex_insert = !editor->hex_insert;
+            editor->hex_editing = 1;
             editor->hex_low = 0;
             update_editor_caret(hWnd, editor);
             return 0;
@@ -1851,6 +1959,8 @@ static int set_editor_view(HWND window, MainWindowState *state, int hex)
         editor_core_send(editor->core, EDITOR_SET_CARET, &caret);
     }
     editor->hex_mode = hex;
+    editor->hex_editing = 0;
+    editor->hex_command[0] = 0;
     ShowScrollBar(view, SB_HORZ, hex ? TRUE : FALSE);
     editor->pending_lead = 0;
     editor->bitmap_valid = 0;
@@ -2549,9 +2659,15 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             mode_text = "substitution failed";
         if (state->command_error)
             mode_text = state->command_error;
+        char hex_status[48];
         EditorControl *editor = (EditorControl *)GetWindowLongPtrA(active_editor(hWnd), GWLP_USERDATA);
-        if (editor && editor->hex_mode)
-            mode_text = editor->hex_insert ? "HEX INSERT" : "HEX OVERWRITE";
+        if (editor && editor->hex_mode) {
+            mode_text = !editor->hex_editing ? "HEX COMMAND" : editor->hex_insert ? "HEX INSERT" : "HEX REPLACE";
+            if (!editor->hex_editing && editor->hex_command[0]) {
+                snprintf(hex_status, sizeof(hex_status), "HEX %s", editor->hex_command);
+                mode_text = hex_status;
+            }
+        }
         SendMessageA(GetDlgItem(hWnd, ID_STATUS), SB_SETTEXTA, 0,
             (LPARAM)mode_text);
         update_buffer_status(hWnd, state->core);
