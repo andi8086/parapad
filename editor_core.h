@@ -94,8 +94,18 @@ typedef enum EditorMessage {
     EDITOR_GET_POSITION,
     EDITOR_SET_PAGE_SIZE,
     EDITOR_GET_COMMAND_PROMPT,
-    EDITOR_REPLACE_BYTES
+    EDITOR_REPLACE_BYTES,
+    EDITOR_GET_LENGTH,
+    EDITOR_READ_RANGE,
+    EDITOR_SET_OFFSET,
+    EDITOR_GET_KNOWN_LINE_COUNT
 } EditorMessage;
+
+typedef struct EditorReadRange {
+    size_t offset;
+    void *data;
+    size_t length;
+} EditorReadRange;
 
 typedef struct EditorByteEdit {
     size_t offset;
@@ -110,7 +120,13 @@ typedef struct EditorPosition {
     size_t offset;
     size_t length;
     size_t line_count;
+    int line_count_complete;
 } EditorPosition;
+
+typedef struct EditorLineCount {
+    size_t count;
+    int complete;
+} EditorLineCount;
 
 typedef struct EditorDirectoryEntry {
     const char *name;
@@ -154,6 +170,7 @@ typedef struct EditorLine {
     size_t index;
     const char *text;
     size_t length;
+    int truncated;
 } EditorLine;
 
 typedef struct EditorCaret {
@@ -166,6 +183,7 @@ typedef struct EditorCharacter {
     size_t column;
     unsigned long value;
     size_t length;
+    int hidden;
 } EditorCharacter;
 
 typedef struct EditorLineCaret {

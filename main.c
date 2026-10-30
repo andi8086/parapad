@@ -21,6 +21,7 @@ typedef struct SyntaxLine {
 typedef struct SyntaxCache {
     SyntaxLine *lines;
     size_t line_count;
+    size_t first_line;
     size_t revision;
     size_t serial;
     int valid;
@@ -133,7 +134,7 @@ static void clear_syntax_cache(SyntaxCache *cache)
     memset(cache, 0, sizeof(*cache));
 }
 
-static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
+static int update_syntax_cache(SyntaxCache *cache, EditorCore *core, size_t first, size_t count)
 {
     if (!cache)
         return 1;
@@ -149,72 +150,58 @@ static int update_syntax_cache(SyntaxCache *cache, EditorCore *core)
         return 1;
     EditorChange change;
     editor_core_send(core, EDITOR_TAKE_CHANGE, &change);
-    if (cache->valid && change.first_line == (size_t)-1 && change.revision == cache->revision)
+    if (cache->valid && change.revision == cache->revision &&
+        cache->first_line == first && cache->line_count == count)
         return 1;
-    size_t count;
-    editor_core_send(core, EDITOR_GET_LINE_COUNT, &count);
-    size_t first = cache->valid && change.first_line != (size_t)-1 ? change.first_line : 0;
-    size_t last = cache->valid ? change.last_line : (size_t)-1;
-    if (count != cache->line_count) {
-        if (count > (size_t)-1 / sizeof(*cache->lines)) {
-            cache->valid = 0;
-            return 0;
-        }
-        SyntaxLine *lines = calloc(count, sizeof(*lines));
-        if (!lines) {
-            cache->valid = 0;
-            return 0;
-        }
-        size_t retained = count < cache->line_count ? count : cache->line_count;
-        if (retained)
-            memcpy(lines, cache->lines, retained * sizeof(*lines));
-        for (size_t index = retained; index < cache->line_count; ++index)
-            lexer->free_line(&cache->lines[index].parsed);
-        free(cache->lines);
-        cache->lines = lines;
-        cache->line_count = count;
-        last = (size_t)-1;
-    }
-    if (first >= count)
-        first = count - 1;
-    if (first && !cache->lines[first - 1].valid)
-        first = 0;
+    if (!count || count > (size_t)-1 / sizeof(*cache->lines) || count > (size_t)-1 - first)
+        return 0;
+    SyntaxLine *lines = calloc(count, sizeof(*lines));
+    if (!lines)
+        return 0;
     const void *state = NULL;
-    if (first)
-        state = cache->lines[first - 1].parsed.end_state;
-    EditorBuffer buffer;
-    editor_core_send(core, EDITOR_GET_TEXT_BUFFER, &buffer);
-    size_t offset = 0;
-    for (size_t index = 0; index < first; ++index) {
-        const unsigned char *newline = memchr(buffer.data + offset, '\n', buffer.length - offset);
-        if (!newline) {
-            cache->valid = 0;
-            return 0;
-        }
-        offset = (size_t)(newline - buffer.data) + 1;
+    size_t begin = 0;
+    if (cache->valid && cache->revision == change.revision && cache->line_count &&
+        first >= cache->first_line + cache->line_count &&
+        cache->lines[cache->line_count - 1].valid) {
+        begin = cache->first_line + cache->line_count;
+        state = cache->lines[cache->line_count - 1].parsed.end_state;
     }
-    for (size_t index = first; index < count; ++index) {
-        const unsigned char *text = buffer.data + offset;
-        const unsigned char *newline = memchr(text, '\n', buffer.length - offset);
-        size_t length = newline ? (size_t)(newline - text) : buffer.length - offset;
-        SyntaxLine *line = &cache->lines[index];
+    LexerLine carry = { 0 };
+    for (size_t index = begin; index < first + count; ++index) {
+        EditorLine text = { index, NULL, 0 };
+        if (!editor_core_send(core, EDITOR_GET_LINE, &text))
+            break;
         LexerLine parsed = { 0 };
-        if (!lexer->lex_line((const char *)text, length, state, &parsed)) {
+        if (!lexer->lex_line(text.text, text.length, state, &parsed)) {
+            lexer->free_line(&carry);
+            for (size_t slot = 0; slot < count; ++slot)
+                lexer->free_line(&lines[slot].parsed);
+            free(lines);
             cache->valid = 0;
             return 0;
         }
-        int converged = line->valid && lexer->states_equal(line->parsed.end_state, parsed.end_state);
-        lexer->free_line(&line->parsed);
-        line->parsed = parsed;
-        line->valid = 1;
-        if (!++cache->serial)
-            ++cache->serial;
-        line->version = cache->serial;
+        lexer->free_line(&carry);
+        if (index < first) {
+            carry = parsed;
+        } else {
+            SyntaxLine *line = &lines[index - first];
+            line->parsed = parsed;
+            line->valid = 1;
+            if (!++cache->serial)
+                ++cache->serial;
+            line->version = cache->serial;
+        }
         state = parsed.end_state;
-        offset += length + (newline != NULL);
-        if (index >= last && converged)
+        if (text.truncated)
             break;
     }
+    lexer->free_line(&carry);
+    for (size_t slot = 0; slot < cache->line_count; ++slot)
+        lexer->free_line(&cache->lines[slot].parsed);
+    free(cache->lines);
+    cache->lines = lines;
+    cache->first_line = first;
+    cache->line_count = count;
     cache->revision = change.revision;
     cache->valid = 1;
     return 1;
@@ -302,8 +289,9 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     COLORREF normal_color = GetTextColor(dc);
     COLORREF normal_background = GetBkColor(dc);
     const LexerLine *syntax = paint && editor->syntax && editor->syntax_ready &&
-        editor->syntax->lexer && index < editor->syntax->line_count ?
-        &editor->syntax->lines[index].parsed : NULL;
+        editor->syntax->lexer && index >= editor->syntax->first_line &&
+        index - editor->syntax->first_line < editor->syntax->line_count ?
+        &editor->syntax->lines[index - editor->syntax->first_line].parsed : NULL;
     size_t token_index = 0;
     EditorSettings settings;
     editor_core_send(editor->core, EDITOR_GET_SETTINGS, &settings);
@@ -321,6 +309,10 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
         int length = character_to_ansi(character.value, text, sizeof(text));
         SIZE extent = { 0, 0 };
         GetTextExtentPoint32A(dc, text, length, &extent);
+        if (character.hidden) {
+            extent.cx = 0;
+            length = 0;
+        }
         if (character.value == '\t') {
             if (space_size.cx <= 0 || settings.tabwidth > (size_t)(INT_MAX / space_size.cx))
                 break;
@@ -382,7 +374,8 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
 
 static int hex_buffer(EditorControl *editor, EditorBuffer *buffer)
 {
-    if (!editor_core_send(editor->core, EDITOR_GET_BUFFER, buffer))
+    buffer->data = NULL;
+    if (!editor_core_send(editor->core, EDITOR_GET_LENGTH, &buffer->length))
         return 0;
     if (editor->hex_core != editor->core) {
         editor->hex_core = editor->core;
@@ -497,8 +490,12 @@ static void paint_hex_editor(HDC dc, EditorControl *editor, int width, int heigh
         size_t count = buffer.length - offset;
         if (count > 16)
             count = 16;
+        unsigned char bytes[16];
+        EditorReadRange range = { offset, bytes, count };
+        if (!editor_core_send(editor->core, EDITOR_READ_RANGE, &range))
+            break;
         for (size_t slot = 0; slot < count; ++slot) {
-            unsigned char byte = buffer.data[offset + slot];
+            unsigned char byte = bytes[slot];
             size_t column = 10 + slot * 3 + (slot >= 8);
             line[column] = digits[byte >> 4];
             line[column + 1] = digits[byte & 15];
@@ -724,7 +721,12 @@ static int handle_hex_key(HWND window, EditorControl *editor, unsigned long key,
                 return 0;
             if (editor->hex_insert && !editor->hex_low)
                 remove_length = 0;
-            byte = remove_length ? buffer.data[editor->hex_offset] : 0;
+            byte = 0;
+            if (remove_length) {
+                EditorReadRange range = { editor->hex_offset, &byte, 1 };
+                if (!editor_core_send(editor->core, EDITOR_READ_RANGE, &range))
+                    return 0;
+            }
             byte = editor->hex_low ? (unsigned char)((byte & 0xF0) | nibble) :
                 (unsigned char)((byte & 0x0F) | (nibble << 4));
         }
@@ -820,7 +822,8 @@ static void clear_line_cache(EditorControl *editor)
 
 static void paint_editor(HDC dc, EditorControl *editor, int width, int height, int buffered, int focused)
 {
-    int syntax_ready = update_syntax_cache(editor->syntax, editor->core);
+    size_t syntax_rows = height > 16 ? (size_t)((height - 17) / editor->line_height + 1) : 1;
+    int syntax_ready = update_syntax_cache(editor->syntax, editor->core, editor->first_line, syntax_rows);
     if (!syntax_ready || syntax_ready != editor->syntax_ready)
         editor->bitmap_valid = 0;
     editor->syntax_ready = syntax_ready;
@@ -879,10 +882,13 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
             guide = position;
     }
     HBRUSH guide_brush = guide >= 0 ? CreateSolidBrush(RGB(64, 64, 64)) : NULL;
+    size_t last_text_line = (size_t)-1;
     for (size_t row = 0; row < rows; ++row) {
         size_t index = editor->first_line + row;
         EditorLine line = { index, NULL, 0 };
-        int exists = editor_core_send(editor->core, EDITOR_GET_LINE, &line);
+        int exists = index <= last_text_line && editor_core_send(editor->core, EDITOR_GET_LINE, &line);
+        if (exists && line.truncated)
+            last_text_line = index;
         EditorSelection selection = { index, 0, 0, 0, 0 };
         if (exists)
             editor_core_send(editor->core, EDITOR_GET_SELECTION, &selection);
@@ -891,7 +897,9 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
             editor_core_send(editor->core, EDITOR_GET_LINE_CARET, &caret);
         CachedLine *cached = editor->lines ? &editor->lines[index % rows] : NULL;
         size_t syntax_version = syntax_ready && editor->syntax && editor->syntax->lexer &&
-            index < editor->syntax->line_count ? editor->syntax->lines[index].version : 0;
+            index >= editor->syntax->first_line &&
+            index - editor->syntax->first_line < editor->syntax->line_count ?
+            editor->syntax->lines[index - editor->syntax->first_line].version : 0;
         if (reuse && cached && cached->valid && cached->index == index && cached->exists == exists &&
             cached->syntax_version == syntax_version &&
             cached->length == line.length && cached->selection.start == selection.start &&
@@ -1143,8 +1151,12 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(hWnd, NULL, FALSE);
             return 0;
         }
-        size_t count;
-        editor_core_send(editor->core, EDITOR_GET_LINE_COUNT, &count);
+        EditorLineCount known;
+        if (!editor_core_send(editor->core, EDITOR_GET_KNOWN_LINE_COUNT, &known))
+            return 0;
+        size_t count = known.count;
+        if (!known.complete && count <= (size_t)-1 - page_lines)
+            count += page_lines;
         size_t last = count > page_lines ? count - page_lines : 0;
         size_t first = editor->first_line > last ? last : editor->first_line;
         if (notches > 0)
@@ -1218,8 +1230,10 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             update_editor_caret(hWnd, editor);
             return 0;
         }
-        size_t count;
-        editor_core_send(editor->core, EDITOR_GET_LINE_COUNT, &count);
+        EditorLineCount known;
+        if (!editor_core_send(editor->core, EDITOR_GET_KNOWN_LINE_COUNT, &known))
+            return 0;
+        size_t count = known.count;
         EditorCaret caret = {
             editor->first_line + (mouse_y > 8 ? (mouse_y - 8) / editor->line_height : 0), 0
         };
@@ -1633,8 +1647,8 @@ static void update_buffer_status(HWND window, EditorCore *core)
     unsigned int percent = position.length
         ? (unsigned int)(100.0 * ((double)position.offset / (double)position.length)) : 100;
     char text[192];
-    snprintf(text, sizeof(text), "LN %zu/%zu, Col %zu    %u%% (%zu / %zu)",
-        position.line + 1, position.line_count, position.column + 1, percent,
+    snprintf(text, sizeof(text), "LN %zu/%zu%s, Col %zu    %u%% (%zu / %zu)",
+        position.line + 1, position.line_count, position.line_count_complete ? "" : "+", position.column + 1, percent,
         position.offset, position.length);
     HWND status = GetDlgItem(window, ID_STATUS);
     SendMessageA(status, SB_SETTEXTA, 1, (LPARAM)text);
@@ -1939,24 +1953,8 @@ static int set_editor_view(HWND window, MainWindowState *state, int hex)
         editor->hex_low = 0;
         editor->hex_left = 0;
     } else {
-        EditorBuffer text;
-        editor_core_send(editor->core, EDITOR_GET_TEXT_BUFFER, &text);
-        int expanded = buffer.length != text.length;
-        size_t offset = 0;
-        EditorCaret caret = { 0, 0 };
-        for (size_t index = 0; index < text.length; ++index) {
-            size_t width = expanded && text.data[index] == '\n' ? 2 : 1;
-            if (editor->hex_offset - offset < width)
-                break;
-            offset += width;
-            if (text.data[index] == '\n') {
-                ++caret.line;
-                caret.column = 0;
-            } else {
-                ++caret.column;
-            }
-        }
-        editor_core_send(editor->core, EDITOR_SET_CARET, &caret);
+        if (!editor_core_send(editor->core, EDITOR_SET_OFFSET, &editor->hex_offset))
+            return 0;
     }
     editor->hex_mode = hex;
     editor->hex_editing = 0;

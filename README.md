@@ -53,6 +53,37 @@ are preserved. Mixed LF/CRLF input retains its exact bytes rather than convertin
 all line endings; `:set lf` or `:set crlf` explicitly converts them.
 Paths use ANSI dialogs and the system code page, consistent with the Win95 GUI.
 
+### Virtual Storage
+
+Every document uses the virtual piece-table backend, including empty buffers,
+small files, and buffers supplied through the core API. There is no file-size
+cutoff or automatic fallback to whole-file storage. File data is cached in
+64 KiB (65,536-byte) chunks, loaded on demand. Unchanged pieces refer to the
+source file; edits are appended to a temporary file. Undo/redo snapshots share
+those sources and copy piece metadata, not complete document contents.
+
+Hex rendering reads only each displayed row. Text rendering retains syntax
+tokens for the visible window and obtains line data through bounded reads.
+Newline indexes grow as needed. The status bar appends `+` to an indexed line
+count while the rest remains unknown, rather than scanning the whole file just
+to display a total. Seeking far into text, exact line-count API requests, and
+stateful syntax reconstruction can still require sequential reads.
+
+Literal searches reload cached chunks as they advance and ordinary searches
+stop at the next match. Substitution, formatting, tab conversion, line-ending
+conversion, and saving stream output through temporary files. Original sources
+referenced by undo/redo are detached before overwriting a source file. Temporary
+disk space is therefore required for edits, streamed transformations, and saves.
+Keep source files unchanged outside the editor while they remain open.
+
+The 64 KiB size bounds file-data cache chunks, not total application memory:
+piece tables, newline indexes, undo metadata, registers, and lexer tokens also
+consume memory. Text-line previews are limited to 65,535 bytes per line; Hex
+Mode can inspect bytes beyond that preview. PCRE2 needs a contiguous line
+subject, so substitution rejects lines longer than 65,535 bytes without applying
+partial changes. Other bounded lexer operations can reject oversized lines too.
+The Win32 build still uses 32-bit document offsets and address-space limits.
+
 ### Text And Hex Views
 
 View > Text Mode and View > Hex Mode switch the active pane without replacing
@@ -172,10 +203,10 @@ characters; malformed bytes show replacement glyphs and control bytes other than
 Tab show dots,
 without modifying their stored bytes. Navigation treats each malformed byte as a
 single unit. Uniform CRLF files are displayed as one line break, without a dot for CR.
-Standalone CR bytes remain control bytes. Editing uses normalized LF boundaries
-internally for uniform line endings and transparently exports the selected format.
-Mixed LF/CRLF buffers retain literal bytes; their CR bytes remain visible as dots
-in Text Mode until an explicit `:set lf` or `:set crlf` conversion.
+Standalone CR bytes remain control bytes. The virtual backend keeps all file
+bytes literal, including mixed endings; the renderer hides CR before LF.
+The default insertion line-ending format is detected from the first chunk.
+An explicit `:set lf` or `:set crlf` streams a whole-document conversion.
 
 ## Syntax Highlighting
 
@@ -672,9 +703,10 @@ shows `no change` until the next editor command. Read-only queries and redraws
 preserve the message. New/Open buffers have independent histories; switching
 buffers preserves them. A raw core load or buffer replacement clears its history;
 saving retains it and records the clean revision, so undo/redo back to that
-revision clears the modified flag. History uses complete byte-buffer snapshots,
-preserving NULs and malformed UTF-8. It is per document instance, kept only in
-memory, and limited by available memory rather than a fixed step count. This is
+revision clears the modified flag. History snapshots piece metadata and shares
+file sources, preserving NULs and malformed UTF-8 without copying whole files.
+It is per document instance, uses memory for metadata and temporary disk storage
+for edited data, and has no fixed step count. This is
 linear undo/redo, not Vim's branching undo tree or persistent undo files.
 
 ## Editor Core
@@ -700,14 +732,17 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_SET_SETTINGS` | `const EditorSettings *` supplying all three settings |
 | `EDITOR_EXECUTE_COMMAND` | NUL-terminated UTF-8 input; execute `set name=value`, `set lf`, `set crlf`, `retab`, `s/pattern/replacement/flags`, `%s/pattern/replacement/flags`, or `'<,'>s/pattern/replacement/flags` for the pending visual range, with an optional `:`, or search with `/pattern` |
 | `EDITOR_GET_LINE_CARET` | `EditorLineCaret *`; supply `line`, receive byte `column`, extra character-cell `advance`, and `active` for block carets |
-| `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy `length` arbitrary bytes, detect line endings, normalize uniform CRLF for editing, and preserve mixed endings literally |
-| `EDITOR_GET_BUFFER` | `EditorBuffer *` receiving borrowed file-format `data` and byte `length`, serialized in the selected LF/CRLF mode |
-| `EDITOR_GET_TEXT_BUFFER` | `EditorBuffer *` receiving borrowed internal editing text and byte length; uniform CRLF is normalized, mixed endings are literal; offsets match caret/line queries |
+| `EDITOR_SET_BUFFER` | `EditorBuffer *`; copy arbitrary bytes into a new virtual buffer without normalizing file bytes |
+| `EDITOR_GET_BUFFER` / `EDITOR_GET_TEXT_BUFFER` | Compatibility reads for documents smaller than 64 KiB; receive a borrowed scratch pointer and byte length; larger reads return 0 rather than materializing the file |
+| `EDITOR_GET_LENGTH` | `size_t *` receiving the exact document byte length without reading file contents |
+| `EDITOR_READ_RANGE` | `EditorReadRange *` supplying byte `offset`, caller-owned `data`, and `length`; copies through 64 KiB cached chunks |
+| `EDITOR_SET_OFFSET` | `const size_t *`; place the text caret at a document byte offset, clamped to a valid UTF-8 boundary |
+| `EDITOR_GET_KNOWN_LINE_COUNT` | `EditorLineCount *` receiving the progressively indexed `count` and `complete` flag without forcing a whole-file scan |
 | `EDITOR_REPLACE_BYTES` | `const EditorByteEdit *`; replace `remove_length` bytes at serialized byte `offset` with `length` bytes from `data`; accepts all byte values, preserves exact saved output, creates an independent undo step, and rejects directory buffers |
 | `EDITOR_GET_LINE_ENDING` | `EditorLineEnding *` receiving `EDITOR_LINE_ENDING_LF` or `EDITOR_LINE_ENDING_CRLF` |
-| `EDITOR_GET_POSITION` | `EditorPosition *` receiving zero-based `line` and display `column`, total `line_count`, plus caret byte `offset` and total byte `length` in the selected serialized file format; read-only |
-| `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; read in binary mode and detect/normalize line endings for editing |
-| `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; save arbitrary bytes with line breaks in the selected format |
+| `EDITOR_GET_POSITION` | `EditorPosition *` receiving zero-based `line` and display `column`, indexed `line_count` and `line_count_complete`, plus exact byte `offset` and `length`; read-only |
+| `EDITOR_LOAD_FILE` | NUL-terminated ANSI path; open a virtual source and detect insertion line endings from its first chunk without loading the complete file |
+| `EDITOR_SAVE_FILE` | NUL-terminated ANSI path; stream the exact document bytes, preserving literal line endings |
 | `EDITOR_GET_MODIFIED` | `int *` receiving whether edits have occurred since creation, replacement, load, or save |
 | `EDITOR_TAKE_CHANGE` | `EditorChange *` receiving the change revision and accumulated inclusive changed-line range; consumes the range without affecting undo groups |
 | `EDITOR_REGISTER_LEXER` | `const Lexer *`; register an additional lexer descriptor on this core; registering the same pointer again is a no-op |
@@ -778,12 +813,12 @@ text, programmatic edits, and other non-keyboard clients.
 The document is a length-based byte buffer, independent of the system locale.
 `EDITOR_SET_BUFFER` and `EDITOR_LOAD_FILE` accept arbitrary bytes, including NUL
 and invalid UTF-8. Replacing or loading the buffer resets the caret, command state,
-selection, and modified flag, while preserving the yank register. The buffer API
-normalizes uniform CRLF pairs internally while preserving all other bytes.
-Mixed endings remain literal, so all input round-trips exactly unless edited
-or explicitly converted.
-`EDITOR_GET_BUFFER` returns a borrowed pointer valid until mutation or destruction;
-always use its length rather than `strlen`. An empty buffer may be supplied as
+selection, and modified flag, while preserving the yank register. File bytes,
+including uniform or mixed CRLF/LF endings, remain literal in virtual storage.
+`EDITOR_GET_BUFFER` is a small-document compatibility API; its borrowed scratch
+pointer expires on the next line/compatibility read, mutation, or destruction.
+Use `EDITOR_GET_LENGTH` and `EDITOR_READ_RANGE` for file-sized clients. Always
+use explicit lengths rather than `strlen`. An empty buffer may be supplied as
 `{ NULL, 0 }`. Replacement copies the input and also supports a slice of the old
 buffer. File-load failures leave the original document unchanged. Save reports
 write/close failures and clears the modified flag only after successful completion.
@@ -797,11 +832,11 @@ preserve valid Unicode scalars and advance one byte over malformed data. Setting
 a column inside a valid UTF-8 sequence clamps to its start. Character queries
 return U+FFFD with length 1 for an invalid byte. Combining sequences are not treated
 as single grapheme clusters.
-CRLF and CR are normalized to LF during text insertion. Loading and raw buffer
-replacement normalize uniform CRLF pairs, retain standalone CR bytes, and keep
-mixed endings literal. Line/caret
-offsets refer to normalized editing text, not serialized file-byte offsets;
-`EDITOR_GET_TEXT_BUFFER` exposes that representation for lexers and other views.
+CRLF, CR, and LF text insertion uses the selected insertion line-ending format.
+Loading and raw byte replacement retain exact bytes. Line/caret byte offsets
+therefore refer to the same bytes as `EDITOR_READ_RANGE`; display columns hide
+CR immediately before LF. `EDITOR_GET_TEXT_BUFFER` is also limited to small
+documents and is not the interface for virtual rendering.
 Empty documents have one
 empty line, and a trailing LF creates a final empty line. Deleting a line removes
 its following newline, or the preceding newline when deleting the final line.
@@ -812,9 +847,10 @@ requiring the GUI to implement command logic. An empty selected line or a select
 newline can have equal start/end offsets; `includes_newline` lets a renderer show
 that selection. Direct buffer mutations cancel visual mode to avoid stale anchors.
 
-`EDITOR_GET_LINE` returns a borrowed slice, not a NUL-terminated line. Use its
-length, do not modify it, and query it again after any text mutation. The pointer
-is invalid after a mutation or destruction. Dispatch is synchronous and instances
+`EDITOR_GET_LINE` returns a borrowed scratch preview of at most 65,535 bytes,
+with `truncated` set when the line continues. Use its length and do not modify it.
+The pointer expires on the next line/compatibility read, mutation, or destruction.
+Dispatch is synchronous and instances
 must not be accessed concurrently without external synchronization.
 Register text is NUL-terminated and remains valid until the next successful
 yank/delete or core destruction; clients must not modify it.
@@ -849,7 +885,7 @@ cl /nologo /W3 /std:c11 /c /DHAVE_CONFIG_H /DPCRE2_CODE_UNIT_WIDTH=8 /DPCRE2_STA
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c lexer_html.c lexer_ini.c lexer_config_sys.c editor_core_tests.c Debug\pcre2\*.obj
+cl /nologo /W4 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_core_tests.exe editor_core.c virtual_buffer.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c lexer_html.c lexer_ini.c lexer_config_sys.c editor_core_tests.c Debug\pcre2\*.obj
 Debug\core-tests\editor_core_tests.exe
 ```
 
@@ -860,7 +896,7 @@ objects above for the same architecture, run:
 
 ```bat
 if not exist Debug\core-tests mkdir Debug\core-tests
-cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c lexer_html.c lexer_ini.c lexer_config_sys.c Debug\pcre2\*.obj user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /WX /std:c11 /FoDebug\core-tests\ /FeDebug\core-tests\editor_window_tests.exe editor_window_tests.c editor_core.c virtual_buffer.c lexer_c_cpp.c lexer_intel_asm.c lexer_makefile.c lexer_batch.c lexer_pascal.c lexer_basic.c lexer_html.c lexer_ini.c lexer_config_sys.c Debug\pcre2\*.obj user32.lib gdi32.lib comctl32.lib comdlg32.lib /link /SUBSYSTEM:CONSOLE
 Debug\core-tests\editor_window_tests.exe
 ```
 

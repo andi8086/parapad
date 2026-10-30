@@ -12,6 +12,7 @@
 #include "lexer_html.h"
 #include "lexer_ini.h"
 #include "lexer_config_sys.h"
+#include "virtual_buffer.h"
 
 #define PCRE2_CODE_UNIT_WIDTH 8
 #define PCRE2_STATIC
@@ -32,6 +33,7 @@ typedef struct ReplaceEdit {
 
 typedef struct HistoryEntry {
     char *text;
+    VirtualBuffer *file;
     size_t length;
     size_t cursor;
     size_t revision;
@@ -41,6 +43,7 @@ typedef struct HistoryEntry {
 } HistoryEntry;
 
 struct EditorCore {
+    FILE *output_stream;
     EditorDirectoryFunctions directory_functions;
     EditorDirectoryEntry *directory_entries;
     size_t directory_count;
@@ -51,6 +54,10 @@ struct EditorCore {
     size_t lexer_count;
     const Lexer *lexer;
     char *text;
+    VirtualBuffer *file;
+    char *line_text;
+    size_t line_capacity;
+    FILE *stream_output;
     size_t length;
     size_t capacity;
     EditorLineEnding line_ending;
@@ -109,6 +116,39 @@ struct EditorCore {
     int history_open;
     int history_changed;
 };
+
+static int write_span(EditorCore *core, size_t start, size_t end, const char *text, size_t length);
+
+static unsigned char text_byte(const EditorCore *core, size_t position)
+{
+    return core->file ? virtual_buffer_byte(core->file, position) :
+        (unsigned char)*(core->text + position);
+}
+
+static int read_text(const EditorCore *core, size_t offset, void *data, size_t length)
+{
+    if (offset > core->length || length > core->length - offset)
+        return 0;
+    if (core->file)
+        return virtual_buffer_read(core->file, offset, data, length);
+    if (length)
+        memcpy(data, core->text + offset, length);
+    return 1;
+}
+
+static int text_equal(const EditorCore *core, size_t offset, const char *text, size_t length)
+{
+    unsigned char chunk[65536];
+    while (length) {
+        size_t count = length > sizeof(chunk) ? sizeof(chunk) : length;
+        if (!read_text(core, offset, chunk, count) || memcmp(chunk, text, count))
+            return 0;
+        offset += count;
+        text += count;
+        length -= count;
+    }
+    return 1;
+}
 
 static void clear_directory(EditorCore *core)
 {
@@ -191,6 +231,7 @@ static void free_history(HistoryEntry *entry)
 {
     while (entry) {
         HistoryEntry *next = entry->next;
+        virtual_buffer_destroy(entry->file);
         free(entry->text);
         free(entry);
         entry = next;
@@ -208,14 +249,18 @@ static void note_changed_lines(EditorCore *core, size_t first, size_t last)
 
 static void note_change(EditorCore *core, size_t start, size_t end, const char *text, size_t length)
 {
+    if (core->file) {
+        note_changed_lines(core, 0, SIZE_MAX);
+        return;
+    }
     size_t first = 0;
     size_t removed_lines = 0;
     size_t added_lines = 0;
     for (size_t index = 0; index < start; ++index)
-        if (core->text[index] == '\n')
+        if (text_byte(core, index) == '\n')
             ++first;
     for (size_t index = start; index < end; ++index)
-        if (core->text[index] == '\n')
+        if (text_byte(core, index) == '\n')
             ++removed_lines;
     for (size_t index = 0; index < length; ++index)
         if (text[index] == '\n')
@@ -233,12 +278,14 @@ static int prepare_edit(EditorCore *core)
         HistoryEntry *entry = malloc(sizeof(*entry));
         if (!entry)
             return 0;
-        entry->text = malloc(core->length + 1);
-        if (!entry->text) {
+        entry->file = core->file ? virtual_buffer_clone(core->file) : NULL;
+        entry->text = core->file ? NULL : malloc(core->length + 1);
+        if (core->file ? !entry->file : !entry->text) {
             free(entry);
             return 0;
         }
-        memcpy(entry->text, core->text, core->length + 1);
+        if (!core->file)
+            memcpy(entry->text, core->text, core->length + 1);
         entry->length = core->length;
         entry->cursor = core->cursor;
         entry->revision = core->revision;
@@ -325,6 +372,8 @@ static size_t decode_character(const char *text, size_t length, unsigned long *v
 
 static int reserve_text(EditorCore *core, size_t length)
 {
+    if (core->file)
+        return length < SIZE_MAX;
     size_t limit = SIZE_MAX;
     if (length >= limit)
         return 0;
@@ -348,7 +397,10 @@ static int insert_text(EditorCore *core, const char *text)
     size_t length = strlen(text);
     if (length > SIZE_MAX - core->length)
         return 0;
-    char *normalized = malloc(length + 1);
+    int crlf = core->file && core->line_ending == EDITOR_LINE_ENDING_CRLF;
+    if (crlf && length > (SIZE_MAX - 1) / 2)
+        return 0;
+    char *normalized = malloc((crlf ? length * 2 : length) + 1);
     if (!normalized)
         return 0;
     size_t count = 0;
@@ -359,16 +411,18 @@ static int insert_text(EditorCore *core, const char *text)
             free(normalized);
             return 0;
         }
-        if (value == '\r') {
+        if (value == '\r' || value == '\n') {
+            if (crlf)
+                normalized[count++] = '\r';
             normalized[count++] = '\n';
-            index += text[index + 1] == '\n' ? 2 : 1;
+            index += value == '\r' && text[index + 1] == '\n' ? 2 : 1;
         } else {
             memcpy(normalized + count, text + index, width);
             count += width;
             index += width;
         }
     }
-    if (!reserve_text(core, core->length + count)) {
+    if (count > SIZE_MAX - 1 - core->length || !reserve_text(core, core->length + count)) {
         free(normalized);
         return 0;
     }
@@ -378,6 +432,21 @@ static int insert_text(EditorCore *core, const char *text)
     }
     if (count)
         note_change(core, core->cursor, core->cursor, normalized, count);
+    if (core->file) {
+        int success = virtual_buffer_replace(core->file, core->cursor, 0, normalized, count);
+        if (success && core->block_insert && memchr(normalized, '\n', count))
+            core->block_insert = 0;
+        free(normalized);
+        if (success) {
+            core->cursor += count;
+            core->length += count;
+            core->modified |= count != 0;
+            if (core->mode == EDITOR_MODE_VISUAL || core->mode == EDITOR_MODE_VISUAL_LINE ||
+                core->mode == EDITOR_MODE_VISUAL_BLOCK)
+                core->mode = EDITOR_MODE_COMMAND;
+        }
+        return success;
+    }
     memmove(core->text + core->cursor + count, core->text + core->cursor,
         core->length - core->cursor + 1);
     memcpy(core->text + core->cursor, normalized, count);
@@ -396,20 +465,32 @@ static int insert_text(EditorCore *core, const char *text)
 
 static size_t line_start(const EditorCore *core, size_t position)
 {
-    while (position > 0 && core->text[position - 1] != '\n')
+    if (core->file) {
+        size_t line, start;
+        return virtual_buffer_lines(core->file, position, &line) &&
+            virtual_buffer_line_start(core->file, line, &start) ? start : position;
+    }
+    while (position > 0 && text_byte(core, position - 1) != '\n')
         --position;
     return position;
 }
 
 static size_t line_end(const EditorCore *core, size_t position)
 {
-    while (position < core->length && core->text[position] != '\n')
+    if (core->file) {
+        size_t line, start, end;
+        return virtual_buffer_lines(core->file, position, &line) &&
+            virtual_buffer_line(core->file, line, &start, &end) ? end : position;
+    }
+    while (position < core->length && text_byte(core, position) != '\n')
         ++position;
     return position;
 }
 
 static int find_line(const EditorCore *core, size_t index, size_t *start, size_t *end)
 {
+    if (core->file)
+        return virtual_buffer_line(core->file, index, start, end);
     *start = 0;
     while (index > 0) {
         size_t next = line_end(core, *start);
@@ -422,16 +503,40 @@ static int find_line(const EditorCore *core, size_t index, size_t *start, size_t
     return 1;
 }
 
+static size_t decode_text(const EditorCore *core, size_t position, size_t length, unsigned long *value)
+{
+    char bytes[4];
+    if (length > sizeof(bytes))
+        length = sizeof(bytes);
+    return read_text(core, position, bytes, length) ? decode_character(bytes, length, value) : 0;
+}
+
+static const char *text_span(EditorCore *core, size_t start, size_t length)
+{
+    if (length >= 65536)
+        return NULL;
+    if (!core->line_text) {
+        core->line_text = malloc(65536);
+        if (!core->line_text)
+            return NULL;
+        core->line_capacity = 65536;
+    }
+    if (!read_text(core, start, core->line_text, length))
+        return NULL;
+    core->line_text[length] = 0;
+    return core->line_text;
+}
+
 static size_t previous_character(const EditorCore *core, size_t position)
 {
     if (position == 0)
         return 0;
     size_t start = position - 1;
     while (start > 0 && position - start < 4 &&
-        ((unsigned char)core->text[start] & 0xC0) == 0x80)
+        ((unsigned char)text_byte(core, start) & 0xC0) == 0x80)
         --start;
     unsigned long value;
-    size_t length = decode_character(core->text + start, position - start, &value);
+    size_t length = decode_text(core, start, position - start, &value);
     return length && start + length == position ? start : position - 1;
 }
 
@@ -440,7 +545,7 @@ static size_t next_character(const EditorCore *core, size_t position)
     if (position == core->length)
         return position;
     unsigned long value;
-    size_t length = decode_character(core->text + position, core->length - position, &value);
+    size_t length = decode_text(core, position, core->length - position, &value);
     return position + (length ? length : 1);
 }
 
@@ -454,8 +559,13 @@ static int erase_text(EditorCore *core, size_t start, size_t end)
         core->block_insert = 0;
     if (start != end)
         core->modified = 1;
+    if (core->file) {
+        if (!virtual_buffer_replace(core->file, start, end - start, NULL, 0))
+            return 0;
+    } else {
     memmove(core->text + start, core->text + end,
         core->length - end + 1);
+    }
     core->length -= end - start;
     if (core->cursor > end)
         core->cursor -= end - start;
@@ -472,10 +582,10 @@ static size_t clamp_column(const EditorCore *core, size_t start, size_t end, siz
     size_t position = start + (column < end - start ? column : end - start);
     size_t candidate = position;
     while (candidate > start && position - candidate < 3 && candidate < end &&
-        ((unsigned char)core->text[candidate] & 0xC0) == 0x80)
+        ((unsigned char)text_byte(core, candidate) & 0xC0) == 0x80)
         --candidate;
     unsigned long value;
-    size_t length = decode_character(core->text + candidate, end - candidate, &value);
+    size_t length = decode_text(core, candidate, end - candidate, &value);
     if (length && candidate + length > position)
         position = candidate;
     return position;
@@ -502,6 +612,12 @@ EditorCore *editor_core_create(const char *initial_text)
     core->page_lines = 20;
     core->command_prefix = ':';
     core->document_change.first_line = SIZE_MAX;
+    core->file = virtual_buffer_create();
+    if (!core->file) {
+        editor_core_destroy(core);
+        return NULL;
+    }
+    core->literal_bytes = 1;
     core->line_ending = initial_text && strstr(initial_text, "\r\n")
         ? EDITOR_LINE_ENDING_CRLF : EDITOR_LINE_ENDING_LF;
     if (!insert_text(core, initial_text ? initial_text : "")) {
@@ -531,6 +647,8 @@ void editor_core_destroy(EditorCore *core)
     free(core->replace_edits);
     free(core->register_text);
     free(core->text);
+    virtual_buffer_destroy(core->file);
+    free(core->line_text);
     free(core);
 }
 
@@ -558,7 +676,9 @@ static size_t character_column(const EditorCore *core, size_t position)
 static size_t advance_columns(const EditorCore *core, size_t column, size_t start, size_t end)
 {
     while (start < end) {
-        size_t width = core->text[start] == '\t' ? core->settings.tabwidth - column % core->settings.tabwidth : 1;
+        size_t width = text_byte(core, start) == '\t' ? core->settings.tabwidth - column % core->settings.tabwidth : 1;
+        if (text_byte(core, start) == '\r' && start + 1 < core->length && text_byte(core, start + 1) == '\n')
+            width = 0;
         if (width > SIZE_MAX - column)
             return SIZE_MAX;
         column += width;
@@ -576,9 +696,14 @@ static size_t column_position(const EditorCore *core, size_t start, size_t end, 
 
 static size_t position_line(const EditorCore *core, size_t position)
 {
+    if (core->file) {
+        size_t line = 0;
+        virtual_buffer_lines(core->file, position, &line);
+        return line;
+    }
     size_t line = 0;
     for (size_t offset = 0; offset < position; ++offset)
-        if (core->text[offset] == '\n')
+        if (text_byte(core, offset) == '\n')
             ++line;
     return line;
 }
@@ -605,9 +730,7 @@ static int finish_block_insert(EditorCore *core)
     char *text = length ? malloc(length) : NULL;
     if (length && !text)
         return 0;
-    if (length)
-        memcpy(text, core->text + core->block_insert_start, length);
-    if (!reserve_text(core, core->length + copies * length)) {
+    if (length && !read_text(core, core->block_insert_start, text, length)) {
         free(text);
         return 0;
     }
@@ -619,16 +742,10 @@ static int finish_block_insert(EditorCore *core)
             size_t position = column_position(core, start, end, core->block_insert_column);
             if (character_column(core, position) < core->block_insert_column)
                 continue;
-            if (!prepare_edit(core)) {
+            if (!write_span(core, position, position, text, length)) {
                 free(text);
                 return 0;
             }
-            note_change(core, position, position, text, length);
-            memmove(core->text + position + length, core->text + position,
-                core->length - position + 1);
-            memcpy(core->text + position, text, length);
-            core->length += length;
-            core->modified = 1;
         }
         core->cursor = previous_character(core, core->cursor);
     }
@@ -641,10 +758,20 @@ static int use_block(EditorCore *core, int remove)
 {
     size_t first, last, left, right;
     block_bounds(core, &first, &last, &left, &right);
-    size_t rows = last - first;
-    if (rows > SIZE_MAX - 1 - core->length)
-        return 0;
-    char *text = malloc(core->length + rows + 1);
+    size_t capacity = last - first;
+    for (size_t line = first;; ++line) {
+        size_t start, end;
+        if (!find_line(core, line, &start, &end))
+            return 0;
+        start = column_position(core, start, end, left);
+        end = column_position(core, start, end, right - left + 1);
+        if (end - start > SIZE_MAX - 1 - capacity)
+            return 0;
+        capacity += end - start;
+        if (line == last)
+            break;
+    }
+    char *text = malloc(capacity + 1);
     if (!text)
         return 0;
     size_t length = 0;
@@ -653,7 +780,10 @@ static int use_block(EditorCore *core, int remove)
         find_line(core, line, &start, &end);
         start = column_position(core, start, end, left);
         end = column_position(core, start, end, right - left + 1);
-        memcpy(text + length, core->text + start, end - start);
+        if (!read_text(core, start, text + length, end - start)) {
+            free(text);
+            return 0;
+        }
         length += end - start;
         if (line == last)
             break;
@@ -701,19 +831,22 @@ static int step_history(EditorCore *core, size_t count, int redo)
         HistoryEntry *entry = *source;
         *source = entry->next;
         char *text = core->text;
+        VirtualBuffer *file = core->file;
         size_t length = core->length;
         size_t cursor = core->revision_cursor;
         size_t revision = core->revision;
         EditorLineEnding line_ending = core->line_ending;
         int literal_bytes = core->literal_bytes;
         core->text = entry->text;
+        core->file = entry->file;
         core->length = entry->length;
-        core->capacity = entry->length + 1;
+        core->capacity = core->file ? 0 : entry->length + 1;
         core->cursor = core->revision_cursor = entry->cursor;
         core->revision = entry->revision;
         core->line_ending = entry->line_ending;
         core->literal_bytes = entry->literal_bytes;
         entry->text = text;
+        entry->file = file;
         entry->length = length;
         entry->cursor = cursor;
         entry->revision = revision;
@@ -771,10 +904,24 @@ static size_t normalize_line_endings(char *text, size_t length, size_t *cursor)
 
 static void reset_document(EditorCore *core)
 {
+    if (core->file) {
+        core->literal_bytes = 1;
+        core->line_ending = EDITOR_LINE_ENDING_LF;
+        unsigned char bytes[65536];
+        size_t count = core->length > sizeof(bytes) ? sizeof(bytes) : core->length;
+        if (virtual_buffer_read(core->file, 0, bytes, count)) {
+            for (size_t index = 1; index < count; ++index)
+                if (bytes[index - 1] == '\r' && bytes[index] == '\n') {
+                    core->line_ending = EDITOR_LINE_ENDING_CRLF;
+                    break;
+                }
+        }
+    } else {
     core->line_ending = inspect_line_endings(core->text, core->length, &core->literal_bytes);
     if (!core->literal_bytes) {
         size_t cursor = 0;
         core->length = normalize_line_endings(core->text, core->length, &cursor);
+    }
     }
     note_changed_lines(core, 0, SIZE_MAX);
     free_history(core->undo);
@@ -799,16 +946,19 @@ static int set_buffer(EditorCore *core, const EditorBuffer *buffer)
 {
     if (!buffer || (buffer->length && !buffer->data) || buffer->length == SIZE_MAX)
         return 0;
-    char *text = malloc(buffer->length + 1);
-    if (!text)
+    VirtualBuffer *paged = virtual_buffer_create();
+    if (!paged)
         return 0;
-    if (buffer->length)
-        memcpy(text, buffer->data, buffer->length);
-    text[buffer->length] = 0;
+    if (!virtual_buffer_replace(paged, 0, 0, buffer->data, buffer->length)) {
+        virtual_buffer_destroy(paged);
+        return 0;
+    }
+    virtual_buffer_destroy(core->file);
+    core->file = paged;
     free(core->text);
-    core->text = text;
+    core->text = NULL;
     core->length = buffer->length;
-    core->capacity = buffer->length + 1;
+    core->capacity = 0;
     clear_directory(core);
     reset_document(core);
     return 1;
@@ -818,36 +968,16 @@ static int load_file(EditorCore *core, const char *path)
 {
     if (!path || !*path)
         return 0;
-    FILE *file = fopen(path, "rb");
-    if (!file)
+    VirtualBuffer *paged = virtual_buffer_open(path);
+    if (!paged)
         return 0;
-    EditorCore loaded = { 0 };
-    int success = reserve_text(&loaded, 0);
-    char chunk[4096];
-    while (success) {
-        size_t count = fread(chunk, 1, sizeof(chunk), file);
-        if (count > SIZE_MAX - loaded.length || !reserve_text(&loaded, loaded.length + count)) {
-            success = 0;
-            break;
-        }
-        memcpy(loaded.text + loaded.length, chunk, count);
-        loaded.length += count;
-        if (count < sizeof(chunk)) {
-            success = !ferror(file);
-            break;
-        }
-    }
-    if (fclose(file) != 0)
-        success = 0;
-    if (!success) {
-        free(loaded.text);
-        return 0;
-    }
-    loaded.text[loaded.length] = 0;
+    size_t file_length = virtual_buffer_length(paged);
+    virtual_buffer_destroy(core->file);
+    core->file = paged;
     free(core->text);
-    core->text = loaded.text;
-    core->length = loaded.length;
-    core->capacity = loaded.capacity;
+    core->text = NULL;
+    core->length = file_length;
+    core->capacity = 0;
     clear_directory(core);
     reset_document(core);
     return 1;
@@ -972,10 +1102,7 @@ static int activate_directory_entry(EditorCore *core)
 {
     if (!core->directory_active)
         return 0;
-    size_t line = 0;
-    for (size_t position = 0; position < core->cursor; ++position)
-        if (core->text[position] == '\n')
-            ++line;
+    size_t line = position_line(core, core->cursor);
     if (line >= core->directory_count)
         return 1;
     const EditorDirectoryEntry *entry = &core->directory_entries[line];
@@ -995,13 +1122,25 @@ static int activate_directory_entry(EditorCore *core)
 
 static int serialize_buffer(EditorCore *core, EditorBuffer *buffer)
 {
+    if (core->file) {
+        buffer->data = NULL;
+        buffer->length = 0;
+        if (core->length >= 65536)
+            return 0;
+        const char *text = text_span(core, 0, core->length);
+        if (!text)
+            return 0;
+        buffer->data = (const unsigned char *)text;
+        buffer->length = core->length;
+        return 1;
+    }
     buffer->data = (const unsigned char *)core->text;
     buffer->length = core->length;
     if (core->literal_bytes || core->line_ending == EDITOR_LINE_ENDING_LF)
         return 1;
     size_t newlines = 0;
     for (size_t index = 0; index < core->length; ++index)
-        if (core->text[index] == '\n')
+        if (text_byte(core, index) == '\n')
             ++newlines;
     if (newlines >= SIZE_MAX - core->length)
         return 0;
@@ -1015,9 +1154,9 @@ static int serialize_buffer(EditorCore *core, EditorBuffer *buffer)
     }
     size_t position = 0;
     for (size_t index = 0; index < core->length; ++index) {
-        if (core->text[index] == '\n')
+        if (text_byte(core, index) == '\n')
             core->serialized_text[position++] = '\r';
-        core->serialized_text[position++] = core->text[index];
+        core->serialized_text[position++] = text_byte(core, index);
     }
     core->serialized_text[position] = 0;
     buffer->data = (const unsigned char *)core->serialized_text;
@@ -1029,6 +1168,28 @@ static int save_file(EditorCore *core, const char *path)
 {
     if (!path || !*path)
         return 0;
+    if (core->file) {
+        if (!virtual_buffer_detach(core->file))
+            return 0;
+        for (HistoryEntry *entry = core->undo; entry; entry = entry->next)
+            if (!virtual_buffer_detach(entry->file))
+                return 0;
+        for (HistoryEntry *entry = core->redo; entry; entry = entry->next)
+            if (!virtual_buffer_detach(entry->file))
+                return 0;
+        FILE *stream = fopen(path, "wb");
+        if (!stream)
+            return 0;
+        int success = virtual_buffer_write(core->file, stream, 0, core->length);
+        if (fclose(stream))
+            success = 0;
+        if (success) {
+            core->modified = 0;
+            core->saved_revision = core->revision;
+            core->history_open = 0;
+        }
+        return success;
+    }
     EditorBuffer buffer;
     if (!serialize_buffer(core, &buffer))
         return 0;
@@ -1070,13 +1231,16 @@ static int use_range(EditorCore *core, TextRange range, int remove)
         core->mode = EDITOR_MODE_COMMAND;
         return 1;
     }
-    int append_newline = range.linewise && (!length || core->text[range.end - 1] != '\n');
+    int append_newline = range.linewise && (!length || text_byte(core, range.end - 1) != '\n');
     if (length > SIZE_MAX - 1 - append_newline)
         return 0;
     char *text = malloc(length + append_newline + 1);
     if (!text)
         return 0;
-    memcpy(text, core->text + range.start, length);
+    if (!read_text(core, range.start, text, length)) {
+        free(text);
+        return 0;
+    }
     if (append_newline)
         text[length++] = '\n';
     text[length] = 0;
@@ -1113,7 +1277,7 @@ static TextRange counted_lines(const EditorCore *core, size_t count)
 
 static int word_class(const EditorCore *core, size_t position)
 {
-    unsigned char byte = (unsigned char)core->text[position];
+    unsigned char byte = (unsigned char)text_byte(core, position);
     if (byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r')
         return 0;
     return byte >= 0x80 || (byte >= 'a' && byte <= 'z') ||
@@ -1179,7 +1343,7 @@ static void goto_line(EditorCore *core, size_t number)
 static int search_matches(const EditorCore *core, size_t position)
 {
     if (core->search_length > core->length - position ||
-        memcmp(core->text + position, core->search_text, core->search_length) != 0)
+        !text_equal(core, position, core->search_text, core->search_length))
         return 0;
     if (!core->search_whole_word)
         return 1;
@@ -1194,6 +1358,39 @@ static int repeat_search(EditorCore *core, size_t count, int backwards)
     if (!core->search_length) {
         core->status = EDITOR_STATUS_NO_PREVIOUS_SEARCH;
         return 0;
+    }
+    if (count == 1) {
+        size_t position = core->cursor;
+        if (backwards) {
+            while (position) {
+                position = previous_character(core, position);
+                if (search_matches(core, position))
+                    goto located;
+            }
+            position = core->length;
+            while (position > core->cursor) {
+                position = previous_character(core, position);
+                if (position < core->cursor)
+                    break;
+                if (search_matches(core, position))
+                    goto located;
+            }
+        } else {
+            for (position = next_character(core, core->cursor); position < core->length;
+                position = next_character(core, position))
+                if (search_matches(core, position))
+                    goto located;
+            for (position = 0; position <= core->cursor && position < core->length;
+                position = next_character(core, position))
+                if (search_matches(core, position))
+                    goto located;
+        }
+        core->status = EDITOR_STATUS_PATTERN_NOT_FOUND;
+        return 0;
+located:
+        core->cursor = position;
+        core->status = EDITOR_STATUS_NONE;
+        return 1;
     }
     size_t matches = 0;
     size_t first = SIZE_MAX;
@@ -1262,7 +1459,10 @@ static int search_word(EditorCore *core, size_t count)
     char *text = malloc(length + 1);
     if (!text)
         return 0;
-    memcpy(text, core->text + start, length);
+    if (!read_text(core, start, text, length)) {
+        free(text);
+        return 0;
+    }
     text[length] = 0;
     free(core->search_text);
     core->search_text = text;
@@ -1315,7 +1515,7 @@ static int move_command(EditorCore *core, unsigned long key, size_t count, int e
         core->cursor = line_start(core, core->cursor);
         size_t end = line_end(core, core->cursor);
         while (core->cursor < end &&
-            (core->text[core->cursor] == ' ' || core->text[core->cursor] == '\t'))
+            (text_byte(core, core->cursor) == ' ' || text_byte(core, core->cursor) == '\t'))
             core->cursor = next_character(core, core->cursor);
         return 1;
     }
@@ -1391,25 +1591,10 @@ static int paste_register(EditorCore *core, size_t count, int before)
     }
     if (suffix)
         text[offset++] = '\n';
-    size_t new_length = core->length - (range.end - range.start) + length;
-    if (!reserve_text(core, new_length)) {
+    if (!write_span(core, range.start, range.end, text, length)) {
         free(text);
         return 0;
     }
-    int changed = length != range.end - range.start ||
-        (length && memcmp(core->text + range.start, text, length) != 0);
-    if (changed && !prepare_edit(core)) {
-        free(text);
-        return 0;
-    }
-    if (changed)
-        note_change(core, range.start, range.end, text, length);
-    memmove(core->text + range.start + length, core->text + range.end,
-        core->length - range.end + 1);
-    memcpy(core->text + range.start, text, length);
-    core->length = new_length;
-    if (changed)
-        core->modified = 1;
     core->cursor = core->register_linewise || range.linewise ? range.start + prefix :
         previous_character(core, range.start + length);
     core->mode = EDITOR_MODE_COMMAND;
@@ -1419,6 +1604,18 @@ static int paste_register(EditorCore *core, size_t count, int before)
 
 static int write_span(EditorCore *core, size_t start, size_t end, const char *text, size_t length)
 {
+    if (core->file) {
+        if (start > end || end > core->length)
+            return 0;
+        if (length == end - start && text_equal(core, start, text, length))
+            return 1;
+        if (!prepare_edit(core) || !virtual_buffer_replace(core->file, start, end - start, text, length))
+            return 0;
+        core->length = virtual_buffer_length(core->file);
+        core->modified = 1;
+        note_changed_lines(core, 0, SIZE_MAX);
+        return 1;
+    }
     size_t remaining = core->length - (end - start);
     if (length > SIZE_MAX - 1 - remaining || !reserve_text(core, remaining + length))
         return 0;
@@ -1437,6 +1634,18 @@ static int write_span(EditorCore *core, size_t start, size_t end, const char *te
 
 static int replace_bytes(EditorCore *core, const EditorByteEdit *edit)
 {
+    if (core->file) {
+        if (!edit || (edit->length && !edit->data) || edit->offset > core->length ||
+            edit->remove_length > core->length - edit->offset ||
+            !write_span(core, edit->offset, edit->offset + edit->remove_length,
+                (const char *)edit->data, edit->length))
+            return 0;
+        core->cursor = edit->offset;
+        core->anchor = core->cursor;
+        core->mode = EDITOR_MODE_COMMAND;
+        reset_command(core);
+        return 1;
+    }
     EditorBuffer buffer;
     if (!edit || (edit->length && !edit->data) || !serialize_buffer(core, &buffer) ||
         edit->offset > buffer.length || edit->remove_length > buffer.length - edit->offset)
@@ -1523,7 +1732,7 @@ static TextRange whole_lines(const EditorCore *core, TextRange range)
 static int blank_text_line(const EditorCore *core, size_t start)
 {
     size_t end = line_end(core, start);
-    while (start < end && (core->text[start] == ' ' || core->text[start] == '\t'))
+    while (start < end && (text_byte(core, start) == ' ' || text_byte(core, start) == '\t'))
         ++start;
     return start == end;
 }
@@ -1561,8 +1770,47 @@ static TextRange paragraph_lines(const EditorCore *core, size_t count, int aroun
     return range;
 }
 
+static int write_stream_span(EditorCore *core, size_t start, size_t end, FILE *stream, size_t length)
+{
+    if (start > end || end > core->length || fflush(stream) || fseek(stream, 0, SEEK_SET))
+        return 0;
+    int equal = length == end - start;
+    unsigned char bytes[65536];
+    for (size_t offset = 0; equal && offset < length;) {
+        size_t count = length - offset;
+        if (count > sizeof(bytes))
+            count = sizeof(bytes);
+        if (fread(bytes, 1, count, stream) != count)
+            return 0;
+        equal = text_equal(core, start + offset, (const char *)bytes, count);
+        offset += count;
+    }
+    if (equal)
+        return 1;
+    if (fseek(stream, 0, SEEK_SET) || !prepare_edit(core) ||
+        !virtual_buffer_replace_stream(core->file, start, end - start, stream, length))
+        return 0;
+    core->length = virtual_buffer_length(core->file);
+    core->modified = 1;
+    note_changed_lines(core, 0, SIZE_MAX);
+    return 1;
+}
+
 static int append_edit_text(EditorCore *output, const char *text, size_t length)
 {
+    if (output->output_stream) {
+        if (length > SIZE_MAX - 1 - output->length)
+            return 0;
+        while (length) {
+            size_t count = length > 65536 ? 65536 : length;
+            if (fwrite(text, 1, count, output->output_stream) != count)
+                return 0;
+            output->length += count;
+            text += count;
+            length -= count;
+        }
+        return 1;
+    }
     if (length > SIZE_MAX - 1 - output->length || !reserve_text(output, output->length + length))
         return 0;
     if (length)
@@ -1572,15 +1820,40 @@ static int append_edit_text(EditorCore *output, const char *text, size_t length)
     return 1;
 }
 
+static int append_core_text(EditorCore *output, const EditorCore *core, size_t start, size_t length)
+{
+    char bytes[65536];
+    while (length) {
+        size_t count = length > sizeof(bytes) ? sizeof(bytes) : length;
+        if (!read_text(core, start, bytes, count) || !append_edit_text(output, bytes, count))
+            return 0;
+        start += count;
+        length -= count;
+    }
+    return 1;
+}
+
+static int same_ranges(const EditorCore *core, size_t first, size_t second, size_t length)
+{
+    for (size_t offset = 0; offset < length; ++offset)
+        if (text_byte(core, first + offset) != text_byte(core, second + offset))
+            return 0;
+    return 1;
+}
+
 static int apply_line_edit(EditorCore *core, TextRange range, EditorCore *output)
 {
-    int success = write_span(core, range.start, range.end, output->text, output->length);
+    int success = output->output_stream ?
+        write_stream_span(core, range.start, range.end, output->output_stream, output->length) :
+        write_span(core, range.start, range.end, output->text, output->length);
+    if (output->output_stream)
+        fclose(output->output_stream);
     free(output->text);
     if (!success)
         return 0;
     core->cursor = range.start;
     while (core->cursor < core->length &&
-        (core->text[core->cursor] == ' ' || core->text[core->cursor] == '\t'))
+        (text_byte(core, core->cursor) == ' ' || text_byte(core, core->cursor) == '\t'))
         ++core->cursor;
     core->anchor = core->cursor;
     core->block_insert = 0;
@@ -1595,10 +1868,13 @@ static int shift_lines(EditorCore *core, TextRange range, int right, size_t step
         return 0;
     size_t distance = steps * core->settings.tabwidth;
     EditorCore output = { 0 };
+    output.output_stream = tmpfile();
+    if (!output.output_stream)
+        return 0;
     for (size_t start = range.start; start < range.end;) {
         size_t end = line_end(core, start);
         size_t first = start;
-        while (first < end && (core->text[first] == ' ' || core->text[first] == '\t'))
+        while (first < end && (text_byte(core, first) == ' ' || text_byte(core, first) == '\t'))
             ++first;
         size_t next = end < range.end ? end + 1 : end;
         if (first < end) {
@@ -1608,18 +1884,21 @@ static int shift_lines(EditorCore *core, TextRange range, int right, size_t step
             column = right ? column + distance : distance > column ? 0 : column - distance;
             size_t bytes = core->settings.expandtabs ? column :
                 column / core->settings.tabwidth + column % core->settings.tabwidth;
-            if (bytes > SIZE_MAX - 1 - output.length || !reserve_text(&output, output.length + bytes))
+            for (size_t index = 0; index < bytes; ++index) {
+                char value = !core->settings.expandtabs && index < column / core->settings.tabwidth ? '\t' : ' ';
+                if (!append_edit_text(&output, &value, 1))
+                    goto failure;
+            }
+            if (!append_core_text(&output, core, first, next - first))
                 goto failure;
-            output.length += c_indent_write(output.text + output.length, column, &core->settings);
-            if (!append_edit_text(&output, core->text + first, next - first))
-                goto failure;
-        } else if (!append_edit_text(&output, core->text + start, next - start)) {
+        } else if (!append_core_text(&output, core, start, next - start)) {
             goto failure;
         }
         start = next;
     }
     return apply_line_edit(core, range, &output);
 failure:
+    fclose(output.output_stream);
     free(output.text);
     return 0;
 }
@@ -1633,38 +1912,41 @@ static int format_lines(EditorCore *core, TextRange range)
     }
     range = whole_lines(core, range);
     EditorCore output = { 0 };
+    output.output_stream = tmpfile();
+    if (!output.output_stream)
+        return 0;
     int paragraph = 0, has_word = 0;
     size_t prefix = 0, prefix_length = 0, column = 0;
     size_t leader = 0, leader_length = 0;
     for (size_t start = range.start; start < range.end;) {
         size_t end = line_end(core, start);
         size_t first = start;
-        while (first < end && (core->text[first] == ' ' || core->text[first] == '\t'))
+        while (first < end && (text_byte(core, first) == ' ' || text_byte(core, first) == '\t'))
             ++first;
         size_t body = first;
         size_t current_leader = 0;
         if (core->lexer == &lexer_c_cpp && end - first >= 2 &&
-            core->text[first] == '/' && core->text[first + 1] == '/') {
-            while (body < end && core->text[body] == '/')
+            text_byte(core, first) == '/' && text_byte(core, first + 1) == '/') {
+            while (body < end && text_byte(core, body) == '/')
                 ++body;
-            if (body < end && core->text[body] == '!')
+            if (body < end && text_byte(core, body) == '!')
                 ++body;
             current_leader = body - first;
-            while (body < end && (core->text[body] == ' ' || core->text[body] == '\t'))
+            while (body < end && (text_byte(core, body) == ' ' || text_byte(core, body) == '\t'))
                 ++body;
         }
         size_t next = end < range.end ? end + 1 : end;
         if (body == end) {
             if (paragraph && !append_edit_text(&output, "\n", 1))
                 goto failure;
-            if (!append_edit_text(&output, core->text + start, next - start))
+            if (!append_core_text(&output, core, start, next - start))
                 goto failure;
             paragraph = 0;
             start = next;
             continue;
         }
         if (paragraph && (current_leader != leader_length ||
-            (leader_length && memcmp(core->text + first, core->text + leader, leader_length)))) {
+            (leader_length && !same_ranges(core, first, leader, leader_length)))) {
             if (!append_edit_text(&output, "\n", 1))
                 goto failure;
             paragraph = 0;
@@ -1674,25 +1956,25 @@ static int format_lines(EditorCore *core, TextRange range)
             prefix_length = body - start;
             leader = first;
             leader_length = current_leader;
-            if (!append_edit_text(&output, core->text + prefix, prefix_length))
+            if (!append_core_text(&output, core, prefix, prefix_length))
                 goto failure;
             column = advance_columns(core, 0, start, body);
             has_word = 0;
             paragraph = 1;
         }
         for (size_t position = body; position < end;) {
-            if (core->text[position] == ' ' || core->text[position] == '\t') {
+            if (text_byte(core, position) == ' ' || text_byte(core, position) == '\t') {
                 ++position;
                 continue;
             }
             size_t word_end = position;
-            while (word_end < end && core->text[word_end] != ' ' && core->text[word_end] != '\t')
+            while (word_end < end && text_byte(core, word_end) != ' ' && text_byte(core, word_end) != '\t')
                 word_end = next_character(core, word_end);
             size_t width = advance_columns(core, 0, position, word_end);
             if (has_word && (column >= core->settings.maxcol ||
                 width > core->settings.maxcol - column - 1)) {
                 if (!append_edit_text(&output, "\n", 1) ||
-                    !append_edit_text(&output, core->text + prefix, prefix_length))
+                    !append_core_text(&output, core, prefix, prefix_length))
                     goto failure;
                 column = advance_columns(core, 0, prefix, prefix + prefix_length);
                 has_word = 0;
@@ -1703,7 +1985,7 @@ static int format_lines(EditorCore *core, TextRange range)
                 ++column;
             }
             if (width > SIZE_MAX - column ||
-                !append_edit_text(&output, core->text + position, word_end - position))
+                !append_core_text(&output, core, position, word_end - position))
                 goto failure;
             column += width;
             has_word = 1;
@@ -1711,11 +1993,12 @@ static int format_lines(EditorCore *core, TextRange range)
         }
         start = next;
     }
-    if (paragraph && range.end > range.start && core->text[range.end - 1] == '\n' &&
+    if (paragraph && range.end > range.start && text_byte(core, range.end - 1) == '\n' &&
         !append_edit_text(&output, "\n", 1))
         goto failure;
     return apply_line_edit(core, range, &output);
 failure:
+    fclose(output.output_stream);
     free(output.text);
     return 0;
 }
@@ -1729,7 +2012,7 @@ static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **
     size_t current_start = line_start(core, core->cursor);
     size_t current_first = current_start;
     while (current_first < core->cursor &&
-        (core->text[current_first] == ' ' || core->text[current_first] == '\t'))
+        (text_byte(core, current_first) == ' ' || text_byte(core, current_first) == '\t'))
         ++current_first;
     size_t current_indent = advance_columns(core, 0, current_start, current_first);
     size_t corrected_indent = current_indent;
@@ -1739,14 +2022,15 @@ static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **
         if (end > core->cursor)
             end = core->cursor;
         size_t first = start;
-        while (first < end && (core->text[first] == ' ' || core->text[first] == '\t'))
+        while (first < end && (text_byte(core, first) == ' ' || text_byte(core, first) == '\t'))
             ++first;
         size_t original_indent = advance_columns(core, 0, start, first);
         size_t indent = original_indent;
         size_t column = 0, measured = start;
         int seen_code = 0;
         LexerCCppLine parsed = { 0 };
-        if (!lexer_c_cpp_line(core->text + start, end - start, state, &parsed)) {
+        const char *subject = text_span(core, start, end - start);
+        if (!subject || !lexer_c_cpp_line(subject, end - start, state, &parsed)) {
             free(frames);
             return 0;
         }
@@ -1757,7 +2041,7 @@ static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **
                 continue;
             size_t token_end = start + token->start + token->length;
             for (size_t position = start + token->start; position < token_end;) {
-                unsigned char value = (unsigned char)core->text[position];
+                unsigned char value = (unsigned char)text_byte(core, position);
                 if (value == ' ' || value == '\t' || value == '\r') {
                     ++position;
                     continue;
@@ -1769,12 +2053,12 @@ static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **
                 if (literal)
                     next = token_end;
                 else if (c_indent_identifier(value))
-                    while (next < token_end && c_indent_identifier((unsigned char)core->text[next]))
+                    while (next < token_end && c_indent_identifier((unsigned char)text_byte(core, next)))
                         ++next;
                 size_t word_length = next - position;
                 int case_label = !literal && !seen_code &&
-                    ((word_length == 4 && !memcmp(core->text + position, "case", 4)) ||
-                        (word_length == 7 && !memcmp(core->text + position, "default", 7)));
+                    ((word_length == 4 && text_equal(core, position, "case", 4)) ||
+                        (word_length == 7 && text_equal(core, position, "default", 7)));
                 int closing = !literal && (value == ')' || value == ']' || value == '}');
                 if (case_label) {
                     for (size_t index = depth; index > 0; --index) {
@@ -1815,7 +2099,7 @@ static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **
                         frames[depth - 1].body = adjusted_column;
                         frames[depth - 1].aligned = 1;
                     }
-                    if (!literal && word_length == 6 && !memcmp(core->text + position, "switch", 6)) {
+                    if (!literal && word_length == 6 && text_equal(core, position, "switch", 6)) {
                         switch_pending = 1;
                         switch_base = indent;
                     }
@@ -1895,7 +2179,10 @@ static int c_indent_newline(EditorCore *core, size_t *replacement_start, char **
     size_t offset = 0;
     if (rewrite) {
         offset = c_indent_write(*text, prefix_column, &core->settings);
-        memcpy(*text + offset, core->text + current_first, content_bytes);
+        if (!read_text(core, current_first, *text + offset, content_bytes)) {
+            free(*text);
+            return 0;
+        }
         offset += content_bytes;
     }
     (*text)[offset++] = '\n';
@@ -1988,7 +2275,11 @@ static int replace_input(EditorCore *core, unsigned long key)
         free(expanded);
         return 0;
     }
-    memcpy(edit.original, core->text + start, edit.original_length);
+    if (!read_text(core, start, edit.original, edit.original_length)) {
+        free(edit.original);
+        free(expanded);
+        return 0;
+    }
     if (!write_span(core, start, end, text, length)) {
         free(edit.original);
         free(expanded);
@@ -2029,7 +2320,7 @@ static int replace_characters(EditorCore *core, unsigned long key, size_t count)
     }
     size_t characters = 0, line = first, column = 0;
     for (size_t position = start; position < end; position = next_character(core, position)) {
-        if (core->text[position] == '\n') {
+        if (text_byte(core, position) == '\n') {
             ++line;
             column = 0;
         } else {
@@ -2050,7 +2341,7 @@ static int replace_characters(EditorCore *core, unsigned long key, size_t count)
     column = 0;
     for (size_t position = start; position < end;) {
         size_t next = next_character(core, position);
-        int newline = core->text[position] == '\n';
+        int newline = text_byte(core, position) == '\n';
         int replace = !newline && (!block || (line <= last && column >= left && column <= right));
         if (replace) {
             if (!positioned) {
@@ -2060,7 +2351,10 @@ static int replace_characters(EditorCore *core, unsigned long key, size_t count)
             memcpy(text + length, encoded, width);
             length += width;
         } else {
-            memcpy(text + length, core->text + position, next - position);
+            if (!read_text(core, position, text + length, next - position)) {
+                free(text);
+                return 0;
+            }
             length += next - position;
         }
         if (newline) {
@@ -2445,51 +2739,36 @@ static int retab(EditorCore *core)
 {
     if (!core->settings.expandtabs)
         return 1;
-    size_t length = core->length;
-    size_t column = 0;
-    int found = 0;
-    for (size_t position = 0; position < core->length; position = next_character(core, position)) {
-        if (core->text[position] == '\t') {
-            size_t spaces = core->settings.tabwidth - column;
-            if (spaces - 1 > SIZE_MAX - 1 - length)
-                return 0;
-            length += spaces - 1;
-            column = 0;
-            found = 1;
-        } else if (core->text[position] == '\n') {
-            column = 0;
-        } else {
-            column = column + 1 == core->settings.tabwidth ? 0 : column + 1;
-        }
-    }
-    if (!found)
-        return 1;
-    char *text = malloc(length + 1);
-    if (!text)
+    EditorCore output = { 0 };
+    output.output_stream = tmpfile();
+    if (!output.output_stream)
         return 0;
-    size_t offset = 0;
-    size_t cursor = length;
-    column = 0;
+    size_t column = 0;
+    size_t cursor = 0;
+    int success = 1;
     for (size_t position = 0; position < core->length;) {
         if (position == core->cursor)
-            cursor = offset;
+            cursor = output.length;
         size_t next = next_character(core, position);
-        if (core->text[position] == '\t') {
+        if (text_byte(core, position) == '\t') {
             size_t spaces = core->settings.tabwidth - column;
-            memset(text + offset, ' ', spaces);
-            offset += spaces;
+            for (size_t index = 0; success && index < spaces; ++index)
+                success = append_edit_text(&output, " ", 1);
             column = 0;
         } else {
-            memcpy(text + offset, core->text + position, next - position);
-            offset += next - position;
-            column = core->text[position] == '\n' || column + 1 == core->settings.tabwidth ? 0 : column + 1;
+            success = append_core_text(&output, core, position, next - position);
+            column = text_byte(core, position) == '\n' || column + 1 == core->settings.tabwidth ? 0 : column + 1;
         }
+        if (!success)
+            break;
         position = next;
     }
-    text[length] = 0;
+    if (core->cursor == core->length)
+        cursor = output.length;
     core->history_open = 0;
-    int success = write_span(core, 0, core->length, text, length);
-    free(text);
+    if (success)
+        success = write_stream_span(core, 0, core->length, output.output_stream, output.length);
+    fclose(output.output_stream);
     if (!success)
         return 0;
     core->history_open = 0;
@@ -2499,6 +2778,46 @@ static int retab(EditorCore *core)
     core->mode = EDITOR_MODE_COMMAND;
     reset_command(core);
     return 1;
+}
+
+static int convert_line_endings(EditorCore *core, EditorLineEnding ending)
+{
+    EditorCore output = { 0 };
+    output.output_stream = tmpfile();
+    if (!output.output_stream)
+        return 0;
+    size_t cursor = 0;
+    int success = 1;
+    for (size_t position = 0; position < core->length; ++position) {
+        if (position == core->cursor)
+            cursor = output.length;
+        char value = (char)text_byte(core, position);
+        if (value == '\r' && position + 1 < core->length && text_byte(core, position + 1) == '\n')
+            continue;
+        if (value == '\n' && ending == EDITOR_LINE_ENDING_CRLF)
+            success = append_edit_text(&output, "\r\n", 2);
+        else
+            success = append_edit_text(&output, &value, 1);
+        if (!success)
+            break;
+    }
+    if (core->cursor == core->length)
+        cursor = output.length;
+    core->history_open = 0;
+    if (success)
+        success = write_stream_span(core, 0, core->length, output.output_stream, output.length);
+    fclose(output.output_stream);
+    if (success && ending != core->line_ending)
+        success = prepare_edit(core);
+    if (success) {
+        if (ending != core->line_ending)
+            core->modified = 1;
+        core->line_ending = ending;
+        core->literal_bytes = 1;
+        core->cursor = core->anchor = cursor;
+    }
+    core->history_open = 0;
+    return success;
 }
 
 static int complete_command(EditorCore *core)
@@ -2596,6 +2915,9 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
     pcre2_compile_context *compile_context = NULL;
     EditorCore output = { 0 };
     int success = 0;
+    output.output_stream = tmpfile();
+    if (!output.output_stream)
+        goto cleanup;
     if (!pattern || !*pattern)
         goto cleanup;
     replacement = substitute_field(&command, (char)delimiter, 0);
@@ -2641,8 +2963,15 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
     int found = 0;
     for (;;) {
         size_t end = line_end(core, start);
-        const char *subject = core->text + start;
         size_t length = end - start;
+        int crlf = length && end < core->length && text_byte(core, end - 1) == '\r';
+        if (crlf)
+            --length;
+        const char *subject = text_span(core, start, length);
+        if (!subject) {
+            core->status = EDITOR_STATUS_REGEX_LIMIT;
+            goto cleanup;
+        }
         size_t copied = 0;
         size_t offset = 0;
         size_t output_line = first + output.length;
@@ -2685,6 +3014,8 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
         }
         if (!append_edit_text(&output, subject + copied, length - copied))
             goto cleanup;
+        if (crlf && !append_edit_text(&output, "\r", 1))
+            goto cleanup;
         if (end == last)
             break;
         if (!append_edit_text(&output, "\n", 1))
@@ -2696,13 +3027,13 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
         goto cleanup;
     }
     core->history_open = 0;
-    success = write_span(core, first, last, output.text, output.length);
+    success = write_stream_span(core, first, last, output.output_stream, output.length);
     core->history_open = 0;
     if (success) {
         core->cursor = line_start(core, cursor);
         size_t end = line_end(core, core->cursor);
         while (core->cursor < end &&
-            (core->text[core->cursor] == ' ' || core->text[core->cursor] == '\t'))
+            (text_byte(core, core->cursor) == ' ' || text_byte(core, core->cursor) == '\t'))
             ++core->cursor;
         core->anchor = core->cursor;
         core->block_insert = 0;
@@ -2712,6 +3043,8 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
         complete_command(core);
     }
 cleanup:
+    if (output.output_stream)
+        fclose(output.output_stream);
     free(output.text);
     pcre2_compile_context_free(compile_context);
     pcre2_match_context_free(context);
@@ -2780,20 +3113,8 @@ static int execute_command(EditorCore *core, const char *text)
         if (core->directory_active)
             return 0;
         EditorLineEnding ending = length == 2 ? EDITOR_LINE_ENDING_LF : EDITOR_LINE_ENDING_CRLF;
-        if (ending != core->line_ending || core->literal_bytes) {
-            core->history_open = 0;
-            if (!prepare_edit(core))
-                return 0;
-            if (core->literal_bytes) {
-                core->length = normalize_line_endings(core->text, core->length, &core->cursor);
-                core->anchor = core->cursor;
-                core->literal_bytes = 0;
-            }
-            core->line_ending = ending;
-            core->modified = 1;
-            core->history_open = 0;
-            note_changed_lines(core, 0, SIZE_MAX);
-        }
+        if (!convert_line_endings(core, ending))
+            return 0;
         return complete_command(core);
     }
     if (*text != '=')
@@ -2981,6 +3302,8 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_GET_TEXT_BUFFER:
         if (!data)
             return 0;
+        if (core->file)
+            return serialize_buffer(core, data);
         ((EditorBuffer *)data)->data = (const unsigned char *)core->text;
         ((EditorBuffer *)data)->length = core->length;
         return 1;
@@ -3005,6 +3328,11 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_GET_LINE_CARET: {
         EditorLineCaret *caret = data;
         size_t start, end;
+        if (caret && core->mode != EDITOR_MODE_VISUAL_BLOCK && !core->block_insert) {
+            caret->active = 0;
+            caret->column = caret->advance = 0;
+            return 1;
+        }
         if (!caret || !find_line(core, caret->line, &start, &end))
             return 0;
         caret->active = 0;
@@ -3034,6 +3362,11 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_GET_SELECTION: {
         EditorSelection *selection = data;
         size_t start, end;
+        if (selection && !core->directory_active && !is_visual(core)) {
+            selection->start = selection->end = 0;
+            selection->active = selection->includes_newline = 0;
+            return 1;
+        }
         if (!selection || !find_line(core, selection->line, &start, &end))
             return 0;
         selection->start = selection->end = 0;
@@ -3100,20 +3433,46 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_GET_LINE: {
         EditorLine *line = data;
         size_t start, end;
+        if (core->file) {
+            if (!line || (!core->line_text && !text_span(core, 0, 0)) ||
+                !virtual_buffer_line_prefix(core->file, line->index, core->line_text,
+                    65535, &line->length, &line->truncated))
+                return 0;
+            core->line_text[line->length] = 0;
+            line->text = core->line_text;
+            return 1;
+        }
         if (!line || !find_line(core, line->index, &start, &end))
             return 0;
         line->text = core->text + start;
         line->length = end - start;
+        line->truncated = 0;
         return 1;
     }
     case EDITOR_GET_CHARACTER: {
         EditorCharacter *character = data;
         size_t start, end;
+        if (core->file) {
+            if (!character || !virtual_buffer_line_start(core->file, character->line, &start) ||
+                character->column >= core->length - start || text_byte(core, start + character->column) == '\n')
+                return 0;
+            character->length = decode_text(core, start + character->column,
+                core->length - start - character->column, &character->value);
+            if (!character->length) {
+                character->value = 0xFFFD;
+                character->length = 1;
+            }
+            character->hidden = character->value == '\r' &&
+                start + character->column + 1 < core->length &&
+                text_byte(core, start + character->column + 1) == '\n';
+            return 1;
+        }
         if (!character || !find_line(core, character->line, &start, &end) ||
             character->column >= end - start)
             return 0;
-        character->length = decode_character(core->text + start + character->column,
+        character->length = decode_text(core, start + character->column,
             end - start - character->column, &character->value);
+        character->hidden = 0;
         if (!character->length) {
             character->value = 0xFFFD;
             character->length = 1;
@@ -3133,11 +3492,25 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     case EDITOR_GET_LINE_COUNT: {
         if (!data)
             return 0;
+        if (core->file) {
+            size_t count;
+            if (!virtual_buffer_lines(core->file, core->length, &count))
+                return 0;
+            *(size_t *)data = count + 1;
+            return 1;
+        }
         size_t count = 1;
         for (size_t index = 0; index < core->length; ++index)
-            if (core->text[index] == '\n')
+            if (text_byte(core, index) == '\n')
                 ++count;
         *(size_t *)data = count;
+        return 1;
+    }
+    case EDITOR_GET_KNOWN_LINE_COUNT: {
+        EditorLineCount *count = data;
+        if (!count || !virtual_buffer_known_lines(core->file, &count->count, &count->complete))
+            return 0;
+        ++count->count;
         return 1;
     }
     case EDITOR_SET_PAGE_SIZE:
@@ -3150,8 +3523,18 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
             return 0;
         EditorPosition position = { 0, 0, core->cursor, core->length, 1 };
         position.column = advance_columns(core, 0, line_start(core, core->cursor), core->cursor);
+        if (core->file) {
+            size_t count;
+            if (!virtual_buffer_known_lines(core->file, &count, &position.line_count_complete))
+                return 0;
+            position.line_count = count + 1;
+            position.line = position_line(core, core->cursor);
+            *(EditorPosition *)data = position;
+            return 1;
+        }
+        position.line_count_complete = 1;
         for (size_t index = 0; index < core->length; ++index) {
-            if (core->text[index] != '\n')
+            if (text_byte(core, index) != '\n')
                 continue;
             ++position.line_count;
             if (index < core->cursor)
@@ -3171,16 +3554,44 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
         EditorCaret *caret = data;
         if (!caret)
             return 0;
-        caret->line = 0;
-        for (size_t index = 0; index < core->cursor; ++index)
-            if (core->text[index] == '\n')
-                ++caret->line;
+        caret->line = position_line(core, core->cursor);
         caret->column = core->cursor - line_start(core, core->cursor);
         return 1;
     }
+    case EDITOR_GET_LENGTH:
+        if (!data)
+            return 0;
+        *(size_t *)data = core->length;
+        return 1;
+    case EDITOR_READ_RANGE: {
+        EditorReadRange *range = data;
+        return range && (!range->length || range->data) &&
+            read_text(core, range->offset, range->data, range->length);
+    }
+    case EDITOR_SET_OFFSET:
+        if (!data || *(const size_t *)data > core->length)
+            return 0;
+        core->cursor = *(const size_t *)data;
+        core->cursor = clamp_column(core, line_start(core, core->cursor),
+            core->length, core->cursor - line_start(core, core->cursor));
+        core->anchor = core->cursor;
+        return 1;
     case EDITOR_SET_CARET: {
         const EditorCaret *caret = data;
         size_t start, end;
+        if (core->file) {
+            if (!caret || !virtual_buffer_line_start(core->file, caret->line, &start))
+                return 0;
+            size_t target = caret->column > core->length - start ? core->length : start + caret->column;
+            end = start;
+            while (end < target && text_byte(core, end) != '\n')
+                ++end;
+            core->block_insert = 0;
+            core->cursor = clamp_column(core, start, core->length, end - start);
+            if (core->mode == EDITOR_MODE_VISUAL_BLOCK)
+                core->block_column = character_column(core, core->cursor);
+            return 1;
+        }
         if (!caret || !find_line(core, caret->line, &start, &end))
             return 0;
         core->block_insert = 0;
