@@ -43,6 +43,7 @@ typedef struct HistoryEntry {
 } HistoryEntry;
 
 struct EditorCore {
+    EditorFileFunctions files;
     FILE *output_stream;
     EditorDirectoryFunctions directory_functions;
     EditorDirectoryEntry *directory_entries;
@@ -593,9 +594,18 @@ static size_t clamp_column(const EditorCore *core, size_t start, size_t end, siz
 
 EditorCore *editor_core_create(const char *initial_text)
 {
+    return editor_core_create_with_files(initial_text, NULL);
+}
+
+EditorCore *editor_core_create_with_files(const char *initial_text, const EditorFileFunctions *files)
+{
+    if (files && (!files->create_temporary || (!!files->map_readonly != !!files->unmap)))
+        return NULL;
     EditorCore *core = calloc(1, sizeof(*core));
     if (!core)
         return NULL;
+    if (files)
+        core->files = *files;
     static const Lexer *const available_lexers[] = {
         &lexer_c_cpp, &lexer_intel_asm, &lexer_makefile, &lexer_batch, &lexer_pascal,
         &lexer_basic, &lexer_html, &lexer_ini, &lexer_config_sys
@@ -617,6 +627,7 @@ EditorCore *editor_core_create(const char *initial_text)
         editor_core_destroy(core);
         return NULL;
     }
+    virtual_buffer_set_temporary_factory(core->file, core->files.context, core->files.create_temporary);
     core->literal_bytes = 1;
     core->line_ending = initial_text && strstr(initial_text, "\r\n")
         ? EDITOR_LINE_ENDING_CRLF : EDITOR_LINE_ENDING_LF;
@@ -949,6 +960,7 @@ static int set_buffer(EditorCore *core, const EditorBuffer *buffer)
     VirtualBuffer *paged = virtual_buffer_create();
     if (!paged)
         return 0;
+    virtual_buffer_set_temporary_factory(paged, core->files.context, core->files.create_temporary);
     if (!virtual_buffer_replace(paged, 0, 0, buffer->data, buffer->length)) {
         virtual_buffer_destroy(paged);
         return 0;
@@ -971,6 +983,7 @@ static int load_file(EditorCore *core, const char *path)
     VirtualBuffer *paged = virtual_buffer_open(path);
     if (!paged)
         return 0;
+    virtual_buffer_set_temporary_factory(paged, core->files.context, core->files.create_temporary);
     size_t file_length = virtual_buffer_length(paged);
     virtual_buffer_destroy(core->file);
     core->file = paged;
@@ -1868,7 +1881,7 @@ static int shift_lines(EditorCore *core, TextRange range, int right, size_t step
         return 0;
     size_t distance = steps * core->settings.tabwidth;
     EditorCore output = { 0 };
-    output.output_stream = tmpfile();
+    output.output_stream = core->files.create_temporary ? core->files.create_temporary(core->files.context) : NULL;
     if (!output.output_stream)
         return 0;
     for (size_t start = range.start; start < range.end;) {
@@ -1912,7 +1925,7 @@ static int format_lines(EditorCore *core, TextRange range)
     }
     range = whole_lines(core, range);
     EditorCore output = { 0 };
-    output.output_stream = tmpfile();
+    output.output_stream = core->files.create_temporary ? core->files.create_temporary(core->files.context) : NULL;
     if (!output.output_stream)
         return 0;
     int paragraph = 0, has_word = 0;
@@ -2740,7 +2753,7 @@ static int retab(EditorCore *core)
     if (!core->settings.expandtabs)
         return 1;
     EditorCore output = { 0 };
-    output.output_stream = tmpfile();
+    output.output_stream = core->files.create_temporary ? core->files.create_temporary(core->files.context) : NULL;
     if (!output.output_stream)
         return 0;
     size_t column = 0;
@@ -2783,7 +2796,7 @@ static int retab(EditorCore *core)
 static int convert_line_endings(EditorCore *core, EditorLineEnding ending)
 {
     EditorCore output = { 0 };
-    output.output_stream = tmpfile();
+    output.output_stream = core->files.create_temporary ? core->files.create_temporary(core->files.context) : NULL;
     if (!output.output_stream)
         return 0;
     size_t cursor = 0;
@@ -2896,6 +2909,40 @@ static int substitute_replacement(EditorCore *output, const char *replacement,
     return 1;
 }
 
+typedef struct RegexSubject {
+    const char *data;
+    FILE *file;
+    const unsigned char *view;
+    void *mapping;
+} RegexSubject;
+
+static void release_regex_subject(EditorCore *core, RegexSubject *subject)
+{
+    if (subject->view)
+        core->files.unmap(core->files.context, subject->view, subject->mapping);
+    if (subject->file)
+        fclose(subject->file);
+    memset(subject, 0, sizeof(*subject));
+}
+
+static int load_regex_subject(EditorCore *core, size_t start, size_t length, RegexSubject *subject)
+{
+    if (length < VIRTUAL_BUFFER_CHUNK_SIZE) {
+        subject->data = text_span(core, start, length);
+        return subject->data != NULL;
+    }
+    if (!core->files.create_temporary || !core->files.map_readonly || !core->files.unmap)
+        return 0;
+    subject->file = core->files.create_temporary(core->files.context);
+    if (!subject->file || !virtual_buffer_write(core->file, subject->file, start, length) ||
+        fflush(subject->file) ||
+        !core->files.map_readonly(core->files.context, subject->file, length,
+            &subject->view, &subject->mapping) || !subject->view)
+        return 0;
+    subject->data = (const char *)subject->view;
+    return 1;
+}
+
 static int substitute(EditorCore *core, const char *command, size_t first, size_t last)
 {
     if (core->directory_active)
@@ -2914,8 +2961,9 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
     pcre2_match_context *context = NULL;
     pcre2_compile_context *compile_context = NULL;
     EditorCore output = { 0 };
+    RegexSubject input = { 0 };
     int success = 0;
-    output.output_stream = tmpfile();
+    output.output_stream = core->files.create_temporary ? core->files.create_temporary(core->files.context) : NULL;
     if (!output.output_stream)
         goto cleanup;
     if (!pattern || !*pattern)
@@ -2967,11 +3015,12 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
         int crlf = length && end < core->length && text_byte(core, end - 1) == '\r';
         if (crlf)
             --length;
-        const char *subject = text_span(core, start, length);
-        if (!subject) {
-            core->status = EDITOR_STATUS_REGEX_LIMIT;
+        release_regex_subject(core, &input);
+        if (!load_regex_subject(core, start, length, &input)) {
+            core->status = EDITOR_STATUS_SUBSTITUTION_FAILED;
             goto cleanup;
         }
+        const char *subject = input.data;
         size_t copied = 0;
         size_t offset = 0;
         size_t output_line = first + output.length;
@@ -3043,6 +3092,7 @@ static int substitute(EditorCore *core, const char *command, size_t first, size_
         complete_command(core);
     }
 cleanup:
+    release_regex_subject(core, &input);
     if (output.output_stream)
         fclose(output.output_stream);
     free(output.text);
@@ -3206,6 +3256,15 @@ static int dispatch_message(EditorCore *core, EditorMessage message, void *data)
     default: break;
     }
     switch (message) {
+    case EDITOR_REGISTER_FILE_FUNCTIONS: {
+        const EditorFileFunctions *files = data;
+        if (!files || !files->create_temporary || (!!files->map_readonly != !!files->unmap) ||
+            core->length || core->undo || core->redo)
+            return 0;
+        core->files = *files;
+        virtual_buffer_set_temporary_factory(core->file, files->context, files->create_temporary);
+        return 1;
+    }
     case EDITOR_REGISTER_DIRECTORY_FUNCTIONS: {
         const EditorDirectoryFunctions *functions = data;
         if (!functions || !functions->list || !functions->change)

@@ -3,6 +3,9 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <io.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1568,6 +1571,73 @@ static int list_directory(void *context, const char *path, EditorDirectoryEmit e
     return success;
 }
 
+static FILE *create_temporary_file(void *context)
+{
+    (void)context;
+    char directory[MAX_PATH];
+    DWORD length = GetTempPathA(MAX_PATH, directory);
+    if (!length || length >= MAX_PATH - 64)
+        return NULL;
+    static LONG sequence;
+    for (unsigned int attempt = 0; attempt < 256; ++attempt) {
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%sparapad-%08lX-%08lX-%08lX.tmp", directory,
+            (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount(),
+            (unsigned long)InterlockedIncrement(&sequence));
+        HANDLE file = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+            CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (file == INVALID_HANDLE_VALUE) {
+            DWORD error = GetLastError();
+            if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)
+                continue;
+            return NULL;
+        }
+        int descriptor = _open_osfhandle((intptr_t)file, _O_BINARY | _O_RDWR);
+        if (descriptor == -1) {
+            CloseHandle(file);
+            return NULL;
+        }
+        FILE *stream = _fdopen(descriptor, "w+b");
+        if (!stream)
+            _close(descriptor);
+        return stream;
+    }
+    return NULL;
+}
+
+static int map_file_readonly(void *context, FILE *file, size_t length,
+    const unsigned char **data, void **mapping)
+{
+    (void)context;
+    *data = NULL;
+    *mapping = NULL;
+    if (!length)
+        return 0;
+    intptr_t descriptor = _get_osfhandle(_fileno(file));
+    if (descriptor == -1)
+        return 0;
+    HANDLE section = CreateFileMappingA((HANDLE)descriptor, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!section)
+        return 0;
+    const unsigned char *view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, length);
+    if (!view) {
+        CloseHandle(section);
+        return 0;
+    }
+    *data = view;
+    *mapping = section;
+    return 1;
+}
+
+static void unmap_file(void *context, const unsigned char *data, void *mapping)
+{
+    (void)context;
+    if (data)
+        UnmapViewOfFile(data);
+    if (mapping)
+        CloseHandle((HANDLE)mapping);
+}
+
 static TextBuffer *create_document(const char *path)
 {
     if (path && strlen(path) >= MAX_PATH)
@@ -1576,11 +1646,13 @@ static TextBuffer *create_document(const char *path)
     if (!buffer)
         return NULL;
     buffer->core = editor_core_create("");
+    EditorFileFunctions files = { NULL, create_temporary_file, map_file_readonly, unmap_file };
     EditorDirectoryFunctions functions = { NULL, list_directory, change_directory };
     DWORD attributes = path ? GetFileAttributesA(path) : INVALID_FILE_ATTRIBUTES;
     EditorMessage load = attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)
         ? EDITOR_OPEN_DIRECTORY : EDITOR_LOAD_FILE;
-    if (!buffer->core || !editor_core_send(buffer->core, EDITOR_REGISTER_DIRECTORY_FUNCTIONS, &functions) ||
+    if (!buffer->core || !editor_core_send(buffer->core, EDITOR_REGISTER_FILE_FUNCTIONS, &files) ||
+        !editor_core_send(buffer->core, EDITOR_REGISTER_DIRECTORY_FUNCTIONS, &functions) ||
         (path && !editor_core_send(buffer->core, load, (void *)path))) {
         editor_core_destroy(buffer->core);
         free(buffer);

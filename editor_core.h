@@ -2,6 +2,7 @@
 #define EDITOR_CORE_H
 
 #include <stddef.h>
+#include <stdio.h>
 #include "lexer.h"
 
 typedef struct EditorCore EditorCore;
@@ -98,8 +99,17 @@ typedef enum EditorMessage {
     EDITOR_GET_LENGTH,
     EDITOR_READ_RANGE,
     EDITOR_SET_OFFSET,
-    EDITOR_GET_KNOWN_LINE_COUNT
+    EDITOR_GET_KNOWN_LINE_COUNT,
+    EDITOR_REGISTER_FILE_FUNCTIONS
 } EditorMessage;
+
+typedef struct EditorFileFunctions {
+    void *context;
+    FILE *(*create_temporary)(void *context);
+    int (*map_readonly)(void *context, FILE *file, size_t length,
+        const unsigned char **data, void **mapping);
+    void (*unmap)(void *context, const unsigned char *data, void *mapping);
+} EditorFileFunctions;
 
 typedef struct EditorReadRange {
     size_t offset;
@@ -213,6 +223,7 @@ typedef struct EditorBuffer {
 } EditorBuffer;
 
 EditorCore *editor_core_create(const char *initial_text);
+EditorCore *editor_core_create_with_files(const char *initial_text, const EditorFileFunctions *files);
 void editor_core_destroy(EditorCore *core);
 int editor_core_send(EditorCore *core, EditorMessage message, void *data);
 

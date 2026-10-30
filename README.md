@@ -79,10 +79,26 @@ Keep source files unchanged outside the editor while they remain open.
 The 64 KiB size bounds file-data cache chunks, not total application memory:
 piece tables, newline indexes, undo metadata, registers, and lexer tokens also
 consume memory. Text-line previews are limited to 65,535 bytes per line; Hex
-Mode can inspect bytes beyond that preview. PCRE2 needs a contiguous line
-subject, so substitution rejects lines longer than 65,535 bytes without applying
-partial changes. Other bounded lexer operations can reject oversized lines too.
+Mode can inspect bytes beyond that preview. PCRE2 substitution has no 64 KiB
+line-size cutoff: larger line subjects are streamed to host-created temporary
+files and exposed through host-provided read-only mappings. The OS pages the
+mapped data on demand; the core does not allocate the entire subject on its heap.
+Matches, lookarounds, backreferences, and captures can cross cache boundaries
+because PCRE2 still sees a complete contiguous virtual subject. Fixed overlapping
+cache windows alone cannot preserve arbitrary PCRE2 matching semantics.
+`:s` and `:%s` retain their existing per-line matching and range semantics.
+Other bounded lexer operations can still reject oversized lines.
 The Win32 build still uses 32-bit document offsets and address-space limits.
+An individual mapped line must fit a contiguous virtual-address range; mapping
+failure aborts substitution without applying partial changes. A 64-bit host can
+provide substantially larger mappings. Existing regex execution limits remain.
+
+Temporary files are provided by registered application callbacks, not by a
+platform policy hidden in the editor core or virtual backend. The Windows host
+uses the user's temporary directory, `CREATE_NEW`, and delete-on-close handles.
+It supplies mapping callbacks using `CreateFileMappingA`/`MapViewOfFile` and
+releases them with `UnmapViewOfFile`/`CloseHandle`. Other hosts can supply their
+own temporary-file and mapping implementations.
 
 ### Text And Hex Views
 
@@ -712,9 +728,33 @@ linear undo/redo, not Vim's branching undo tree or persistent undo files.
 ## Editor Core
 
 `editor_core.h` exposes an opaque `EditorCore` with no Windows dependencies.
-Create an instance with `editor_core_create(initial_text)` and release it with
-`editor_core_destroy`. Creation copies the supplied text and places the caret
-at the beginning; NULL creates an empty document.
+Create an instance with `editor_core_create_with_files(initial_text, &files)`
+and release it with `editor_core_destroy`. Creation copies the supplied text
+and places the caret at the beginning; NULL creates an empty document.
+Alternatively, create an empty instance with `editor_core_create(NULL)` and
+send `EDITOR_REGISTER_FILE_FUNCTIONS` before loading or editing. Registration
+requires an empty document with no undo/redo history. There is no implicit
+temporary-file fallback: nonempty initial text requires file callbacks at
+construction, and operations requiring temporary storage fail without them.
+
+`EditorFileFunctions` is copied per instance. Its `context` and callback code
+must remain valid until the core and its snapshots are destroyed. Callbacks
+must not reenter the core. `create_temporary(context)` returns a new, empty,
+seekable binary read/write `FILE *`, or NULL on failure. Ownership transfers to
+the core/backend; `fclose` must release resources and remove the temporary file.
+Each call must return an independent stream. This factory is used for edit
+storage, streamed output, source detachment, and large regex subjects, and is
+retained by cloned virtual buffers used for undo/redo.
+
+`map_readonly(context, file, length, &data, &mapping)` maps the first `length`
+bytes of an already-flushed temporary stream and returns 1 on success. It must
+provide a stable contiguous read-only view plus an opaque release token. On
+failure it returns 0, releases any partial resources, and clears both outputs.
+`unmap(context, data, mapping)` releases that view and token before the stream is
+closed. The mapping callbacks must be supplied together. They are required for
+substitution subjects of 64 KiB or more; without them such an
+operation fails safely, rather than truncating a match or allocating the whole
+subject. All OS-specific creation, mapping, and deletion stays in the host.
 
 `editor_core_send(core, message, data)` returns 1 on success (including boundary
 no-ops) and 0 for invalid arguments, an unknown message, an invalid line, or an
@@ -748,6 +788,7 @@ allocation failure. Failed edits leave the document unchanged.
 | `EDITOR_REGISTER_LEXER` | `const Lexer *`; register an additional lexer descriptor on this core; registering the same pointer again is a no-op |
 | `EDITOR_SELECT_LEXER` | NUL-terminated filename; select the first registered lexer matching its basename or extension, or plain text when none matches |
 | `EDITOR_GET_LEXER` | `const Lexer **` receiving the selected descriptor, or NULL for plain text |
+| `EDITOR_REGISTER_FILE_FUNCTIONS` | `const EditorFileFunctions *`; register host temporary-file creation and optional paired read-only mapping/release callbacks on an empty core before use |
 | `EDITOR_REGISTER_DIRECTORY_FUNCTIONS` | `const EditorDirectoryFunctions *`; register host directory listing and local path-resolution callbacks |
 | `EDITOR_OPEN_DIRECTORY` | NUL-terminated host-native path; replace an unmodified buffer with a read-only listing, resolving relative to its current directory when browsing |
 | `EDITOR_ACTIVATE_DIRECTORY_ENTRY` | NULL; enter the directory or load the file at the caret, replacing the listing in place |

@@ -32,6 +32,8 @@ typedef struct FilePiece {
 } FilePiece;
 
 struct VirtualBuffer {
+    void *temporary_context;
+    VirtualBufferTemporaryFactory create_temporary;
     FilePiece *pieces;
     size_t count;
     size_t length;
@@ -172,6 +174,13 @@ VirtualBuffer *virtual_buffer_create(void)
     return calloc(1, sizeof(VirtualBuffer));
 }
 
+void virtual_buffer_set_temporary_factory(VirtualBuffer *buffer, void *context,
+    VirtualBufferTemporaryFactory create_temporary)
+{
+    buffer->temporary_context = context;
+    buffer->create_temporary = create_temporary;
+}
+
 VirtualBuffer *virtual_buffer_open(const char *path)
 {
     FILE *file = fopen(path, "rb");
@@ -233,6 +242,8 @@ VirtualBuffer *virtual_buffer_clone(const VirtualBuffer *buffer)
     if (buffer->count)
         memcpy(copy->pieces, buffer->pieces, buffer->count * sizeof(*copy->pieces));
     copy->count = buffer->count;
+    copy->temporary_context = buffer->temporary_context;
+    copy->create_temporary = buffer->create_temporary;
     copy->length = buffer->length;
     copy->changes = buffer->changes;
     if (copy->changes)
@@ -306,7 +317,7 @@ static int replace(VirtualBuffer *buffer, size_t offset, size_t removed,
     if (!pieces)
         return 0;
     if (length && !buffer->changes) {
-        FILE *file = tmpfile();
+        FILE *file = buffer->create_temporary ? buffer->create_temporary(buffer->temporary_context) : NULL;
         if (file) {
             buffer->changes = create_source(file, 0);
             if (buffer->changes)
@@ -532,7 +543,7 @@ int virtual_buffer_detach(VirtualBuffer *buffer)
         FileSource *source = buffer->pieces[index].source;
         if (source->temporary)
             continue;
-        FILE *copy = tmpfile();
+        FILE *copy = buffer->create_temporary ? buffer->create_temporary(buffer->temporary_context) : NULL;
         if (!copy)
             return 0;
         unsigned char chunk[FILE_CHUNK];

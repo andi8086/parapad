@@ -7,8 +7,11 @@
 #define VIRTUAL_BUFFER_CHUNK_SIZE 65536u
 
 typedef struct VirtualBuffer VirtualBuffer;
+typedef FILE *(*VirtualBufferTemporaryFactory)(void *context);
 
 VirtualBuffer *virtual_buffer_create(void);
+void virtual_buffer_set_temporary_factory(VirtualBuffer *buffer, void *context,
+    VirtualBufferTemporaryFactory create_temporary);
 VirtualBuffer *virtual_buffer_open(const char *path);
 VirtualBuffer *virtual_buffer_clone(const VirtualBuffer *buffer);
 void virtual_buffer_destroy(VirtualBuffer *buffer);
