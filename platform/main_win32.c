@@ -16,6 +16,7 @@
 
 #include "resource_win32.h"
 
+#define HELP_FILE "PARAPAD.HLP"
 
 #define EDITOR_DEF_FONT_SIZE 12
 
@@ -59,7 +60,9 @@ typedef struct SyntaxCache {
 #define ID_SECOND_EDITOR 110
 #define ID_VIEW_TEXT 111
 #define ID_VIEW_HEX 112
-#define ID_HELP_ABOUT 113
+#define ID_HELP_CONTENTS 113
+#define ID_HELP_SEARCH 114
+#define ID_HELP_ABOUT 115
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
 #define WM_EDITOR_REFRESH (WM_APP + 3)
@@ -2681,6 +2684,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         HMENU help_menu = CreatePopupMenu();
         if (!help_menu ||
+            !AppendMenuA(help_menu, MF_STRING, ID_HELP_CONTENTS, "&Contents") ||
+            !AppendMenuA(help_menu, MF_STRING, ID_HELP_SEARCH, "&Search for Help on...") ||
             !AppendMenuA(help_menu, MF_STRING, ID_HELP_ABOUT, "&About ParaPad...") ||
             !AppendMenuA(menu, MF_POPUP, (UINT_PTR)help_menu, "&Help")) {
             if (help_menu) {
@@ -2966,6 +2971,13 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_FILE_EXIT:
             SendMessage(hWnd, WM_CLOSE, 0, 0);
             return 0;
+        case ID_HELP_CONTENTS:
+            WinHelp(hWnd, HELP_FILE, HELP_CONTENTS, 0L);
+            break;
+        case ID_HELP_SEARCH:
+            WinHelp(hWnd, HELP_FILE, HELP_FINDER, 0L);
+            //WinHelp(hWnd, HELP_FILE, HELP_PARTIALKEY, (DWORD)(LPSTR)"");
+            break;
         case ID_HELP_ABOUT: {
                 /* ShellAbout(hWnd,
                            "ParaPad, v" VERSION_STR "#Built With Open Watcom#",
@@ -3002,6 +3014,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_DESTROY:
         DragAcceptFiles(hWnd, FALSE);
+        WinHelp(hWnd, HELP_FILE, HELP_QUIT, 0L);
         PostQuitMessage(0);
         return 0;
     case WM_NCDESTROY:
