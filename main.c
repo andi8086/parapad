@@ -274,9 +274,14 @@ static int dispatch_ansi_key(EditorControl *editor, WPARAM value, unsigned int r
     }
     WCHAR units[2];
     int count = MultiByteToWideChar(CP_ACP, 0, text, length, units, 2);
-    if (!count)
-        return 0;
-    unsigned long codepoint = units[0];
+    unsigned long codepoint;
+    if (!count) {
+        if (length != 1 || (unsigned char)text[0] >= 0x80)
+            return 0;
+        codepoint = (unsigned char)text[0];
+    } else {
+        codepoint = units[0];
+    }
     if (count == 2) {
         if (units[0] < 0xD800 || units[0] > 0xDBFF ||
             units[1] < 0xDC00 || units[1] > 0xDFFF)
@@ -287,6 +292,16 @@ static int dispatch_ansi_key(EditorControl *editor, WPARAM value, unsigned int r
         if (!editor_core_send(editor->core, EDITOR_HANDLE_KEY, &codepoint))
             return 0;
     return 1;
+}
+
+static int text_extent(HDC dc, const char *text, int length, int fallback_width,
+    SIZE *extent)
+{
+    if (GetTextExtentPointA(dc, text, length, extent) && extent->cx > 0)
+        return 1;
+    extent->cx = fallback_width > 0 ? fallback_width : 1;
+    extent->cy = 0;
+    return 0;
 }
 
 static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
@@ -308,7 +323,7 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     EditorSettings settings;
     editor_core_send(editor->core, EDITOR_GET_SETTINGS, &settings);
     SIZE space_size = { 0, 0 };
-    GetTextExtentPoint32A(dc, " ", 1, &space_size);
+    text_extent(dc, " ", 1, editor->character_width, &space_size);
     int column_limit = -1;
     if (space_size.cx > 0 && settings.maxcol && settings.maxcol <= (size_t)(INT_MAX / space_size.cx))
         column_limit = (int)settings.maxcol * space_size.cx;
@@ -320,7 +335,7 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
         char text[8];
         int length = character_to_ansi(character.value, text, sizeof(text));
         SIZE extent = { 0, 0 };
-        GetTextExtentPoint32A(dc, text, length, &extent);
+        text_extent(dc, text, length, editor->character_width, &extent);
         if (character.hidden) {
             extent.cx = 0;
             length = 0;
@@ -382,7 +397,7 @@ static int layout_editor_line(HDC dc, EditorControl *editor, size_t index,
     }
     if (paint && selection.active && selection.includes_newline) {
         SIZE space = { 0, 0 };
-        GetTextExtentPoint32A(dc, " ", 1, &space);
+        text_extent(dc, " ", 1, editor->character_width, &space);
         int left = editor->text_left - editor->left_pixel + width;
         RECT highlight;
         highlight.left = left;
@@ -582,7 +597,7 @@ static int hex_edit(EditorControl *editor, size_t remove_length, const unsigned 
 {
     EditorByteEdit edit;
     edit.offset = editor->hex_offset;
-    edit.length = remove_length;
+    edit.remove_length = remove_length;
     edit.data = data;
     edit.length = length;
     return editor_core_send(editor->core, EDITOR_REPLACE_BYTES, &edit);
@@ -926,7 +941,7 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
     HGDIOBJ old_font = SelectObject(dc, editor->font);
     SetBkMode(dc, TRANSPARENT);
     SIZE space_size = { 0, 0 };
-    GetTextExtentPoint32A(dc, " ", 1, &space_size);
+    text_extent(dc, " ", 1, editor->character_width, &space_size);
     int guide = -1;
     if (space_size.cx > 0 && settings.maxcol &&
         settings.maxcol <= (size_t)((INT_MAX - editor->text_left) / space_size.cx)) {
@@ -998,7 +1013,7 @@ static void paint_editor(HDC dc, EditorControl *editor, int width, int height, i
                 if (caret.active) {
                     int offset = layout_editor_line(dc, editor, index, caret.column, 0, 0, 0, NULL);
                     SIZE space = { 0, 0 };
-                    GetTextExtentPoint32A(dc, " ", 1, &space);
+                    text_extent(dc, " ", 1, editor->character_width, &space);
                     int left = editor->text_left - editor->left_pixel + offset;
                     if (space.cx > 0 && caret.advance <= (size_t)((INT_MAX - offset) / space.cx)) {
                         left += (int)caret.advance * space.cx;
@@ -1084,7 +1099,8 @@ static int set_editor_font(HWND window, EditorControl *editor, int points)
     TEXTMETRICA metrics;
     GetTextMetricsA(dc, &metrics);
     SIZE number_size = { 0, 0 };
-    GetTextExtentPoint32A(dc, "00000", 5, &number_size);
+    int character_width = metrics.tmAveCharWidth > 0 ? metrics.tmAveCharWidth : 1;
+    text_extent(dc, "00000", 5, 5 * character_width, &number_size);
     SelectObject(dc, old_font);
     ReleaseDC(window, dc);
     HFONT previous = editor->font;
@@ -1094,7 +1110,7 @@ static int set_editor_font(HWND window, EditorControl *editor, int points)
     if (editor->line_height < 1)
         editor->line_height = 1;
     editor->text_left = 8 + number_size.cx + 16;
-    editor->character_width = metrics.tmAveCharWidth > 0 ? metrics.tmAveCharWidth : 1;
+    editor->character_width = character_width;
     editor->bitmap_valid = 0;
     editor->pending_lead = 0;
     SendMessageA(GetDlgItem(GetParent(window), ID_COMMAND_LINE), WM_SETFONT, (WPARAM)font, TRUE);
@@ -1662,19 +1678,21 @@ static FILE *create_temporary_file(void *context)
             DWORD error = GetLastError();
             if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)
                 continue;
-            return NULL;
+            return tmpfile();
         }
         int descriptor = _open_osfhandle((intptr_t)file, _O_BINARY | _O_RDWR);
         if (descriptor == -1) {
             CloseHandle(file);
-            return NULL;
+            return tmpfile();
         }
         FILE *stream = _fdopen(descriptor, "w+b");
-        if (!stream)
+        if (!stream) {
             _close(descriptor);
+            return tmpfile();
+        }
         return stream;
     }
-    return NULL;
+    return tmpfile();
 }
 
 static int map_file_readonly(void *context, FILE *file, size_t length,
@@ -2658,8 +2676,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND view = active_editor(hWnd);
         EditorControl *editor = view ? (EditorControl *)GetWindowLongPtrA(view, GWLP_USERDATA) : NULL;
         if (editor && (HMENU)wp == GetSubMenu(GetMenu(hWnd), 1)) {
-            CheckMenuRadioItem((HMENU)wp, ID_VIEW_TEXT, ID_VIEW_HEX,
-                editor->hex_mode ? ID_VIEW_HEX : ID_VIEW_TEXT, MF_BYCOMMAND);
+            CheckMenuItem((HMENU)wp, ID_VIEW_HEX, editor->hex_mode ? MF_CHECKED : MF_UNCHECKED);
+            CheckMenuItem((HMENU)wp, ID_VIEW_TEXT, editor->hex_mode ? MF_UNCHECKED : MF_CHECKED);
             EditorDirectory directory;
             editor_core_send(editor->core, EDITOR_GET_DIRECTORY, &directory);
             EnableMenuItem((HMENU)wp, ID_VIEW_HEX,
