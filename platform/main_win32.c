@@ -14,7 +14,11 @@
 #include "editor_core.h"
 #include "lexer.h"
 
+#include "resource_win32.h"
+
+
 #define EDITOR_DEF_FONT_SIZE 12
+
 
 #ifndef OPENFILENAME_SIZE_VERSION_400A
 #       define OPENFILENAME_SIZE_VERSION_400A \
@@ -23,6 +27,8 @@
 #endif
 
 static UINT legacy_wheel_message;
+
+HICON hAppIcon;
 
 typedef struct SyntaxLine {
     LexerLine parsed;
@@ -53,12 +59,41 @@ typedef struct SyntaxCache {
 #define ID_SECOND_EDITOR 110
 #define ID_VIEW_TEXT 111
 #define ID_VIEW_HEX 112
+#define ID_HELP_ABOUT 113
 #define WM_EDITOR_MODE_CHANGED (WM_APP + 1)
 #define WM_EDITOR_BUFFER_CHANGED (WM_APP + 2)
 #define WM_EDITOR_REFRESH (WM_APP + 3)
 #define WM_EDITOR_SWITCH_BUFFER (WM_APP + 4)
 #define WM_EDITOR_FOCUS (WM_APP + 5)
 #define WM_EDITOR_WINDOW_KEY (WM_APP + 6)
+
+
+BOOL CALLBACK AboutDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_INITDIALOG: {
+            char szBuffer[32];
+
+            MEMORYSTATUS status;
+            GlobalMemoryStatus(&status);
+
+            DWORD free_mem_k = status.dwAvailPhys / 1024;
+            DWORD total_mem_k = status.dwTotalPhys / 1024;
+            sprintf(szBuffer, "%lu / %lu KB Free", free_mem_k, total_mem_k);
+
+            SetDlgItemText(hDlg, IDC_PHYSICAL_MEM, szBuffer);
+        }
+        return TRUE;
+    case WM_COMMAND:
+        if (wParam == IDOK || wParam == IDCANCEL) {
+            EndDialog(hDlg, TRUE);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
 
 typedef struct CachedLine {
     char *text;
@@ -130,6 +165,8 @@ typedef struct MainWindowState {
     int split_vertical;
     int window_pending;
 } MainWindowState;
+
+static int open_document(HWND window, MainWindowState *state, const char *path);
 
 static HWND active_editor(HWND window)
 {
@@ -2642,6 +2679,16 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             DestroyMenu(menu);
             return -1;
         }
+        HMENU help_menu = CreatePopupMenu();
+        if (!help_menu ||
+            !AppendMenuA(help_menu, MF_STRING, ID_HELP_ABOUT, "&About ParaPad...") ||
+            !AppendMenuA(menu, MF_POPUP, (UINT_PTR)help_menu, "&Help")) {
+            if (help_menu) {
+                DestroyMenu(help_menu);
+            }
+            DestroyMenu(menu);
+            return -1;
+        }
         if (!SetMenu(hWnd, menu)) {
             DestroyMenu(menu);
             return -1;
@@ -2689,6 +2736,8 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         if (!state->command_proc)
             return -1;
         update_document_title(hWnd, state);
+
+        hAppIcon = NULL;
         return 0;
     }
     case WM_SIZE:
@@ -2917,6 +2966,23 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_FILE_EXIT:
             SendMessage(hWnd, WM_CLOSE, 0, 0);
             return 0;
+        case ID_HELP_ABOUT: {
+                /* ShellAbout(hWnd,
+                           "ParaPad, v" VERSION_STR "#Built With Open Watcom#",
+                           COPYRIGHT_STR,
+                           hAppIcon);
+                */
+                FARPROC lpfnAboutDlgProc;
+                /* HINSTANCE hInstance =
+                        (HINSTANCE)GetWindowLongPtr(hWnd, GWLP_HINSTANCE); */
+                HINSTANCE hInstance = GetModuleHandle(NULL);
+                lpfnAboutDlgProc =
+                        MakeProcInstance((FARPROC)AboutDlgProc, hInstance);
+                DialogBox(hInstance, MAKEINTRESOURCE(IDD_ABOUT),
+                          hWnd, (DLGPROC)lpfnAboutDlgProc);
+                FreeProcInstance(lpfnAboutDlgProc);
+            }
+            break;
         }
         break;
     }

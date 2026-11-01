@@ -50,6 +50,8 @@ LIBS = \
         user32.lib \
         comdlg32.lib
 
+RFLAGS_win32 = -q -r -bt=nt -d_WIN32
+
 vpath %.c src/
 vpath %.c platform/
 vpath %.c third_party/pcre2/src/
@@ -58,7 +60,15 @@ $(BUILDDIR_win32)/%.obj: %.c | $(BUILDDIR_win32)
 	@$(info OWCC [WIN32] $@)
 	@owcc -Wc,-wcd=138 $(PCRE_DEFs) $(INCLUDES) -std=c99 -bwin32 -c $< -o $@
 
-$(BUILDDIR_win32)/ppwin32.exe: $(OBJs_win32) $(PCRE2_OBJs)
+RESOURCE_win32 = $(BUILDDIR_win32)/parapad_win32.res
+
+$(RESOURCE_win32): platform/parapad_win32.rc
+	$(info WRC [WIN32] $@)
+	@wrc $< $(RFLAGS_win32) -i=src/ -fo=$@
+
+$(BUILDDIR_win32)/ppwin32.exe: $(OBJs_win32) $(PCRE2_OBJs) $(RESOURCE_win32)
 	@$(info OWCC [WIN32] $@)
-	@owcc -bwin32 $^ $(LIBS) -o$@
+	@owcc -bwin32 $(OBJs_win32) $(PCRE2_OBJs) $(LIBS) -o$@
+	@$(info WRC [WIN32] $@)
+	@wrc -q $(RESOURCE_win32) $@
 
