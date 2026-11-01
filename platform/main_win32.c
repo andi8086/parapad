@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <limits.h>
@@ -1135,7 +1136,8 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
-    case WM_CREATE: {
+    case WM_CREATE:
+        DragAcceptFiles(hWnd, TRUE);
         if (!legacy_wheel_message)
             legacy_wheel_message = RegisterWindowMessageA("MSWHEEL_ROLLMSG");
         editor = calloc(1, sizeof(*editor));
@@ -1145,7 +1147,6 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         SetWindowLongPtrA(hWnd, GWLP_USERDATA, (LONG_PTR)editor);
         set_editor_font(hWnd, editor, EDITOR_DEF_FONT_SIZE);
         return 0;
-    }
     case WM_GETDLGCODE:
         return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTTAB;
     case WM_EDITOR_REFRESH:
@@ -1499,8 +1500,27 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             SetWindowLongPtrA(hWnd, GWLP_USERDATA, 0);
         }
         break;
-    }
+    case WM_DROPFILES:
+        {
+            HDROP hdrop = (HDROP)wp;
+            UINT file_count;
+            UINT i;
+            char szFileName[MAX_PATH];
 
+            HWND parent = GetParent(hWnd);
+            MainWindowState *state = (MainWindowState *)
+                GetWindowLongPtrA(parent, GWLP_USERDATA);
+
+            file_count = DragQueryFile(hdrop, UINT16_MAX, NULL, 0);
+
+            for (i = 0; i < file_count; i++) {
+                DragQueryFile(hdrop, i, szFileName, sizeof(szFileName));
+                open_document(parent, state, szFileName);
+            }
+            DragFinish(hdrop);
+        }
+        return 0;
+    }
     return DefWindowProcA(hWnd, msg, wp, lp);
 }
 
@@ -2915,6 +2935,7 @@ LRESULT CALLBACK main_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(hWnd);
         return 0;
     case WM_DESTROY:
+        DragAcceptFiles(hWnd, FALSE);
         PostQuitMessage(0);
         return 0;
     case WM_NCDESTROY:
