@@ -3055,7 +3055,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     main_cls.lpfnWndProc = main_wnd_proc;
     main_cls.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     main_cls.hCursor = LoadCursor(NULL, IDC_ARROW);
-    main_cls.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON_MAIN));
+    main_cls.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON_BLACK));
     main_cls.hInstance = hInstance;
     main_cls.lpszClassName = "PARAPAD_CLASS";
 

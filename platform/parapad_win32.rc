@@ -11,6 +11,7 @@
 #define IDOK             1
 
 IDI_ICON_MAIN ICON "parapad_win32.ico"
+IDI_ICON_BLACK ICON "parapad_black.ico"
 
 IDD_ABOUT DIALOG 30, 30, 200, 100
 STYLE DS_MODALFRAME | WS_CAPTION | WS_SYSMENU
