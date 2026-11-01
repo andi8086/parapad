@@ -13,6 +13,8 @@
 #include "editor_core.h"
 #include "lexer.h"
 
+#define EDITOR_DEF_FONT_SIZE 12
+
 #ifndef OPENFILENAME_SIZE_VERSION_400A
 #       define OPENFILENAME_SIZE_VERSION_400A \
                 (sizeof(OPENFILENAMEA) - sizeof(void *) * 3 \
@@ -1141,7 +1143,7 @@ LRESULT CALLBACK my_editor_wnd_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
             return -1;
         editor->core = ((LPCREATESTRUCTA)lp)->lpCreateParams;
         SetWindowLongPtrA(hWnd, GWLP_USERDATA, (LONG_PTR)editor);
-        set_editor_font(hWnd, editor, 18);
+        set_editor_font(hWnd, editor, EDITOR_DEF_FONT_SIZE);
         return 0;
     }
     case WM_GETDLGCODE:
