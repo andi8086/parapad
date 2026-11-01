@@ -3,5 +3,6 @@
 
 #define VERSION_STR   "v0.1 beta"
 #define COPYRIGHT_STR "Copyright \xA9 2026 Andreas J. Reichel"
+#define COPYRIGHT_STR_ASCII "Copyright (C) 2026 Andreas J. Reichel"
 
 #endif
