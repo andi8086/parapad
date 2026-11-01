@@ -2042,7 +2042,7 @@ static void layout_main_children(HWND window)
     int status_parts[3];
     status_parts[0] = text_right > 544 ? text_right - 544 : 0;
     status_parts[1] = text_right > 64 ? text_right - 64 : 0;
-    status_parts[1] = text_right;
+    status_parts[2] = text_right;
     SendMessageA(status, SB_SETPARTS, 3, (LPARAM)status_parts);
     update_buffer_status(window, state->core);
     RECT status_rect = { 0 };
