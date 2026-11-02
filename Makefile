@@ -31,7 +31,8 @@ OBJs_win32 += \
 OBJs_dos32 = $(addprefix $(BUILDDIR_dos32)/,$(OBJs))
 OBJs_dos32 += \
         $(BUILDDIR_dos32)/main_dos32.obj \
-        $(BUILDDIR_dos32)/dos32_tui.obj
+        $(BUILDDIR_dos32)/dos32_tui.obj \
+        $(BUILDDIR_dos32)/dos32_msg.obj
 
 PCRE2 = \
         $(wildcard third_party/pcre2/src/pcre2_*.c)
